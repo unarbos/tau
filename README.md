@@ -3,9 +3,10 @@
 `tau` is a small CLI for running a staged SWE workflow:
 
 1. `generate` mines a commit and creates a task.
-2. `solve` runs an agent against that task in Docker.
-3. `eval` compares multiple solutions.
-4. `delete` removes saved task artifacts.
+2. `solve` runs a solver against that task.
+3. `compare` scores two saved solutions by changed-line similarity.
+4. `eval` compares multiple solutions with an LLM judge.
+5. `delete` removes saved task artifacts.
 
 ## Modify And Share The Main Agent
 
@@ -45,7 +46,8 @@ This makes it easy to iterate locally in `tau/agent`, then publish the same agen
 - `uv`
 - Docker
 - A GitHub token for task generation
-- An OpenRouter API key for solving and evaluation
+- An OpenRouter API key for Docker PI solves and evaluation
+- A Cursor API key for Cursor solves
 
 ## Setup
 
@@ -61,6 +63,7 @@ Create a `.env` file in `tau/` if you do not already have one:
 ```bash
 GITHUB_TOKEN=your_github_token
 OPENROUTER_API_KEY=your_openrouter_api_key
+CURSOR_API_KEY=your_cursor_api_key
 ```
 
 `tau` loads `.env` automatically from the project root.
@@ -99,11 +102,27 @@ Useful options:
 
 ## Solve A Task
 
-`solve` requires an agent workspace. The `--agent` value can be:
+`solve` supports multiple backends. The `--agent` value can be:
 
-- a local agent workspace directory
-- a repo root that contains `agent/`
-- a GitHub repo URL or shorthand like `owner/repo`
+- `cursor` to run the Cursor CLI in Docker
+- `claude` to run the local Claude CLI on the host
+- a local agent workspace directory for the Docker PI solver
+- a repo root that contains `agent/` for the Docker PI solver
+- a GitHub repo URL or shorthand like `owner/repo` for the Docker PI solver
+
+Example using Cursor:
+
+```bash
+source .venv/bin/activate
+tau solve --task my-task --solution cursor-run --agent cursor
+```
+
+Example using Claude:
+
+```bash
+source .venv/bin/activate
+tau solve --task my-task --solution claude-run --agent claude
+```
 
 Example using the local bundled agent checkout in this repo:
 
@@ -130,6 +149,22 @@ Useful options:
 - `--docker-solver-no-cache`
 - `--agent-timeout <seconds>`
 - `--debug`
+
+## Compare Solutions
+
+Compare two saved solutions using changed-lines-only similarity:
+
+```bash
+source .venv/bin/activate
+tau compare --task my-task --solutions cursor-run baseline
+```
+
+Comma-separated values also work:
+
+```bash
+source .venv/bin/activate
+tau compare --task my-task --solutions cursor-run,baseline
+```
 
 ## Evaluate Solutions
 
@@ -175,14 +210,18 @@ tau delete task --all
 ```bash
 source .venv/bin/activate
 tau generate --task demo-task
-tau solve --task demo-task --solution run-1 --agent ./agent
+tau solve --task demo-task --solution run-1 --agent cursor
 tau solve --task demo-task --solution run-2 --agent ./agent
+tau compare --task demo-task --solutions run-1 run-2
 tau eval --task demo-task --solutions run-1 run-2
 ```
 
 ## Notes
 
 - `generate` needs `GITHUB_TOKEN` or `GH_TOKEN`.
-- `solve` and `eval` need `OPENROUTER_API_KEY`.
-- `solve` uses Docker, so Docker must be installed and running.
+- `tau solve --agent cursor` needs `CURSOR_API_KEY` and Docker.
+- `tau solve --agent claude` needs the `claude` CLI installed on the host.
+- Docker PI solves and `eval` need `OPENROUTER_API_KEY`.
+- `compare` reads saved solution artifacts and does not call a model.
+- Docker-backed solves use Docker, so Docker must be installed and running.
 - Generated task, solution, and evaluation paths are printed by the CLI after each command finishes.

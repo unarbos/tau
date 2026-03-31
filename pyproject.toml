@@ -18,6 +18,7 @@ build-backend = "setuptools.build_meta"
 py-modules = [
     "claude_runner",
     "cli",
+    "compare",
     "config",
     "cursor_runner",
     "docker_solver",
@@ -47,6 +48,7 @@ ignore = ["E501"]
 known-first-party = [
     "claude_runner",
     "cli",
+    "compare",
     "config",
     "cursor_runner",
     "docker_solver",

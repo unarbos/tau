@@ -5,13 +5,13 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
-from config import DockerSolverAgentSource, RunConfig
-from pipeline import delete_task_run, evaluate_task_run, generate_task_run, solve_task_run
+from config import RunConfig, SolverAgentSource
+from pipeline import compare_task_run, delete_task_run, evaluate_task_run, generate_task_run, solve_task_run
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate, solve, and evaluate SWE tasks as independent stages.",
+        description="Generate, solve, compare, and evaluate SWE tasks as independent stages.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -38,7 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument(
         "--agent",
         required=True,
-        help="Local agent workspace directory or repo root, or a GitHub repo URL/shorthand whose agent lives in /agent.",
+        help=(
+            "Solver backend selector. Use 'cursor' for the Cursor CLI, 'claude' for the host Claude CLI, "
+            "or pass a local agent workspace / repo root / GitHub repo URL for the Docker PI solver."
+        ),
     )
     solve.add_argument("--solver-model", help="Optional model override for solving.")
     solve.add_argument(
@@ -159,6 +162,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional random seed for deterministic blind-candidate ordering.",
     )
 
+    compare = subparsers.add_parser("compare", help="Compare two saved solutions by changed-line similarity.")
+    _add_shared_args(compare)
+    compare.add_argument("--task", required=True, help="Existing generated task name.")
+    compare.add_argument(
+        "--solutions",
+        required=True,
+        nargs="+",
+        help="Exactly two solution names to compare. Supports '--solutions A B' and '--solutions A,B'.",
+    )
+
     delete = subparsers.add_parser("delete", help="Delete saved task workspaces and related artifacts.")
     _add_shared_args(delete)
     delete.add_argument(
@@ -207,6 +220,20 @@ def main() -> None:
                 f"{result.repo}@{result.commit_sha[:12]} -> {result.comparison_count} comparisons"
             )
             print(result.eval_root)
+            return
+        if args.command == "compare":
+            result = compare_task_run(
+                task_name=args.task,
+                solution_names=_normalize_compare_solution_names(args.solutions),
+                config=_build_compare_config(args),
+            )
+            print(
+                f"compared {result.task_name}/{result.comparison_name}: "
+                f"{result.repo}@{result.commit_sha[:12]} -> "
+                f"{result.matched_changed_lines}/{result.scored_positions} matching changed lines "
+                f"({result.similarity_ratio:.2%})"
+            )
+            print(result.comparison_root)
             return
         if args.command == "delete":
             result = delete_task_run(
@@ -258,7 +285,7 @@ def _build_generate_config(args: argparse.Namespace) -> RunConfig:
 
 
 def _build_solve_config(args: argparse.Namespace) -> RunConfig:
-    agent = _resolve_agent_source(args.agent, cwd=Path.cwd())
+    solver_backend, agent_source = _resolve_solve_target(args.agent, cwd=Path.cwd())
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
@@ -270,9 +297,10 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
         solver_max_cost=args.solver_max_cost,
         solver_max_tokens_per_request=args.solver_max_tokens_per_request,
         random_seed=args.seed,
-        solver_backend="docker-pi",
+        solver_backend=solver_backend,
+        solve_agent=args.agent,
         docker_solver_image=args.docker_solver_image,
-        docker_solver_agent=agent,
+        solver_agent_source=agent_source,
         docker_solver_memory=args.docker_solver_memory,
         docker_solver_cpus=args.docker_solver_cpus,
         docker_solver_pids_limit=args.docker_solver_pids_limit,
@@ -299,6 +327,14 @@ def _build_eval_config(args: argparse.Namespace) -> RunConfig:
     )
 
 
+def _build_compare_config(args: argparse.Namespace) -> RunConfig:
+    return RunConfig(
+        workspace_root=args.workspace_root.resolve(),
+        agent_timeout=args.agent_timeout,
+        debug=args.debug,
+    )
+
+
 def _build_delete_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
@@ -317,7 +353,23 @@ def _normalize_solution_names(raw_values: list[str]) -> list[str]:
     return names
 
 
-def _resolve_agent_source(raw_value: str, *, cwd: Path) -> DockerSolverAgentSource:
+def _normalize_compare_solution_names(raw_values: list[str]) -> list[str]:
+    names = _normalize_solution_names(raw_values)
+    if len(names) != 2:
+        raise ValueError("compare requires exactly two solution names")
+    return names
+
+
+def _resolve_solve_target(raw_value: str, *, cwd: Path) -> tuple[str, SolverAgentSource | None]:
+    normalized = raw_value.strip().lower()
+    if normalized == "cursor":
+        return "cursor", None
+    if normalized == "claude":
+        return "claude", None
+    return "docker-pi", _resolve_agent_source(raw_value, cwd=cwd)
+
+
+def _resolve_agent_source(raw_value: str, *, cwd: Path) -> SolverAgentSource:
     value = raw_value.strip()
     if not value:
         raise ValueError("--agent cannot be empty")
@@ -325,7 +377,7 @@ def _resolve_agent_source(raw_value: str, *, cwd: Path) -> DockerSolverAgentSour
     candidate_path = Path(value).expanduser()
     if candidate_path.exists():
         resolved = _resolve_local_agent_dir(candidate_path.resolve())
-        return DockerSolverAgentSource(
+        return SolverAgentSource(
             raw=value,
             kind="local_path",
             local_path=str(resolved),
@@ -337,7 +389,7 @@ def _resolve_agent_source(raw_value: str, *, cwd: Path) -> DockerSolverAgentSour
     relative_candidate = (cwd / candidate_path).resolve()
     if relative_candidate.exists():
         resolved = _resolve_local_agent_dir(relative_candidate)
-        return DockerSolverAgentSource(
+        return SolverAgentSource(
             raw=value,
             kind="local_path",
             local_path=str(resolved),
@@ -350,7 +402,7 @@ def _resolve_agent_source(raw_value: str, *, cwd: Path) -> DockerSolverAgentSour
             "'github.com/org/repo' or 'https://github.com/org/repo'"
         )
 
-    return DockerSolverAgentSource(
+    return SolverAgentSource(
         raw=value,
         kind="github_repo",
         repo_url=repo_url,

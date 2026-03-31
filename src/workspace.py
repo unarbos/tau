@@ -37,6 +37,7 @@ class TaskPaths:
     original_dir: Path
     reference_dir: Path
     solutions_dir: Path
+    comparisons_dir: Path
     evals_dir: Path
     commit_path: Path
     reference_patch_path: Path
@@ -61,6 +62,14 @@ class EvalPaths:
     root: Path
     comparisons_dir: Path
     eval_json_path: Path
+
+
+@dataclass(slots=True)
+class ComparePaths:
+    task_name: str
+    name: str
+    root: Path
+    compare_json_path: Path
 
 
 def validate_name(name: str, *, label: str) -> str:
@@ -92,6 +101,7 @@ def build_task_paths(tasks_root: Path, task_name: str) -> TaskPaths:
         original_dir=task_dir / "original",
         reference_dir=task_dir / "reference",
         solutions_dir=root / "solutions",
+        comparisons_dir=root / "comparisons",
         evals_dir=root / "evals",
         commit_path=task_dir / "commit.json",
         reference_patch_path=task_dir / "reference.patch",
@@ -125,6 +135,17 @@ def build_eval_paths(task_paths: TaskPaths, eval_name: str) -> EvalPaths:
     )
 
 
+def build_compare_paths(task_paths: TaskPaths, compare_name: str) -> ComparePaths:
+    compare_name = validate_name(compare_name, label="comparison")
+    root = task_paths.comparisons_dir / compare_name
+    return ComparePaths(
+        task_name=task_paths.name,
+        name=compare_name,
+        root=root,
+        compare_json_path=root / "compare.json",
+    )
+
+
 def materialize_task_workspace(tasks_root: Path, task_name: str, candidate: CommitCandidate) -> TaskPaths:
     task_paths = build_task_paths(tasks_root, task_name)
     log.debug(
@@ -138,6 +159,7 @@ def materialize_task_workspace(tasks_root: Path, task_name: str, candidate: Comm
 
     task_paths.task_dir.mkdir(parents=True, exist_ok=False)
     task_paths.solutions_dir.mkdir(parents=True, exist_ok=False)
+    task_paths.comparisons_dir.mkdir(parents=True, exist_ok=False)
     task_paths.evals_dir.mkdir(parents=True, exist_ok=False)
 
     clone_result = _run(
@@ -206,6 +228,13 @@ def derive_eval_name(solution_names: list[str]) -> str:
     return validate_name("--".join(normalized), label="eval")
 
 
+def derive_compare_name(solution_names: list[str]) -> str:
+    normalized = [validate_solution_name(name) for name in solution_names]
+    if len(normalized) != 2:
+        raise ValueError("compare requires exactly two solutions")
+    return validate_name(f"{normalized[0]}--vs--{normalized[1]}", label="comparison")
+
+
 def prepare_eval_workspace(task_paths: TaskPaths, eval_name: str) -> EvalPaths:
     eval_paths = build_eval_paths(task_paths, eval_name)
     if eval_paths.root.exists():
@@ -215,6 +244,16 @@ def prepare_eval_workspace(task_paths: TaskPaths, eval_name: str) -> EvalPaths:
     eval_paths.root.mkdir(parents=True, exist_ok=False)
     eval_paths.comparisons_dir.mkdir(parents=True, exist_ok=False)
     return eval_paths
+
+
+def prepare_compare_workspace(task_paths: TaskPaths, compare_name: str) -> ComparePaths:
+    compare_paths = build_compare_paths(task_paths, compare_name)
+    if compare_paths.root.exists():
+        raise FileExistsError(
+            f"Comparison {compare_name!r} already exists for task {task_paths.name!r} at {compare_paths.root}",
+        )
+    compare_paths.root.mkdir(parents=True, exist_ok=False)
+    return compare_paths
 
 
 def resolve_task_paths(tasks_root: Path, task_name: str) -> TaskPaths:
@@ -332,6 +371,27 @@ def git_diff(repo_dir: Path, *args: str) -> str:
         diff_output += file_result.stdout
 
     return diff_output
+
+
+def git_changed_files(repo_dir: Path) -> list[str]:
+    tracked_result = _run(["git", "diff", "--name-only", "--relative"], cwd=repo_dir, timeout=60)
+    if tracked_result.returncode not in (0, 1):
+        raise RuntimeError(f"git diff --name-only failed: {tracked_result.stderr[-500:]}")
+
+    untracked_result = _run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=repo_dir,
+        timeout=30,
+    )
+    if untracked_result.returncode != 0:
+        raise RuntimeError(f"git ls-files failed: {untracked_result.stderr[-500:]}")
+
+    changed_paths = {
+        line.strip()
+        for line in tracked_result.stdout.splitlines() + untracked_result.stdout.splitlines()
+        if line.strip()
+    }
+    return sorted(changed_paths)
 
 
 def write_json(path: Path, payload: dict) -> None:

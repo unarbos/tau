@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 @dataclass(slots=True)
-class DockerSolverAgentSource:
+class SolverAgentSource:
     raw: str
     kind: str
     local_path: str | None = None
@@ -36,6 +36,7 @@ class RunConfig:
         default_factory=lambda: os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"),
     )
     openrouter_api_key: str | None = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY"))
+    cursor_api_key: str | None = field(default_factory=lambda: os.environ.get("CURSOR_API_KEY"))
     generator_model: str | None = None
     solver_model: str | None = None
     eval_model: str | None = None
@@ -50,8 +51,9 @@ class RunConfig:
     max_mining_attempts: int = 25
     http_timeout: float = 30.0
     solver_backend: str = "claude"
+    solve_agent: str | None = None
     docker_solver_image: str | None = None
-    docker_solver_agent: DockerSolverAgentSource | None = None
+    solver_agent_source: SolverAgentSource | None = None
     docker_solver_memory: str = "2g"
     docker_solver_cpus: str = "2"
     docker_solver_pids_limit: int = 256
@@ -77,3 +79,11 @@ class RunConfig:
     @property
     def use_docker_solver(self) -> bool:
         return self.solver_backend == "docker-pi"
+
+    @property
+    def use_cursor_solver(self) -> bool:
+        return self.solver_backend == "cursor"
+
+    @property
+    def use_claude_solver(self) -> bool:
+        return self.solver_backend == "claude"

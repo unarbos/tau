@@ -983,7 +983,7 @@ def _validate_agent_workspace(agent_dir: Path) -> Path:
 
 
 def _materialize_agent_source(*, config: RunConfig, target_dir: Path) -> Path:
-    agent = config.docker_solver_agent
+    agent = config.solver_agent_source
     if agent is None:
         raise RuntimeError("Docker solver agent is not configured")
 

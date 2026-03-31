@@ -5,7 +5,9 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
+from compare import compare_solution_repos
 from config import RunConfig
+from cursor_runner import solve_task_with_cursor_in_docker
 from docker_solver import solve_task_in_docker
 from eval import evaluate_candidate_pair
 from github_miner import GitHubMiner
@@ -13,11 +15,13 @@ from solver_runner import solve_task
 from task_generation import generate_task_description
 from workspace import (
     delete_all_task_workspaces,
+    derive_compare_name,
     delete_task_workspace,
     derive_eval_name,
     load_commit_candidate,
     load_generated_task,
     materialize_task_workspace,
+    prepare_compare_workspace,
     prepare_eval_workspace,
     prepare_solution_workspace,
     resolve_solution_paths,
@@ -55,6 +59,18 @@ class EvalStageResult:
     commit_sha: str
     eval_root: str
     comparison_count: int
+
+
+@dataclass(slots=True)
+class CompareStageResult:
+    task_name: str
+    comparison_name: str
+    repo: str
+    commit_sha: str
+    comparison_root: str
+    matched_changed_lines: int
+    scored_positions: int
+    similarity_ratio: float
 
 
 @dataclass(slots=True)
@@ -117,6 +133,15 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             config=config,
             run_label=f"{task_name}-{solution_name}",
         )
+    elif config.use_cursor_solver:
+        solve_result = solve_task_with_cursor_in_docker(
+            repo_dir=solution_paths.repo_dir,
+            task=task,
+            model=config.solver_model,
+            timeout=config.agent_timeout,
+            config=config,
+            run_label=f"{task_name}-{solution_name}",
+        )
     else:
         solve_result = solve_task(
             repo_dir=solution_paths.repo_dir,
@@ -135,10 +160,8 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             "solution_name": solution_name,
             "repo_full_name": candidate.repo_full_name,
             "commit_sha": candidate.commit_sha,
-            "agent": config.docker_solver_agent.raw if config.use_docker_solver and config.docker_solver_agent else None,
-            "agent_source": (
-                config.docker_solver_agent.to_dict() if config.use_docker_solver and config.docker_solver_agent else None
-            ),
+            "agent": _solve_agent_label(config),
+            "agent_source": config.solver_agent_source.to_dict() if config.solver_agent_source else None,
             "solver_backend": config.solver_backend,
             "result": solve_result.to_dict(),
         },
@@ -150,7 +173,7 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
         commit_sha=candidate.commit_sha,
         solution_root=str(solution_paths.root),
         success=solve_result.success,
-        agent=config.docker_solver_agent.raw if config.use_docker_solver and config.docker_solver_agent else None,
+        agent=_solve_agent_label(config),
     )
 
 
@@ -259,6 +282,43 @@ def delete_task_run(*, task_name: str | None, delete_all: bool, config: RunConfi
     )
 
 
+def compare_task_run(*, task_name: str, solution_names: list[str], config: RunConfig) -> CompareStageResult:
+    _setup_logging(debug=config.debug)
+    task_paths = resolve_task_paths(config.tasks_root, task_name)
+    candidate = load_commit_candidate(task_paths)
+    left_solution = resolve_solution_paths(task_paths, solution_names[0])
+    right_solution = resolve_solution_paths(task_paths, solution_names[1])
+    comparison_name = derive_compare_name(solution_names)
+    compare_paths = prepare_compare_workspace(task_paths, comparison_name)
+    compare_result = compare_solution_repos(
+        original_dir=task_paths.original_dir,
+        repo_a_dir=left_solution.repo_dir,
+        repo_b_dir=right_solution.repo_dir,
+    )
+    write_json(
+        compare_paths.compare_json_path,
+        {
+            "stage": "compare",
+            "task_name": task_name,
+            "comparison_name": comparison_name,
+            "solutions": solution_names,
+            "repo_full_name": candidate.repo_full_name,
+            "commit_sha": candidate.commit_sha,
+            "result": compare_result.to_dict(),
+        },
+    )
+    return CompareStageResult(
+        task_name=task_name,
+        comparison_name=comparison_name,
+        repo=candidate.repo_full_name,
+        commit_sha=candidate.commit_sha,
+        comparison_root=str(compare_paths.root),
+        matched_changed_lines=compare_result.matched_changed_lines,
+        scored_positions=compare_result.scored_positions,
+        similarity_ratio=compare_result.similarity_ratio,
+    )
+
+
 def _resolve_eval_candidate(*, task_paths, solution_name: str) -> ResolvedEvalCandidate:
     if solution_name == "original":
         return ResolvedEvalCandidate(
@@ -273,6 +333,14 @@ def _resolve_eval_candidate(*, task_paths, solution_name: str) -> ResolvedEvalCa
         patch=solution_paths.solution_diff_path.read_text(),
         repo_dir=solution_paths.repo_dir,
     )
+
+
+def _solve_agent_label(config: RunConfig) -> str | None:
+    if config.solve_agent:
+        return config.solve_agent
+    if config.solver_agent_source:
+        return config.solver_agent_source.raw
+    return config.solver_backend
 
 
 def _setup_logging(*, debug: bool) -> None:
