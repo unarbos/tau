@@ -595,7 +595,7 @@ def _container_name(image_tag: str, *, run_label: str | None) -> str:
 
 
 def _bundled_agent_dir() -> Path:
-    agent_dir = Path(__file__).resolve().parents[2] / "agent"
+    agent_dir = Path(__file__).resolve().parents[1] / "agent"
     if not agent_dir.is_dir():
         raise RuntimeError(f"Bundled agent workspace is missing: {agent_dir}")
     return agent_dir
