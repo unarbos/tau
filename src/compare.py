@@ -82,7 +82,7 @@ def compare_solution_repos(*, original_dir: Path, repo_a_dir: Path, repo_b_dir: 
         changed_sequence_a = _build_changed_line_sequence(original_lines, file_a_lines)
         changed_sequence_b = _build_changed_line_sequence(original_lines, file_b_lines)
         matched_lines, file_positions = _count_positional_matches(changed_sequence_a, changed_sequence_b)
-        similarity_ratio = (matched_lines / file_positions) if file_positions else 1.0
+        similarity_ratio = (matched_lines / file_positions) if file_positions else 0.0
 
         per_file.append(
             FileCompareResult(
@@ -99,7 +99,7 @@ def compare_solution_repos(*, original_dir: Path, repo_a_dir: Path, repo_b_dir: 
         total_changed_lines_a += len(changed_sequence_a)
         total_changed_lines_b += len(changed_sequence_b)
 
-    similarity_ratio = (matched_changed_lines / scored_positions) if scored_positions else 1.0
+    similarity_ratio = (matched_changed_lines / scored_positions) if scored_positions else 0.0
     return CompareResult(
         matched_changed_lines=matched_changed_lines,
         scored_positions=scored_positions,
