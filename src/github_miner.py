@@ -223,6 +223,15 @@ class GitHubMiner:
                 f"Only {code_changed} code lines changed, need {MIN_CODE_CHANGED_LINES}"
             )
 
+        # Prefer modification-heavy commits: agents produce more similar
+        # patches when editing existing code vs writing entirely new files.
+        modified_files = [f for f in code_files if f.status == "modified"]
+        if not modified_files:
+            return (
+                f"No modified code files (all {len(code_files)} are added/removed); "
+                "need at least 1 modified file for meaningful comparison"
+            )
+
         return None
 
     def _recent_push_events(self) -> list[dict]:
