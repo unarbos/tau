@@ -51,7 +51,7 @@ class RunConfig:
     solver_max_cost: float | None = None
     solver_max_tokens_per_request: int | None = None
     random_seed: int | None = None
-    max_mining_attempts: int = 25
+    max_mining_attempts: int = 50
     http_timeout: float = 30.0
     solver_backend: str = "claude"
     solve_agent: str | None = None

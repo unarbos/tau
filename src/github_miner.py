@@ -95,6 +95,39 @@ class CommitCandidate:
         )
 
 
+_CODE_EXTENSIONS = frozenset({
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs", ".c", ".cpp",
+    ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".scala", ".sh",
+    ".bash", ".zsh", ".pl", ".pm", ".r", ".lua", ".ex", ".exs", ".erl",
+    ".hs", ".ml", ".mli", ".clj", ".cljs", ".vue", ".svelte", ".dart",
+    ".zig", ".nim", ".cr", ".v", ".sql", ".m", ".mm",
+})
+
+_SKIP_FILENAMES = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "cargo.lock",
+    "poetry.lock", "pipfile.lock", "gemfile.lock", "composer.lock",
+    "go.sum", "flake.lock",
+})
+
+MIN_CODE_CHANGED_LINES = 5
+MIN_CODE_FILES = 1
+
+
+def _is_code_file(filename: str) -> bool:
+    """Return True if the file has a recognized code extension."""
+    lower = filename.lower()
+    for ext in _CODE_EXTENSIONS:
+        if lower.endswith(ext):
+            return True
+    return False
+
+
+def _is_lockfile(filename: str) -> bool:
+    """Return True if the file is a lockfile or auto-generated."""
+    base = filename.rsplit("/", 1)[-1].lower()
+    return base in _SKIP_FILENAMES
+
+
 class GitHubMiner:
     """Sample random recent commits from public GitHub push events."""
 
@@ -151,17 +184,46 @@ class GitHubMiner:
                 log.debug("Mining attempt %s failed: %s", attempt, exc)
                 continue
 
-            if candidate.combined_patch:
-                log.debug(
-                    "Sampled commit repo=%s sha=%s with %s changed files",
-                    candidate.repo_full_name,
-                    candidate.commit_sha,
-                    len(candidate.files),
-                )
-                return candidate
-            last_error = "Sampled commit had no textual patch content"
-            log.debug("Discarding commit without textual patch content")
+            if not candidate.combined_patch:
+                last_error = "Sampled commit had no textual patch content"
+                log.debug("Discarding commit without textual patch content")
+                continue
+
+            reject_reason = self._quality_check(candidate)
+            if reject_reason:
+                last_error = reject_reason
+                log.debug("Discarding commit: %s", reject_reason)
+                continue
+
+            log.debug(
+                "Sampled commit repo=%s sha=%s with %s changed files",
+                candidate.repo_full_name,
+                candidate.commit_sha,
+                len(candidate.files),
+            )
+            return candidate
         raise RuntimeError(last_error or "Could not sample a usable GitHub commit")
+
+    @staticmethod
+    def _quality_check(candidate: CommitCandidate) -> str | None:
+        """Return a rejection reason, or None if the commit is acceptable."""
+        code_files = [
+            f for f in candidate.files
+            if f.patch and _is_code_file(f.filename) and not _is_lockfile(f.filename)
+        ]
+        if len(code_files) < MIN_CODE_FILES:
+            return (
+                f"Only {len(code_files)} code file(s), need {MIN_CODE_FILES}; "
+                f"files: {[f.filename for f in candidate.files]}"
+            )
+
+        code_changed = sum(f.additions + f.deletions for f in code_files)
+        if code_changed < MIN_CODE_CHANGED_LINES:
+            return (
+                f"Only {code_changed} code lines changed, need {MIN_CODE_CHANGED_LINES}"
+            )
+
+        return None
 
     def _recent_push_events(self) -> list[dict]:
         log.debug("Fetching recent public events page 1")
