@@ -227,9 +227,14 @@ class OpenRouterProxy:
             def _handle(self) -> None:
                 try:
                     proxy._handle_request(self)
+                except BrokenPipeError:
+                    log.debug("Client disconnected (broken pipe)")
                 except Exception:  # noqa: BLE001
                     log.exception("OpenRouter proxy request failed")
-                    self.send_error(502, "Proxy request failed")
+                    try:
+                        self.send_error(502, "Proxy request failed")
+                    except BrokenPipeError:
+                        pass
 
         if self.bind_host is not None:
             self._server = _ReusableThreadingHTTPServer((self.bind_host, self.bind_port), Handler)
