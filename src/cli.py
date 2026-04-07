@@ -6,7 +6,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from config import RunConfig, SolverAgentSource
-from pipeline import compare_task_run, delete_task_run, evaluate_task_run, generate_task_run, solve_task_run
+from pipeline import (
+    compare_task_run,
+    delete_task_run,
+    evaluate_task_run,
+    generate_task_run,
+    solve_task_run,
+)
+
+_DEFAULT_CONCURRENCY = min(os.cpu_count() or 4, 8)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,8 +104,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--subtensor-endpoint",
         help="Optional websocket endpoint that overrides --network for chain access.",
     )
-    validate.add_argument("--rounds", type=int, default=3, help="Maximum scored rounds per duel.")
-    validate.add_argument("--concurrency", type=int, default=1, help="Concurrent live tasks per duel.")
+    validate.add_argument("--rounds", type=int, default=3, help="Maximum scored rounds per duel (legacy; prefer --max-rounds).")
+    validate.add_argument(
+        "--concurrency",
+        type=int,
+        default=_DEFAULT_CONCURRENCY,
+        help="Concurrent live tasks per duel (default: min(cpu_count, 8)).",
+    )
+    validate.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.15,
+        help="SPRT epsilon: required win-rate margin above 0.5 to dethrone the king.",
+    )
+    validate.add_argument(
+        "--alpha",
+        type=float,
+        default=0.05,
+        help="SPRT alpha: false-positive rate (probability of wrongly dethroning the king).",
+    )
+    validate.add_argument(
+        "--beta",
+        type=float,
+        default=0.10,
+        help="SPRT beta: false-negative rate (probability of failing to dethrone a better agent).",
+    )
+    validate.add_argument(
+        "--min-rounds",
+        type=int,
+        default=5,
+        help="Minimum scored rounds before SPRT can render a decision.",
+    )
+    validate.add_argument(
+        "--max-rounds",
+        type=int,
+        default=50,
+        help="Safety cap on total scored rounds per duel.",
+    )
+    validate.add_argument(
+        "--copy-similarity-threshold",
+        type=float,
+        default=0.90,
+        help="If mean king-challenger patch similarity exceeds this, disqualify as a copy.",
+    )
     validate.add_argument(
         "--eval-window-seconds",
         type=int,
@@ -343,6 +392,12 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_subtensor_endpoint=args.subtensor_endpoint,
         validate_rounds=args.rounds,
         validate_concurrency=args.concurrency,
+        validate_epsilon=args.epsilon,
+        validate_alpha=args.alpha,
+        validate_beta=args.beta,
+        validate_min_rounds=args.min_rounds,
+        validate_max_rounds=args.max_rounds,
+        validate_copy_similarity_threshold=args.copy_similarity_threshold,
         validate_eval_window_seconds=args.eval_window_seconds,
         validate_weight_interval_blocks=args.weight_interval_blocks,
         validate_poll_interval_seconds=args.poll_interval_seconds,

@@ -73,7 +73,13 @@ class RunConfig:
     validate_network: str | None = None
     validate_subtensor_endpoint: str | None = None
     validate_rounds: int = 3
-    validate_concurrency: int = 1
+    validate_concurrency: int = field(default_factory=lambda: min(os.cpu_count() or 4, 8))
+    validate_epsilon: float = 0.15
+    validate_alpha: float = 0.05
+    validate_beta: float = 0.10
+    validate_min_rounds: int = 5
+    validate_max_rounds: int = 50
+    validate_copy_similarity_threshold: float = 0.90
     validate_eval_window_seconds: int = 900
     validate_weight_interval_blocks: int = 360
     validate_poll_interval_seconds: int = 30

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -15,6 +16,7 @@ import httpx
 
 from config import RunConfig, SolverAgentSource
 from pipeline import _setup_logging, compare_task_run, generate_task_run, solve_task_run
+from r2 import duel_to_summary, publish_dashboard_data
 from workspace import write_json
 
 log = logging.getLogger("swe-eval.validate")
@@ -68,6 +70,7 @@ class ValidationRoundResult:
     challenger_lines: int
     king_similarity_ratio: float
     challenger_similarity_ratio: float
+    king_challenger_similarity: float
     task_root: str
     king_compare_root: str
     challenger_compare_root: str
@@ -120,9 +123,12 @@ class ValidatorState:
     seen_hotkeys: list[str] = field(default_factory=list)
     retired_hotkeys: list[str] = field(default_factory=list)
     disqualified_hotkeys: list[str] = field(default_factory=list)
+    locked_commitments: dict[str, str] = field(default_factory=dict)
     last_weight_block: int | None = None
     next_task_index: int = 1
     next_duel_index: int = 1
+    king_since: str | None = None
+    king_duels_defended: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,14 +137,18 @@ class ValidatorState:
             "seen_hotkeys": self.seen_hotkeys,
             "retired_hotkeys": self.retired_hotkeys,
             "disqualified_hotkeys": self.disqualified_hotkeys,
+            "locked_commitments": self.locked_commitments,
             "last_weight_block": self.last_weight_block,
             "next_task_index": self.next_task_index,
             "next_duel_index": self.next_duel_index,
+            "king_since": self.king_since,
+            "king_duels_defended": self.king_duels_defended,
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ValidatorState:
         current_king_payload = payload.get("current_king")
+        raw_locked = payload.get("locked_commitments", {})
         return cls(
             current_king=(
                 ValidatorSubmission.from_dict(current_king_payload)
@@ -153,6 +163,7 @@ class ValidatorState:
             seen_hotkeys=[str(item) for item in payload.get("seen_hotkeys", [])],
             retired_hotkeys=[str(item) for item in payload.get("retired_hotkeys", [])],
             disqualified_hotkeys=[str(item) for item in payload.get("disqualified_hotkeys", [])],
+            locked_commitments={str(k): str(v) for k, v in raw_locked.items()} if isinstance(raw_locked, dict) else {},
             last_weight_block=(
                 int(payload["last_weight_block"])
                 if payload.get("last_weight_block") is not None
@@ -160,6 +171,8 @@ class ValidatorState:
             ),
             next_task_index=int(payload.get("next_task_index", 1)),
             next_duel_index=int(payload.get("next_duel_index", 1)),
+            king_since=payload.get("king_since"),
+            king_duels_defended=int(payload.get("king_duels_defended", 0)),
         )
 
 
@@ -241,6 +254,32 @@ class _MockSubtensorApi:
         _ = exc_type, exc, tb
 
 
+def _sprt_log_likelihood_ratio(wins: int, losses: int, p0: float, p1: float) -> float:
+    if p0 <= 0 or p0 >= 1 or p1 <= 0 or p1 >= 1:
+        raise ValueError("p0 and p1 must be in (0, 1)")
+    return wins * math.log(p1 / p0) + losses * math.log((1 - p1) / (1 - p0))
+
+
+def _sprt_decision(
+    wins: int,
+    losses: int,
+    epsilon: float,
+    alpha: float,
+    beta: float,
+) -> str:
+    """Return 'challenger' if contender is statistically better, 'king' if not, 'continue' if undecided."""
+    p0 = 0.5
+    p1 = min(0.5 + epsilon, 0.999)
+    lower_bound = math.log(beta / (1 - alpha))
+    upper_bound = math.log((1 - beta) / alpha)
+    llr = _sprt_log_likelihood_ratio(wins, losses, p0, p1)
+    if llr >= upper_bound:
+        return "challenger"
+    if llr <= lower_bound:
+        return "king"
+    return "continue"
+
+
 def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
     if config.validate_rounds < 1:
@@ -253,6 +292,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         raise ValueError("--weight-interval-blocks must be at least 1")
     if config.validate_max_duels is not None and config.validate_max_duels < 1:
         raise ValueError("--max-duels must be at least 1")
+    if config.validate_epsilon <= 0 or config.validate_epsilon >= 0.5:
+        raise ValueError("--epsilon must be in (0, 0.5)")
+    if config.validate_alpha <= 0 or config.validate_alpha >= 1:
+        raise ValueError("--alpha must be in (0, 1)")
+    if config.validate_beta <= 0 or config.validate_beta >= 1:
+        raise ValueError("--beta must be in (0, 1)")
+    if config.validate_min_rounds < 1:
+        raise ValueError("--min-rounds must be at least 1")
+    if config.validate_max_rounds < config.validate_min_rounds:
+        raise ValueError("--max-rounds must be >= --min-rounds")
     if (
         not config.validate_mock_set_weights
         and (not config.validate_wallet_name or not config.validate_wallet_hotkey)
@@ -261,6 +310,22 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
     paths = _prepare_validate_paths(config.validate_root)
     state = _load_state(paths.state_path)
+    dashboard_history = _load_dashboard_history(paths.root / "dashboard_history.json")
+    if dashboard_history:
+        max_duel_id = max(d.get("duel_id", 0) for d in dashboard_history)
+        if max_duel_id >= state.next_duel_index:
+            state.next_duel_index = max_duel_id + 1
+        max_task_idx = 0
+        for d in dashboard_history:
+            for r in d.get("rounds", []):
+                tn = r.get("task_name", "")
+                parts = tn.rsplit("-", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    max_task_idx = max(max_task_idx, int(parts[1]))
+        if max_task_idx >= state.next_task_index:
+            state.next_task_index = max_task_idx + 1
+    validator_started_at = _timestamp()
+    active_duel_info: dict[str, Any] | None = None
     github_headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -290,7 +355,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     subtensor=subtensor, github_client=github_client, config=config
                 )
                 _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
+                prev_king_hotkey = state.current_king.hotkey if state.current_king else None
                 _ensure_king(state=state)
+                if state.current_king and state.current_king.hotkey != prev_king_hotkey:
+                    state.king_since = _timestamp()
+                    state.king_duels_defended = 0
 
                 # Ensure king SHA is resolved to full 40-char form
                 # (may be short if loaded from state written by older code)
@@ -301,18 +370,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     if full:
                         state.current_king.commit_sha = full
 
-                # Check if the king has updated their commitment on chain
-                # (e.g. pushed a new agent version). Auto-update without
-                # requiring a duel so the king always runs their latest code.
-                if state.current_king:
-                    _maybe_update_king_commitment(
-                        chain_submissions=chain_submissions,
-                        state=state,
-                    )
-
                 if state.current_king is None:
                     log.info("No valid king or challengers found on subnet %s yet; sleeping", config.validate_netuid)
                     _save_state(paths.state_path, state)
+                    _publish_dashboard(state, dashboard_history, config, validator_started_at, None)
                     time.sleep(config.validate_poll_interval_seconds)
                     continue
 
@@ -342,12 +403,25 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 if challenger is None:
                     log.info("No challenger in queue; sleeping %ds", config.validate_poll_interval_seconds)
                     _save_state(paths.state_path, state)
+                    _publish_dashboard(state, dashboard_history, config, validator_started_at, None)
                     time.sleep(config.validate_poll_interval_seconds)
                     continue
 
                 log.info("Starting duel: king=%s vs challenger=%s (uid %s)",
                          state.current_king.commitment if state.current_king else "?",
                          challenger.commitment, challenger.uid)
+                active_duel_info = {
+                    "duel_id": state.next_duel_index,
+                    "king_uid": state.current_king.uid if state.current_king else None,
+                    "king_repo": state.current_king.repo_full_name if state.current_king else None,
+                    "challenger_uid": challenger.uid,
+                    "challenger_repo": challenger.repo_full_name,
+                    "started_at": _timestamp(),
+                    "rounds_completed": 0,
+                    "wins": 0, "losses": 0, "ties": 0,
+                }
+                _publish_dashboard(state, dashboard_history, config, validator_started_at, active_duel_info)
+
                 duel = _run_duel(
                     subtensor=subtensor,
                     github_client=github_client,
@@ -355,11 +429,24 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     state=state,
                     challenger=challenger,
                 )
+                active_duel_info = None
                 duel_count += 1
+
+                if duel.king_replaced:
+                    state.king_since = _timestamp()
+                    state.king_duels_defended = 0
+                else:
+                    state.king_duels_defended += 1
+
                 log.info("Duel %d complete: wins=%d losses=%d ties=%d king_replaced=%s",
                          duel_count, duel.wins, duel.losses, duel.ties, duel.king_replaced)
                 _write_duel(paths, duel)
                 _save_state(paths.state_path, state)
+
+                dashboard_history.append(duel_to_summary(duel.to_dict()))
+                _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
+                _publish_dashboard(state, dashboard_history, config, validator_started_at, None)
+
                 if config.validate_max_duels is not None and duel_count >= config.validate_max_duels:
                     break
     finally:
@@ -398,7 +485,8 @@ def _run_duel(
     losses = 0
     ties = 0
     launched = 0
-    completed = 0
+    scored = 0
+    sprt_verdict = "continue"
 
     log.info(
         "Starting duel %s: king uid=%s (%s) vs challenger uid=%s (%s)",
@@ -434,11 +522,13 @@ def _run_duel(
 
     with ThreadPoolExecutor(max_workers=config.validate_concurrency) as executor:
         futures: dict[Future[ValidationRoundResult], str] = {}
-        while completed < config.validate_rounds:
+
+        while scored < config.validate_max_rounds and sprt_verdict == "continue":
             while (
                 len(futures) < config.validate_concurrency
-                and launched < config.validate_rounds
+                and launched < config.validate_max_rounds
                 and time.monotonic() < deadline
+                and sprt_verdict == "continue"
             ):
                 task_name = _allocate_task_name(state)
                 future = executor.submit(
@@ -472,13 +562,32 @@ def _run_duel(
                 futures.pop(future, None)
                 rounds.append(result)
                 if result.scored:
-                    completed += 1
+                    scored += 1
                     if result.winner == "challenger":
                         wins += 1
                     elif result.winner == "king":
                         losses += 1
                     else:
                         ties += 1
+
+                    decisive = wins + losses
+                    if decisive > 0 and scored >= config.validate_min_rounds:
+                        sprt_verdict = _sprt_decision(
+                            wins=wins,
+                            losses=losses,
+                            epsilon=config.validate_epsilon,
+                            alpha=config.validate_alpha,
+                            beta=config.validate_beta,
+                        )
+                        log.info(
+                            "Duel %s SPRT after %d scored (%d decisive): "
+                            "W=%d L=%d T=%d verdict=%s",
+                            duel_id, scored, decisive, wins, losses, ties, sprt_verdict,
+                        )
+
+    if scored >= config.validate_max_rounds and sprt_verdict == "continue":
+        sprt_verdict = "king"
+        log.info("Duel %s hit max rounds (%d); defaulting to king", duel_id, config.validate_max_rounds)
 
     disqualification_reason: str | None = None
     king_after = king_before
@@ -502,18 +611,37 @@ def _run_duel(
             king_after = replacement
             king_replaced = True
         disqualification_reason = "king is no longer eligible"
-    elif wins > losses:
-        replacement = _resolve_promotion_candidate(
-            subtensor=subtensor,
-            github_client=github_client,
-            config=config,
-            state=state,
-            primary_candidate=challenger,
-        )
-        if replacement is not None:
-            _retire_hotkey(state, king_before.hotkey)
-            king_after = replacement
-            king_replaced = True
+    elif sprt_verdict == "challenger":
+        scored_with_similarity = [
+            r for r in rounds if r.scored and r.king_challenger_similarity > 0
+        ]
+        if scored_with_similarity:
+            mean_kc_sim = sum(r.king_challenger_similarity for r in scored_with_similarity) / len(
+                scored_with_similarity
+            )
+        else:
+            mean_kc_sim = 0.0
+
+        if mean_kc_sim >= config.validate_copy_similarity_threshold:
+            _mark_disqualified(state, challenger.hotkey)
+            disqualification_reason = (
+                f"challenger disqualified as likely copy "
+                f"(mean king-challenger similarity {mean_kc_sim:.3f} "
+                f">= threshold {config.validate_copy_similarity_threshold})"
+            )
+            log.warning("Duel %s: %s", duel_id, disqualification_reason)
+        else:
+            replacement = _resolve_promotion_candidate(
+                subtensor=subtensor,
+                github_client=github_client,
+                config=config,
+                state=state,
+                primary_candidate=challenger,
+            )
+            if replacement is not None:
+                _retire_hotkey(state, king_before.hotkey)
+                king_after = replacement
+                king_replaced = True
 
     if disqualification_reason is not None and not king_replaced:
         state.current_king = None
@@ -522,11 +650,12 @@ def _run_duel(
     finished_at = _timestamp()
     king_label = state.current_king.agent_ref if state.current_king is not None else "<none>"
     log.info(
-        "Finished duel %s: wins=%s losses=%s ties=%s king=%s",
+        "Finished duel %s: wins=%s losses=%s ties=%s verdict=%s king=%s",
         duel_id,
         wins,
         losses,
         ties,
+        sprt_verdict,
         king_label,
     )
     return DuelResult(
@@ -564,21 +693,47 @@ def _run_validation_round(
 
     try:
         generate_result = generate_task_run(task_name=task_name, config=config)
+
+        cursor_start = time.monotonic()
         cursor_result = solve_task_run(
             task_name=task_name,
             solution_name="cursor",
             config=_build_cursor_config(config),
         )
-        king_result = solve_task_run(
+        cursor_elapsed = time.monotonic() - cursor_start
+
+        _AGENT_TIMEOUT_FLOOR = 300
+        agent_timeout = max(int(cursor_elapsed * 2) + 1, _AGENT_TIMEOUT_FLOOR)
+        log.info(
+            "Cursor solved %s in %.1fs; agent timeout capped to %ds",
+            task_name, cursor_elapsed, agent_timeout,
+        )
+
+        king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
+        king_start = time.monotonic()
+        _king_result = solve_task_run(
             task_name=task_name,
             solution_name="king",
-            config=_build_agent_config(config, king),
+            config=king_cfg,
         )
-        challenger_result = solve_task_run(
+        king_elapsed = time.monotonic() - king_start
+        king_timed_out = king_elapsed >= agent_timeout
+
+        challenger_cfg = replace(_build_agent_config(config, challenger), agent_timeout=agent_timeout)
+        challenger_start = time.monotonic()
+        _challenger_result = solve_task_run(
             task_name=task_name,
             solution_name="challenger",
-            config=_build_agent_config(config, challenger),
+            config=challenger_cfg,
         )
+        challenger_elapsed = time.monotonic() - challenger_start
+        challenger_timed_out = challenger_elapsed >= agent_timeout
+
+        if king_timed_out:
+            log.info("King timed out on %s (%.1fs >= %ds); zero score", task_name, king_elapsed, agent_timeout)
+        if challenger_timed_out:
+            log.info("Challenger timed out on %s (%.1fs >= %ds); zero score", task_name, challenger_elapsed, agent_timeout)
+
         king_compare = compare_task_run(
             task_name=task_name,
             solution_names=["cursor", "king"],
@@ -589,6 +744,11 @@ def _run_validation_round(
             solution_names=["cursor", "challenger"],
             config=config,
         )
+        king_challenger_compare = compare_task_run(
+            task_name=task_name,
+            solution_names=["king", "challenger"],
+            config=config,
+        )
     except Exception as exc:  # noqa: BLE001
         return ValidationRoundResult(
             task_name=task_name,
@@ -597,16 +757,21 @@ def _run_validation_round(
             challenger_lines=0,
             king_similarity_ratio=0.0,
             challenger_similarity_ratio=0.0,
+            king_challenger_similarity=0.0,
             task_root=str(config.tasks_root / task_name),
             king_compare_root="",
             challenger_compare_root="",
             error=f"duel {duel_id} task {task_name} failed: {exc}",
         )
 
-    _ = cursor_result, king_result, challenger_result
-    if challenger_compare.matched_changed_lines > king_compare.matched_changed_lines:
+    _ = cursor_result
+
+    king_lines = 0 if king_timed_out else king_compare.matched_changed_lines
+    challenger_lines = 0 if challenger_timed_out else challenger_compare.matched_changed_lines
+
+    if challenger_lines > king_lines:
         winner = "challenger"
-    elif challenger_compare.matched_changed_lines < king_compare.matched_changed_lines:
+    elif challenger_lines < king_lines:
         winner = "king"
     else:
         winner = "tie"
@@ -614,10 +779,11 @@ def _run_validation_round(
     return ValidationRoundResult(
         task_name=task_name,
         winner=winner,
-        king_lines=king_compare.matched_changed_lines,
-        challenger_lines=challenger_compare.matched_changed_lines,
-        king_similarity_ratio=king_compare.similarity_ratio,
-        challenger_similarity_ratio=challenger_compare.similarity_ratio,
+        king_lines=king_lines,
+        challenger_lines=challenger_lines,
+        king_similarity_ratio=0.0 if king_timed_out else king_compare.similarity_ratio,
+        challenger_similarity_ratio=0.0 if challenger_timed_out else challenger_compare.similarity_ratio,
+        king_challenger_similarity=king_challenger_compare.similarity_ratio,
         task_root=generate_result.task_root,
         king_compare_root=king_compare.comparison_root,
         challenger_compare_root=challenger_compare.comparison_root,
@@ -656,6 +822,7 @@ def _run_mock_validation_round(
         challenger_lines=challenger_lines,
         king_similarity_ratio=0.40,
         challenger_similarity_ratio=0.75,
+        king_challenger_similarity=0.30,
         task_root=str(task_root),
         king_compare_root=str(king_compare_root),
         challenger_compare_root=str(challenger_compare_root),
@@ -675,10 +842,20 @@ def _refresh_queue(
     submissions = chain_submissions
     queue_limit = config.validate_queue_size
     for submission in submissions:
+        locked = state.locked_commitments.get(submission.hotkey)
+        if locked is not None and locked != submission.commitment:
+            log.warning(
+                "Hotkey %s changed commitment from %r to %r; ignoring (immutable)",
+                submission.hotkey,
+                locked,
+                submission.commitment,
+            )
+            continue
         if submission.hotkey in known_hotkeys:
             continue
         if queue_limit is not None and len(state.queue) >= queue_limit:
             break
+        state.locked_commitments[submission.hotkey] = submission.commitment
         state.queue.append(submission)
         state.seen_hotkeys.append(submission.hotkey)
         known_hotkeys.add(submission.hotkey)
@@ -820,31 +997,6 @@ def _ensure_king(*, state: ValidatorState) -> None:
     if not state.queue:
         return
     state.current_king = state.queue.pop(0)
-
-
-def _maybe_update_king_commitment(
-    *,
-    chain_submissions: list[ValidatorSubmission],
-    state: ValidatorState,
-) -> None:
-    """If the king has updated their chain commitment, update the king in state.
-
-    This lets the king push improved agent code without losing the throne.
-    """
-    king = state.current_king
-    if king is None:
-        return
-
-    for sub in chain_submissions:
-        if sub.hotkey == king.hotkey and sub.commit_sha != king.commit_sha:
-            log.info(
-                "King %s updated commitment on chain: %s -> %s",
-                king.hotkey,
-                king.commitment,
-                sub.commitment,
-            )
-            state.current_king = sub
-            break
 
 
 def _pop_next_valid_challenger(
@@ -1052,6 +1204,91 @@ def _write_duel(paths: ValidatePaths, duel: DuelResult) -> None:
     write_json(duel_path, duel.to_dict())
 
 
+def _load_dashboard_history(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text())
+        if isinstance(payload, list):
+            return payload
+    except Exception:
+        log.exception("Failed to load dashboard history from %s; starting fresh", path)
+    return []
+
+
+def _save_dashboard_history(path: Path, history: list[dict[str, Any]]) -> None:
+    write_json(path, history)
+
+
+def _publish_dashboard(
+    state: ValidatorState,
+    history: list[dict[str, Any]],
+    config: RunConfig,
+    validator_started_at: str,
+    active_duel: dict[str, Any] | None,
+) -> None:
+    king = state.current_king
+    king_dict = {
+        "uid": king.uid,
+        "hotkey": king.hotkey,
+        "repo_full_name": king.repo_full_name,
+        "repo_url": f"https://github.com/{king.repo_full_name}",
+        "commit_sha": king.commit_sha,
+    } if king else None
+
+    commitment_to_submission: dict[str, dict[str, Any]] = {}
+    for d in history:
+        for role in ("king", "challenger"):
+            hk = d.get(f"{role}_hotkey")
+            if hk and hk not in commitment_to_submission:
+                commitment_to_submission[hk] = {
+                    "uid": d.get(f"{role}_uid"),
+                    "hotkey": hk,
+                    "repo": d.get(f"{role}_repo"),
+                }
+
+    def _resolve_hotkey(hk: str) -> dict[str, Any]:
+        if hk in commitment_to_submission:
+            return commitment_to_submission[hk]
+        commitment = state.locked_commitments.get(hk, "")
+        repo = commitment.split("@")[0] if "@" in commitment else commitment
+        return {"uid": None, "hotkey": hk, "repo": repo or "unknown"}
+
+    total_rounds = sum(len(d.get("rounds", [])) for d in history)
+    status = {
+        "validator_started_at": validator_started_at,
+        "netuid": config.validate_netuid,
+        "queue": [
+            {"uid": s.uid, "repo": s.repo_full_name, "hotkey": s.hotkey, "commitment_block": s.commitment_block}
+            for s in state.queue
+        ],
+        "active_duel": active_duel,
+        "disqualified": [_resolve_hotkey(hk) for hk in state.disqualified_hotkeys],
+        "retired": [_resolve_hotkey(hk) for hk in state.retired_hotkeys],
+        "total_rounds": total_rounds,
+        "miners_seen": len(state.seen_hotkeys),
+        "king_since": state.king_since,
+        "king_duels_defended": state.king_duels_defended,
+    }
+
+    local_payload = {
+        "updated_at": _timestamp(),
+        "current_king": king_dict,
+        "duels": history,
+        "status": status,
+    }
+    local_path = config.validate_root / "dashboard_data.json"
+    try:
+        write_json(local_path, local_payload)
+    except Exception:
+        log.exception("Failed to write local dashboard_data.json (non-fatal)")
+
+    try:
+        publish_dashboard_data(current_king=king_dict, duel_history=history, status=status)
+    except Exception:
+        log.exception("R2 dashboard publish failed (non-fatal)")
+
+
 def _retire_hotkey(state: ValidatorState, hotkey: str) -> None:
     if hotkey not in state.retired_hotkeys:
         state.retired_hotkeys.append(hotkey)
@@ -1131,9 +1368,11 @@ def _open_subtensor(config: RunConfig):
     if config.validate_mock_local_agent:
         return _MockSubtensorApi()
     network = config.validate_subtensor_endpoint or config.validate_network
+    # Disable the default 5-second websocket auto-shutdown so the connection
+    # survives idle periods (e.g. while resolving GitHub SHAs between chain queries).
     if network:
-        return bt.SubtensorApi(network=network)
-    return bt.SubtensorApi()
+        return bt.SubtensorApi(network=network, websocket_shutdown_timer=0)
+    return bt.SubtensorApi(websocket_shutdown_timer=0)
 
 
 def _timestamp() -> str:

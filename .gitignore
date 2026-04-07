@@ -21,5 +21,8 @@ build/
 dist/
 *.egg-info/
 
+# Runtime logs
+validator.log
+
 # OS/editor cruft
 .DS_Store
