@@ -218,7 +218,12 @@ class PoolTask:
 # ---------------------------------------------------------------------------
 
 class TaskPool:
-    """Thread-safe pool of pre-solved tasks (generate + claw baseline + king)."""
+    """Thread-safe pool of pre-solved tasks shared across all duels.
+
+    Tasks are NOT removed on read so every active duel can reuse the same
+    baseline+king work.  Each duel tracks which tasks it has already used
+    and passes an ``exclude`` set to skip them.
+    """
 
     def __init__(self, pool_dir: Path) -> None:
         self._pool_dir = pool_dir
@@ -233,21 +238,50 @@ class TaskPool:
         path = self._pool_dir / f"{task.task_name}.json"
         write_json(path, task.to_dict())
 
+    def take(self, min_block: int, exclude: set[str] | None = None) -> PoolTask | None:
+        """Return a pool task without removing it.
+
+        Skips tasks whose name is in *exclude* (already used by this duel).
+        """
+        excluded = exclude or set()
+        with self._lock:
+            for p in sorted(self._pool_dir.glob("*.json")):
+                try:
+                    d = json.loads(p.read_text())
+                    task_name = str(d.get("task_name", ""))
+                    if task_name in excluded:
+                        continue
+                    if int(d.get("creation_block", 0)) > min_block:
+                        return PoolTask.from_dict(d)
+                except Exception:
+                    p.unlink(missing_ok=True)
+            return None
+
+    # Keep pop() for backward compat (used by nothing now, but safe to have)
     def pop(self, min_block: int) -> PoolTask | None:
         with self._lock:
-            candidates = []
             for p in sorted(self._pool_dir.glob("*.json")):
                 try:
                     d = json.loads(p.read_text())
                     if int(d.get("creation_block", 0)) > min_block:
-                        candidates.append((p, d))
+                        path = p
+                        path.unlink(missing_ok=True)
+                        return PoolTask.from_dict(d)
                 except Exception:
                     p.unlink(missing_ok=True)
-            if not candidates:
-                return None
-            path, data = candidates[0]
-            path.unlink(missing_ok=True)
-            return PoolTask.from_dict(data)
+            return None
+
+    def prune(self, keep: int) -> int:
+        """Remove the oldest pool tasks if pool exceeds *keep* entries."""
+        with self._lock:
+            files = sorted(self._pool_dir.glob("*.json"))
+            if len(files) <= keep:
+                return 0
+            removed = 0
+            for p in files[:-keep]:
+                p.unlink(missing_ok=True)
+                removed += 1
+            return removed
 
     def flush(self) -> int:
         with self._lock:
@@ -289,17 +323,26 @@ def _pool_filler_loop(
                 log.info("Pool filler: skipping %s (patch too small)", task_name)
                 continue
 
-            baseline_start = time.monotonic()
-            solve_task_run(task_name=task_name, solution_name="baseline", config=_build_baseline_config(config))
-            baseline_elapsed = time.monotonic() - baseline_start
-
             king = state.current_king
             if king is None:
                 continue
 
-            agent_timeout = min(int(baseline_elapsed * 2) + 1, 300)
-            king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
-            solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
+            baseline_cfg = _build_baseline_config(config)
+            king_cfg = replace(_build_agent_config(config, king), agent_timeout=300)
+
+            baseline_start = time.monotonic()
+            with ThreadPoolExecutor(max_workers=2) as solve_exec:
+                baseline_fut = solve_exec.submit(
+                    solve_task_run, task_name=task_name,
+                    solution_name="baseline", config=baseline_cfg,
+                )
+                king_fut = solve_exec.submit(
+                    solve_task_run, task_name=task_name,
+                    solution_name="king", config=king_cfg,
+                )
+                baseline_fut.result()
+                king_fut.result()
+            baseline_elapsed = time.monotonic() - baseline_start
 
             king_compare = compare_task_run(task_name=task_name, solution_names=["baseline", "king"], config=config)
 
@@ -318,7 +361,8 @@ def _pool_filler_loop(
                 king_similarity=king_compare.similarity_ratio,
                 baseline_lines=king_compare.total_changed_lines_a,
             ))
-            log.info("Pool filler: added %s (pool size: %d)", task_name, pool.size())
+            pruned = pool.prune(keep=config.validate_task_pool_target)
+            log.info("Pool filler: added %s (pool size: %d, pruned: %d)", task_name, pool.size(), pruned)
 
         except Exception:
             log.exception("Pool filler: error generating task (retrying)")
@@ -344,17 +388,18 @@ def _run_duel(
     started_at = _timestamp()
     rounds: list[ValidationRoundResult] = []
     wins = losses = ties = scored = 0
+    used_tasks: set[str] = set()
 
     log.info("Duel %d: king uid=%s vs challenger uid=%s (%s), need %d/%d wins",
              duel_id, king.uid, challenger.uid, challenger.repo_full_name,
              threshold, config.validate_duel_rounds)
 
     while scored < config.validate_duel_rounds and not cancel_event.is_set():
-        # Pop a task from the pool (must be created after challenger committed)
-        task = pool.pop(min_block=challenger.commitment_block)
+        task = pool.take(min_block=challenger.commitment_block, exclude=used_tasks)
         if task is None:
             cancel_event.wait(3)
             continue
+        used_tasks.add(task.task_name)
 
         try:
             agent_timeout = min(int(task.cursor_elapsed * 2) + 1, 300)
