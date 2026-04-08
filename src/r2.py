@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+import httpx
 
 log = logging.getLogger("swe-eval.r2")
 
@@ -348,3 +349,51 @@ def backfill_duel_to_r2(
 
     log.info("Backfilled duel %d from %s", duel_id, duel_json_path)
     return True
+
+
+def fetch_chain_data(netuid: int) -> dict[str, Any] | None:
+    """Fetch subnet and market data from the TaoMarketCap API."""
+    api_key = os.environ.get("TMC_API_KEY")
+    if not api_key:
+        return None
+    headers = {"Authorization": api_key, "Accept": "application/json"}
+    base = "https://api.taomarketcap.com/public/v1"
+    try:
+        with httpx.Client(timeout=15, headers=headers) as c:
+            market = c.get(f"{base}/market/market-data/")
+            subnet = c.get(f"{base}/subnets/{netuid}/")
+            weights = c.get(f"{base}/subnets/weights/{netuid}/")
+        m = market.json() if market.status_code == 200 else {}
+        s = subnet.json() if subnet.status_code == 200 else {}
+        w = weights.json() if weights.status_code == 200 else {}
+        snap = s.get("latest_snapshot", {})
+        burn = int(snap.get("burn", 0))
+        tao = float(m.get("current_price", 0))
+        alpha_tao = float(snap.get("subnet_moving_price", 0))
+        wt = []
+        for we in w.get("weights", []):
+            for tid, val in we.get("value", {}).items():
+                wt.append({"validator_uid": we["uid"], "miner_uid": int(tid), "weight": val})
+        return {
+            "fetched_at": datetime.now(tz=UTC).isoformat(),
+            "tao_price_usd": tao,
+            "tao_change_24h": float((m.get("usd_quote") or {}).get("percent_change_24h", 0)),
+            "tao_market_cap": float((m.get("usd_quote") or {}).get("market_cap", 0)),
+            "alpha_price_tao": alpha_tao,
+            "alpha_price_usd": alpha_tao * tao,
+            "subnet_tao": int(snap.get("subnet_tao", 0)) / 1e9,
+            "subnet_emission_per_day": int(snap.get("subnet_tao_in_emission", 0)) / 1e9 * 7200,
+            "burn_cost_rao": burn,
+            "burn_cost_tao": burn / 1e9,
+            "burn_cost_usd": burn / 1e9 * tao,
+            "neuron_count": int(snap.get("subnetwork_n", 0)),
+            "max_neurons": int(snap.get("max_allowed_uids", 256)),
+            "token_symbol": snap.get("token_symbol", ""),
+            "subnet_name": (snap.get("subnet_identities_v3") or {}).get("subnetName", ""),
+            "tempo": int(snap.get("tempo", 0)),
+            "immunity_period": int(snap.get("immunity_period", 0)),
+            "weights": wt,
+        }
+    except Exception:
+        log.exception("Failed to fetch chain data (non-fatal)")
+        return None
