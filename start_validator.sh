@@ -25,8 +25,8 @@ echo "$(date -Iseconds) Starting validator..." >> "$LOGFILE"
 tau validate \
   --wallet-name sn66_owner \
   --wallet-hotkey default \
-  --max-concurrency 20 \
+  --max-concurrency 48 \
   --task-pool-target 60 \
-  --duel-rounds 25 \
-  --win-margin 4 \
+  --duel-rounds 15 \
+  --win-margin 3 \
   >> "$LOGFILE" 2>&1

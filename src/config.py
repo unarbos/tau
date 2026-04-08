@@ -73,9 +73,9 @@ class RunConfig:
     validate_netuid: int = 66
     validate_network: str | None = None
     validate_subtensor_endpoint: str | None = None
-    validate_duel_rounds: int = 25
-    validate_win_margin: int = 4
-    validate_max_concurrency: int = 20
+    validate_duel_rounds: int = 15
+    validate_win_margin: int = 3
+    validate_max_concurrency: int = 48
     validate_task_pool_target: int = 60
     validate_pool_filler_concurrency: int = 24
     validate_weight_interval_blocks: int = 360
