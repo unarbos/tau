@@ -5,6 +5,8 @@ import logging
 import random
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import asdict, dataclass
 from urllib.parse import urlencode
 
@@ -13,6 +15,67 @@ import httpx
 
 _GITHUB_API = "https://api.github.com"
 log = logging.getLogger("swe-eval.github_miner")
+
+_RATE_LIMIT_COOLDOWN = 60  # seconds to wait before reusing a rate-limited token
+
+
+class GitHubTokenRotator:
+    """Thread-safe round-robin over multiple GitHub PATs with rate-limit tracking."""
+
+    def __init__(self, tokens: list[str]) -> None:
+        if not tokens:
+            raise ValueError("GitHubTokenRotator requires at least one token")
+        self._tokens = list(tokens)
+        self._index = 0
+        self._lock = threading.Lock()
+        self._cooldowns: dict[int, float] = {}
+        log.info("Token rotator initialised with %d token(s)", len(self._tokens))
+
+    @classmethod
+    def from_env(cls, multi: str | None = None, single: str | None = None) -> GitHubTokenRotator | None:
+        """Build a rotator from GITHUB_TOKENS (comma-separated) or GITHUB_TOKEN."""
+        raw = multi or ""
+        tokens = [t.strip() for t in raw.split(",") if t.strip()]
+        if not tokens and single:
+            tokens = [single]
+        return cls(tokens) if tokens else None
+
+    @property
+    def size(self) -> int:
+        return len(self._tokens)
+
+    def get_token(self) -> str:
+        """Return the next available token. Blocks if all tokens are cooling down."""
+        with self._lock:
+            n = len(self._tokens)
+            now = time.monotonic()
+
+            for _ in range(n):
+                idx = self._index % n
+                self._index += 1
+                ready_at = self._cooldowns.get(idx, 0)
+                if now >= ready_at:
+                    return self._tokens[idx]
+
+            earliest = min(self._cooldowns.values())
+            wait = max(0, earliest - now)
+
+        log.warning("All %d GitHub tokens rate-limited; sleeping %.0fs", n, wait)
+        time.sleep(wait)
+        return self.get_token()
+
+    def mark_rate_limited(self, token: str) -> None:
+        """Put *token* on cooldown so other threads skip it."""
+        with self._lock:
+            try:
+                idx = self._tokens.index(token)
+            except ValueError:
+                return
+            self._cooldowns[idx] = time.monotonic() + _RATE_LIMIT_COOLDOWN
+            log.info("Token #%d rate-limited, cooldown %ds (%d/%d on cooldown)",
+                     idx, _RATE_LIMIT_COOLDOWN,
+                     sum(1 for v in self._cooldowns.values() if v > time.monotonic()),
+                     len(self._tokens))
 
 
 @dataclass(slots=True)
@@ -134,16 +197,19 @@ class GitHubMiner:
     def __init__(
         self,
         *,
-        token: str | None,
+        token: str | None = None,
+        token_rotator: GitHubTokenRotator | None = None,
         rng: random.Random,
         timeout: float = 30.0,
     ) -> None:
+        self._rotator = token_rotator
+        self._static_token = token
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "swe-eval",
         }
-        if token:
+        if not token_rotator and token:
             headers["Authorization"] = f"Bearer {token}"
         self._rng = rng
         self._client = httpx.Client(
@@ -152,7 +218,7 @@ class GitHubMiner:
             timeout=timeout,
             follow_redirects=True,
         )
-        self._use_gh_cli = bool(not token and shutil.which("gh"))
+        self._use_gh_cli = bool(not token and not token_rotator and shutil.which("gh"))
 
     def close(self) -> None:
         log.debug("Closing HTTP client")
@@ -318,21 +384,29 @@ class GitHubMiner:
         return sorted(pages)
 
     def _get_json(self, path: str, return_response: bool = False, **params):
+        used_token: str | None = None
         try:
             log.debug("GET %s params=%s", path, params or None)
-            response = self._client.get(path, params=params or None)
+            request_headers: dict[str, str] = {}
+            if self._rotator:
+                used_token = self._rotator.get_token()
+                request_headers["Authorization"] = f"Bearer {used_token}"
+            response = self._client.get(path, params=params or None, headers=request_headers or None)
             response.raise_for_status()
             payload = response.json()
             if return_response:
                 return response, payload
             return payload
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 403 and self._use_gh_cli:
-                log.debug("HTTP 403 for %s, falling back to gh api", path)
-                payload = self._get_json_via_gh(path, **params)
-                if return_response:
-                    return None, payload
-                return payload
+            if exc.response.status_code == 403:
+                if self._rotator and used_token:
+                    self._rotator.mark_rate_limited(used_token)
+                if self._use_gh_cli:
+                    log.debug("HTTP 403 for %s, falling back to gh api", path)
+                    payload = self._get_json_via_gh(path, **params)
+                    if return_response:
+                        return None, payload
+                    return payload
             raise
 
     @staticmethod

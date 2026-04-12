@@ -11,7 +11,7 @@ from config import RunConfig
 from cursor_runner import solve_task_with_cursor_in_docker
 from docker_solver import solve_task_in_docker
 from eval import evaluate_candidate_pair
-from github_miner import GitHubMiner
+from github_miner import GitHubMiner, GitHubTokenRotator
 from solver_runner import solve_task, solve_task_claw
 from task_generation import generate_task_description
 from workspace import (
@@ -50,6 +50,7 @@ class SolveStageResult:
     solution_root: str
     success: bool
     agent: str | None
+    exit_reason: str = "completed"
 
 
 @dataclass(slots=True)
@@ -83,10 +84,29 @@ class DeleteStageResult:
     deleted_all: bool
 
 
+_shared_rotator: GitHubTokenRotator | None = None
+_rotator_init_done = False
+
+
+def _get_shared_rotator(config: RunConfig) -> GitHubTokenRotator | None:
+    global _shared_rotator, _rotator_init_done
+    if _rotator_init_done:
+        return _shared_rotator
+    _shared_rotator = GitHubTokenRotator.from_env(
+        multi=config.github_tokens, single=config.github_token,
+    )
+    _rotator_init_done = True
+    return _shared_rotator
+
+
 def generate_task_run(*, task_name: str, config: RunConfig) -> GenerateStageResult:
     _setup_logging(debug=config.debug)
     rng = random.Random(config.random_seed)
-    miner = GitHubMiner(token=config.github_token, rng=rng, timeout=config.http_timeout)
+    rotator = _get_shared_rotator(config)
+    miner = GitHubMiner(
+        token_rotator=rotator, token=config.github_token if not rotator else None,
+        rng=rng, timeout=config.http_timeout,
+    )
     try:
         log.debug("Sampling commit candidate for task %s", task_name)
         candidate = miner.sample_commit(max_attempts=config.max_mining_attempts)
@@ -187,6 +207,7 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
         solution_root=str(solution_paths.root),
         success=solve_result.success,
         agent=_solve_agent_label(config),
+        exit_reason=solve_result.exit_reason,
     )
 
 
@@ -362,6 +383,10 @@ def _setup_logging(*, debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
     root = logging.getLogger()
     root.setLevel(level)
+
+    # Bittensor sets all non-bittensor loggers to CRITICAL on import.
+    # Reset our own logger tree so output is not silenced.
+    logging.getLogger("swe-eval").setLevel(level)
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",

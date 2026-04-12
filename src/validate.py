@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +36,20 @@ _GITHUB_COMMIT_RE = re.compile(
 )
 _BASELINE_MODEL = "gemini-3-flash"
 _MIN_PATCH_LINES = 100
+_MIN_DECISIVE_ROUNDS = 10
+
+
+def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
+    """Check if the challenger has won the duel based on decisive rounds only.
+
+    Ties are fully excluded. The challenger must win more than half of
+    decisive rounds plus a margin, and there must be at least
+    ``_MIN_DECISIVE_ROUNDS`` decisive rounds to avoid fluky outcomes.
+    """
+    decisive = wins + losses
+    if decisive < _MIN_DECISIVE_ROUNDS:
+        return False
+    return wins > decisive // 2 + margin
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +256,8 @@ class TaskPool:
         """Return a pool task without removing it.
 
         Skips tasks whose name is in *exclude* (already used by this duel).
+        A task with ``creation_block == 0`` (chain lookup failed during pool
+        fill) is treated as universally eligible.
         """
         excluded = exclude or set()
         with self._lock:
@@ -251,7 +267,8 @@ class TaskPool:
                     task_name = str(d.get("task_name", ""))
                     if task_name in excluded:
                         continue
-                    if int(d.get("creation_block", 0)) > min_block:
+                    creation_block = int(d.get("creation_block", 0))
+                    if creation_block == 0 or creation_block > min_block:
                         return PoolTask.from_dict(d)
                 except Exception:
                     p.unlink(missing_ok=True)
@@ -301,6 +318,8 @@ def _pool_filler_loop(
     state: ValidatorState,
     pool: TaskPool,
     stop_event: threading.Event,
+    state_lock: threading.Lock,
+    pool_starved: threading.Event | None = None,
 ) -> None:
     while not stop_event.is_set():
         try:
@@ -308,11 +327,13 @@ def _pool_filler_loop(
                 stop_event.wait(5)
                 continue
 
-            if pool.size() >= config.validate_task_pool_target:
+            starved = pool_starved is not None and pool_starved.is_set()
+            if pool.size() >= config.validate_task_pool_target and not starved:
                 stop_event.wait(2)
                 continue
 
-            task_name = _allocate_task_name(state)
+            with state_lock:
+                task_name = _allocate_task_name(state)
             log.info("Pool filler: generating task %s", task_name)
 
             generate_result = generate_task_run(task_name=task_name, config=config)
@@ -326,6 +347,7 @@ def _pool_filler_loop(
             king = state.current_king
             if king is None:
                 continue
+            king_hotkey_before = king.hotkey
 
             baseline_cfg = _build_baseline_config(config)
             king_cfg = replace(_build_agent_config(config, king), agent_timeout=300)
@@ -344,6 +366,11 @@ def _pool_filler_loop(
                 king_fut.result()
             baseline_elapsed = time.monotonic() - baseline_start
 
+            current_king = state.current_king
+            if current_king is None or current_king.hotkey != king_hotkey_before:
+                log.info("Pool filler: discarding %s (king changed during solve)", task_name)
+                continue
+
             king_compare = compare_task_run(task_name=task_name, solution_names=["baseline", "king"], config=config)
 
             try:
@@ -351,6 +378,10 @@ def _pool_filler_loop(
                     creation_block = sub.block
             except Exception:
                 creation_block = 0
+
+            if state.current_king is None or state.current_king.hotkey != king_hotkey_before:
+                log.info("Pool filler: discarding %s (king changed during compare)", task_name)
+                continue
 
             pool.add(PoolTask(
                 task_name=task_name,
@@ -362,6 +393,8 @@ def _pool_filler_loop(
                 baseline_lines=king_compare.total_changed_lines_a,
             ))
             pruned = pool.prune(keep=config.validate_task_pool_target)
+            if pool_starved is not None:
+                pool_starved.clear()
             log.info("Pool filler: added %s (pool size: %d, pruned: %d)", task_name, pool.size(), pruned)
 
         except Exception:
@@ -383,8 +416,9 @@ def _run_duel(
     pool: TaskPool,
     cancel_event: threading.Event,
     on_round_complete: Any = None,
+    pool_starved: threading.Event | None = None,
 ) -> DuelResult:
-    threshold = config.validate_duel_rounds // 2 + config.validate_win_margin + 1
+    margin = config.validate_win_margin
     started_at = _timestamp()
     rounds: list[ValidationRoundResult] = []
     wins = losses = ties = scored = 0
@@ -392,10 +426,13 @@ def _run_duel(
     duel_start_mono = time.monotonic()
     max_total_rounds = config.validate_duel_rounds * 3
     _POOL_WAIT_TIMEOUT = 300
+    _MAX_POOL_TIMEOUTS = 3
+    consecutive_pool_timeouts = 0
 
-    log.info("Duel %d: king uid=%s vs challenger uid=%s (%s), need %d/%d wins",
+    log.info("Duel %d: king uid=%s vs challenger uid=%s (%s), %d rounds, "
+             "need >50%%+%d of decisive rounds (min %d decisive, ties ignored)",
              duel_id, king.uid, challenger.uid, challenger.repo_full_name,
-             threshold, config.validate_duel_rounds)
+             config.validate_duel_rounds, margin, _MIN_DECISIVE_ROUNDS)
 
     while scored < config.validate_duel_rounds and not cancel_event.is_set():
         duel_elapsed = time.monotonic() - duel_start_mono
@@ -412,6 +449,8 @@ def _run_duel(
 
         task = pool.take(min_block=challenger.commitment_block, exclude=used_tasks)
         if task is None:
+            if pool_starved is not None:
+                pool_starved.set()
             pool_wait_start = time.monotonic()
             while task is None and not cancel_event.is_set():
                 waited = time.monotonic() - pool_wait_start
@@ -424,18 +463,22 @@ def _run_duel(
                 cancel_event.wait(3)
                 task = pool.take(min_block=challenger.commitment_block, exclude=used_tasks)
             if task is None:
+                consecutive_pool_timeouts += 1
+                if consecutive_pool_timeouts >= _MAX_POOL_TIMEOUTS:
+                    log.warning("Duel %d: aborting after %d consecutive pool timeouts (scored %d/%d)",
+                                duel_id, consecutive_pool_timeouts, scored, config.validate_duel_rounds)
+                    break
                 continue
+        consecutive_pool_timeouts = 0
         used_tasks.add(task.task_name)
 
         try:
             agent_timeout = min(int(task.cursor_elapsed * 2) + 1, 300)
-            solution_label = f"challenger-{challenger.uid}"
+            solution_label = f"challenger-{challenger.uid}-d{duel_id}"
 
             challenger_cfg = replace(_build_agent_config(config, challenger), agent_timeout=agent_timeout)
-            chall_start = time.monotonic()
-            solve_task_run(task_name=task.task_name, solution_name=solution_label, config=challenger_cfg)
-            chall_elapsed = time.monotonic() - chall_start
-            chall_timed_out = chall_elapsed >= agent_timeout
+            solve_result = solve_task_run(task_name=task.task_name, solution_name=solution_label, config=challenger_cfg)
+            chall_timed_out = solve_result.exit_reason == "time_limit_exceeded"
 
             if chall_timed_out:
                 log.info("Duel %d: challenger uid=%s timed out on %s", duel_id, challenger.uid, task.task_name)
@@ -494,32 +537,34 @@ def _run_duel(
 
         rounds.append(result)
         if result.scored:
-            scored += 1
             if result.winner == "challenger":
                 wins += 1
+                scored += 1
             elif result.winner == "king":
                 losses += 1
+                scored += 1
             else:
                 ties += 1
 
-            log.info("Duel %d round %d: %s (W=%d L=%d T=%d, need %d more wins)",
-                     duel_id, scored, result.winner, wins, losses, ties, max(0, threshold - wins))
+            decisive = wins + losses
+            log.info("Duel %d round=%d: %s (W=%d L=%d T=%d, decisive=%d)",
+                     duel_id, len(rounds), result.winner, wins, losses, ties, decisive)
 
-            # Early stop: threshold reached
-            if wins >= threshold:
-                log.info("Duel %d: challenger uid=%s WINS (%d/%d)", duel_id, challenger.uid, wins, scored)
+            if _challenger_wins(wins, losses, margin):
+                log.info("Duel %d: challenger uid=%s WINS (%d/%d decisive)", duel_id, challenger.uid, wins, decisive)
                 break
-            # Early stop: can't reach threshold
             remaining = config.validate_duel_rounds - scored
-            if wins + remaining < threshold:
-                log.info("Duel %d: challenger uid=%s can't reach threshold (%d + %d < %d)",
-                         duel_id, challenger.uid, wins, remaining, threshold)
+            if remaining <= 0 and not _challenger_wins(wins, losses, margin):
+                log.info("Duel %d: all rounds exhausted, challenger uid=%s did not win (%d/%d decisive)",
+                         duel_id, challenger.uid, wins, decisive)
                 break
 
         if on_round_complete is not None:
             try:
+                decisive = wins + losses
+                dyn_threshold = decisive // 2 + margin + 1 if decisive >= _MIN_DECISIVE_ROUNDS else _MIN_DECISIVE_ROUNDS
                 on_round_complete(duel_id=duel_id, wins=wins, losses=losses, ties=ties,
-                                  scored=scored, threshold=threshold, rounds=rounds)
+                                  scored=scored, threshold=dyn_threshold, rounds=rounds)
             except Exception:
                 log.exception("on_round_complete callback failed (non-fatal)")
 
@@ -527,8 +572,12 @@ def _run_duel(
     king_replaced = False
     dq_reason: str | None = None
     king_after = king
+    decisive = wins + losses
 
-    if wins >= threshold:
+    log.info("Duel %d final: W=%d L=%d T=%d (decisive=%d, challenger_wins=%s)",
+             duel_id, wins, losses, ties, decisive, _challenger_wins(wins, losses, margin))
+
+    if _challenger_wins(wins, losses, margin):
         scored_sim = [r for r in rounds if r.scored and r.king_challenger_similarity > 0]
         mean_sim = sum(r.king_challenger_similarity for r in scored_sim) / len(scored_sim) if scored_sim else 0.0
         _COPY_THRESHOLD = 0.90
@@ -548,14 +597,277 @@ def _run_duel(
 
 
 # ---------------------------------------------------------------------------
+# Parallel duel runner (all rounds run concurrently)
+# ---------------------------------------------------------------------------
+
+def _gather_pool_tasks(
+    pool: TaskPool,
+    n: int,
+    min_block: int,
+    timeout: float = 600,
+    pool_starved: threading.Event | None = None,
+) -> list[PoolTask]:
+    """Collect up to *n* distinct tasks from the pool, waiting if needed."""
+    tasks: list[PoolTask] = []
+    seen: set[str] = set()
+    deadline = time.monotonic() + timeout
+    while len(tasks) < n:
+        remaining_time = deadline - time.monotonic()
+        if remaining_time <= 0:
+            break
+        task = pool.take(min_block=min_block, exclude=seen)
+        if task is not None:
+            tasks.append(task)
+            seen.add(task.task_name)
+        else:
+            if pool_starved is not None:
+                pool_starved.set()
+            time.sleep(min(3, remaining_time))
+    if pool_starved is not None:
+        pool_starved.clear()
+    return tasks
+
+
+def _solve_and_compare_round(
+    *,
+    task: PoolTask,
+    challenger: ValidatorSubmission,
+    config: RunConfig,
+    duel_id: int,
+) -> ValidationRoundResult:
+    """Run a single round: solve challenger, then compare. Thread-safe."""
+    solution_label = f"challenger-{challenger.uid}-d{duel_id}"
+    try:
+        agent_timeout = min(int(task.cursor_elapsed * 2) + 1, 300)
+        challenger_cfg = replace(
+            _build_agent_config(config, challenger), agent_timeout=agent_timeout,
+        )
+        solve_result = solve_task_run(
+            task_name=task.task_name, solution_name=solution_label,
+            config=challenger_cfg,
+        )
+        chall_timed_out = solve_result.exit_reason == "time_limit_exceeded"
+        if chall_timed_out:
+            log.info("Duel %d: challenger uid=%s timed out on %s",
+                     duel_id, challenger.uid, task.task_name)
+
+        with ThreadPoolExecutor(max_workers=2) as cmp_exec:
+            chall_fut = cmp_exec.submit(
+                compare_task_run, task_name=task.task_name,
+                solution_names=["baseline", solution_label], config=config,
+            )
+            kc_fut = cmp_exec.submit(
+                compare_task_run, task_name=task.task_name,
+                solution_names=["king", solution_label], config=config,
+            )
+            chall_compare = chall_fut.result()
+            kc_compare = kc_fut.result()
+
+        c_lines = 0 if chall_timed_out else chall_compare.matched_changed_lines
+        k_lines = task.king_lines
+
+        if c_lines > k_lines:
+            winner = "challenger"
+        elif c_lines < k_lines:
+            winner = "king"
+        else:
+            winner = "tie"
+
+        result = ValidationRoundResult(
+            task_name=task.task_name, winner=winner,
+            king_lines=k_lines, challenger_lines=c_lines,
+            king_similarity_ratio=task.king_similarity,
+            challenger_similarity_ratio=0.0 if chall_timed_out else chall_compare.similarity_ratio,
+            king_challenger_similarity=kc_compare.similarity_ratio,
+            task_root=task.task_root,
+            king_compare_root="",
+            challenger_compare_root=chall_compare.comparison_root,
+            baseline_lines=task.baseline_lines,
+        )
+
+        try:
+            publish_round_data(
+                duel_id=duel_id, task_name=task.task_name,
+                tasks_root=config.tasks_root,
+                solution_labels={
+                    "baseline": "baseline", "king": "king",
+                    "challenger": solution_label,
+                },
+            )
+        except Exception:
+            log.exception("R2 round publish failed (non-fatal)")
+
+        return result
+
+    except Exception as exc:
+        return ValidationRoundResult(
+            task_name=task.task_name, winner="error",
+            king_lines=0, challenger_lines=0,
+            king_similarity_ratio=0.0, challenger_similarity_ratio=0.0,
+            king_challenger_similarity=0.0,
+            task_root=task.task_root, king_compare_root="",
+            challenger_compare_root="",
+            error=f"duel {duel_id} task {task.task_name} failed: {exc}",
+        )
+
+
+def _run_parallel_duel(
+    *,
+    config: RunConfig,
+    state: ValidatorState,
+    king: ValidatorSubmission,
+    challenger: ValidatorSubmission,
+    duel_id: int,
+    pool: TaskPool,
+    pool_starved: threading.Event | None = None,
+    on_round_complete: Any = None,
+) -> DuelResult:
+    """Run a duel with all rounds executing in parallel.
+
+    Instead of running rounds sequentially, this gathers N tasks from the
+    pool up front and then launches all challenger solves + comparisons
+    concurrently.  Wall-clock time is roughly that of a single round.
+    """
+    n_rounds = config.validate_duel_rounds
+    concurrency = config.validate_round_concurrency
+    margin = config.validate_win_margin
+    started_at = _timestamp()
+
+    log.info(
+        "Parallel duel %d: king uid=%s vs challenger uid=%s (%s), "
+        "%d rounds at concurrency %d, need >50%%+%d of decisive rounds "
+        "(min %d decisive, ties ignored)",
+        duel_id, king.uid, challenger.uid, challenger.repo_full_name,
+        n_rounds, concurrency, margin, _MIN_DECISIVE_ROUNDS,
+    )
+
+    # Phase 1: gather tasks from pool
+    log.info("Duel %d phase 1: gathering %d tasks from pool (pool size=%d)",
+             duel_id, n_rounds, pool.size())
+    tasks = _gather_pool_tasks(
+        pool, n_rounds, min_block=challenger.commitment_block,
+        timeout=config.validate_duel_timeout_seconds,
+        pool_starved=pool_starved,
+    )
+    log.info("Duel %d: gathered %d/%d tasks", duel_id, len(tasks), n_rounds)
+    if not tasks:
+        log.warning("Duel %d: no tasks available, aborting", duel_id)
+        return DuelResult(
+            duel_id=duel_id, started_at=started_at, finished_at=_timestamp(),
+            king_before=king, challenger=challenger, rounds=[],
+            wins=0, losses=0, ties=0,
+            king_after=king, king_replaced=False,
+        )
+
+    # Phase 2+3: solve and compare all rounds in parallel
+    log.info("Duel %d phase 2: launching %d parallel solves + compares",
+             duel_id, len(tasks))
+    solve_start = time.monotonic()
+
+    rounds: list[ValidationRoundResult] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(
+                _solve_and_compare_round,
+                task=task, challenger=challenger, config=config,
+                duel_id=duel_id,
+            ): task
+            for task in tasks
+        }
+        for future in futures:
+            result = future.result()
+            rounds.append(result)
+            if on_round_complete is not None:
+                wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
+                losses = sum(1 for r in rounds if r.scored and r.winner == "king")
+                ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
+                scored = wins + losses
+                decisive = wins + losses
+                dyn_threshold = decisive // 2 + margin + 1 if decisive >= _MIN_DECISIVE_ROUNDS else _MIN_DECISIVE_ROUNDS
+                try:
+                    on_round_complete(
+                        duel_id=duel_id, wins=wins, losses=losses, ties=ties,
+                        scored=scored, threshold=dyn_threshold, rounds=rounds,
+                    )
+                except Exception:
+                    log.exception("on_round_complete callback failed (non-fatal)")
+
+    solve_elapsed = time.monotonic() - solve_start
+    log.info("Duel %d: all %d rounds completed in %.1fs", duel_id, len(rounds), solve_elapsed)
+
+    # Phase 4: score
+    wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
+    losses = sum(1 for r in rounds if r.scored and r.winner == "king")
+    ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
+    decisive = wins + losses
+
+    challenger_won = _challenger_wins(wins, losses, margin)
+    log.info("Duel %d result: W=%d L=%d T=%d (decisive=%d, challenger_wins=%s)",
+             duel_id, wins, losses, ties, decisive, challenger_won)
+
+    king_replaced = False
+    dq_reason: str | None = None
+    king_after = king
+
+    if challenger_won:
+        scored_sim = [r for r in rounds if r.scored and r.king_challenger_similarity > 0]
+        mean_sim = (
+            sum(r.king_challenger_similarity for r in scored_sim) / len(scored_sim)
+            if scored_sim else 0.0
+        )
+        _COPY_THRESHOLD = 0.90
+        if mean_sim >= _COPY_THRESHOLD:
+            dq_reason = f"copy detected (similarity {mean_sim:.3f} >= {_COPY_THRESHOLD})"
+            log.warning("Duel %d: %s", duel_id, dq_reason)
+        else:
+            king_replaced = True
+            log.info("Duel %d: challenger uid=%s WINS (%d/%d decisive)",
+                     duel_id, challenger.uid, wins, decisive)
+    else:
+        log.info("Duel %d: king defends (challenger uid=%s got %d/%d decisive, needed >50%%+%d)",
+                 duel_id, challenger.uid, wins, decisive, margin)
+
+    return DuelResult(
+        duel_id=duel_id, started_at=started_at, finished_at=_timestamp(),
+        king_before=king, challenger=challenger, rounds=rounds,
+        wins=wins, losses=losses, ties=ties,
+        king_after=king_after, king_replaced=king_replaced,
+        disqualification_reason=dq_reason,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main validator loop
 # ---------------------------------------------------------------------------
 
+def _kill_stale_containers() -> None:
+    """Kill and remove all swe-eval-* containers left over from a prior run."""
+    try:
+        running = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "name=swe-eval-"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if running.returncode == 0 and running.stdout.strip():
+            ids = running.stdout.strip().splitlines()
+            subprocess.run(["docker", "kill", *ids], capture_output=True, timeout=30)
+            log.info("Killed %d orphaned swe-eval containers", len(ids))
+        stopped = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", "name=swe-eval-"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if stopped.returncode == 0 and stopped.stdout.strip():
+            ids = stopped.stdout.strip().splitlines()
+            subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=30)
+    except Exception:
+        log.exception("Startup container cleanup failed (non-fatal)")
+
+
 def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
-    threshold = config.validate_duel_rounds // 2 + config.validate_win_margin + 1
-    log.info("Scoring: %d rounds, need %d wins to dethrone (margin=%d)",
-             config.validate_duel_rounds, threshold, config.validate_win_margin)
+    _kill_stale_containers()
+    log.info("Scoring: %d rounds per duel, ties fully ignored, "
+             "challenger must win >50%%+%d of decisive rounds (min %d decisive)",
+             config.validate_duel_rounds, config.validate_win_margin, _MIN_DECISIVE_ROUNDS)
 
     if not config.validate_wallet_name or not config.validate_wallet_hotkey:
         raise ValueError("validate requires --wallet-name and --wallet-hotkey")
@@ -576,6 +888,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
     pool = TaskPool(paths.pool_dir)
     pool_stop = threading.Event()
+    pool_starved = threading.Event()
+    state_lock = threading.Lock()
     validator_started_at = _timestamp()
     chain_data: dict[str, Any] | None = None
     last_king_check = 0.0
@@ -583,21 +897,20 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     github_client = _build_github_client(config)
     duel_count = 0
 
-    # Active duels: hotkey -> (future, cancel_event, challenger, start_time)
-    active_duels: dict[str, tuple[Future, threading.Event, ValidatorSubmission, float]] = {}
-    duel_progress: dict[str, dict[str, Any]] = {}
-    executor = ThreadPoolExecutor(max_workers=config.validate_max_concurrency + config.validate_pool_filler_concurrency + 1)
+    active_duel_info: dict[str, Any] | None = None
+    pool_filler_executor = ThreadPoolExecutor(
+        max_workers=config.validate_pool_filler_concurrency,
+    )
 
     try:
         with _open_subtensor(config) as subtensor:
             log.info("Connected to chain for netuid %s", config.validate_netuid)
 
-            # Initial chain poll + king setup
+            # Initial chain poll + king setup (no block cutoff yet so king can be selected)
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
             chain_submissions = _fetch_chain_submissions(subtensor=subtensor, github_client=github_client, config=config)
             _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
 
-            # Recovery: if no king and empty queue, clear seen list so miners can re-enter
             if state.current_king is None and not state.queue and state.seen_hotkeys:
                 log.warning("No king and empty queue with %d seen hotkeys; clearing seen list for recovery", len(state.seen_hotkeys))
                 kept = set(state.disqualified_hotkeys)
@@ -605,21 +918,37 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
 
             _ensure_king(state=state)
+
+            # Set block cutoff AFTER king is established so initial queue isn't filtered
+            if config.validate_min_commitment_block == 0:
+                config.validate_min_commitment_block = subtensor.block
+                log.info("Auto-set min_commitment_block to current block %d",
+                         config.validate_min_commitment_block)
+
+            if not state.queue and state.current_king:
+                kept = set(state.disqualified_hotkeys)
+                kept.add(state.current_king.hotkey)
+                old_count = len(state.seen_hotkeys)
+                state.seen_hotkeys = [hk for hk in state.seen_hotkeys if hk in kept]
+                cleared = old_count - len(state.seen_hotkeys)
+                if cleared > 0:
+                    log.info("Startup recycle: %d previously evaluated agents re-queued", cleared)
+                    _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
             if state.current_king:
                 if not state.king_since:
                     state.king_since = _timestamp()
 
             # Start pool fillers
             for _ in range(config.validate_pool_filler_concurrency):
-                executor.submit(_pool_filler_loop, config, state, pool, pool_stop)
+                pool_filler_executor.submit(_pool_filler_loop, config, state, pool, pool_stop, state_lock, pool_starved)
 
             while True:
-                # Poll chain
+              try:
                 current_block = subtensor.block
-                log.info("Poll: block=%s king=%s queue=%d active_duels=%d pool=%d",
+                log.info("Poll: block=%s king=%s queue=%d pool=%d",
                          current_block,
                          state.current_king.commitment if state.current_king else None,
-                         len(state.queue), len(active_duels), pool.size())
+                         len(state.queue), pool.size())
 
                 chain_data = fetch_chain_data(config.validate_netuid) or chain_data
                 chain_submissions = _fetch_chain_submissions(subtensor=subtensor, github_client=github_client, config=config)
@@ -630,6 +959,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     kept = set(state.disqualified_hotkeys)
                     state.seen_hotkeys = [hk for hk in state.seen_hotkeys if hk in kept]
                     _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
+
+                if not state.queue and state.current_king:
+                    kept = set(state.disqualified_hotkeys)
+                    kept.add(state.current_king.hotkey)
+                    old_count = len(state.seen_hotkeys)
+                    state.seen_hotkeys = [hk for hk in state.seen_hotkeys if hk in kept]
+                    cleared = old_count - len(state.seen_hotkeys)
+                    if cleared > 0:
+                        log.info("Recycling %d previously evaluated agents (no new challengers)", cleared)
+                        _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
 
                 prev_king = state.current_king.hotkey if state.current_king else None
                 _ensure_king(state=state)
@@ -644,143 +983,144 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                 if state.current_king:
                     if time.monotonic() - last_king_check > 600:
-                        _maybe_disqualify_king(subtensor=subtensor, github_client=github_client, config=config, state=state)
+                        try:
+                            _maybe_disqualify_king(subtensor=subtensor, github_client=github_client, config=config, state=state)
+                        except Exception:
+                            log.exception("King disqualification check failed (non-fatal)")
                         last_king_check = time.monotonic()
-                    _maybe_set_weights(subtensor=subtensor, config=config, state=state, current_block=current_block)
+                    try:
+                        _maybe_set_weights(subtensor=subtensor, config=config, state=state, current_block=current_block)
+                    except Exception:
+                        log.exception("set_weights failed (non-fatal, will retry next interval)")
 
-                # Launch new duels up to concurrency limit
-                while len(active_duels) < config.validate_max_concurrency and state.queue and state.current_king:
+                # --- Serialized duel: run one challenger at a time ---
+                if state.queue and state.current_king:
                     challenger = _pop_next_valid_challenger(subtensor=subtensor, github_client=github_client, config=config, state=state)
-                    if challenger is None:
-                        break
+                    if challenger is not None:
+                        duel_id = state.next_duel_index
+                        state.next_duel_index += 1
 
-                    duel_id = state.next_duel_index
-                    state.next_duel_index += 1
-                    cancel_ev = threading.Event()
+                        active_duel_info = {
+                            "king_uid": state.current_king.uid,
+                            "king_repo": state.current_king.repo_full_name,
+                            "challenger_uid": challenger.uid,
+                            "challenger_repo": challenger.repo_full_name,
+                            "threshold": _MIN_DECISIVE_ROUNDS,
+                            "win_margin": config.validate_win_margin,
+                            "duel_rounds": config.validate_duel_rounds,
+                        }
 
-                    def make_callback(did: int, hk: str) -> Any:
-                        def cb(*, duel_id: int, wins: int, losses: int, ties: int,
-                               scored: int, threshold: int, rounds: list, **kw: Any) -> None:
-                            duel_progress[hk] = {
-                                "wins": wins, "losses": losses, "ties": ties,
-                                "scored": scored, "threshold": threshold,
-                                "rounds": [{"task_name": r.task_name, "winner": r.winner,
-                                            "king_lines": r.king_lines, "challenger_lines": r.challenger_lines,
-                                            "king_similarity_ratio": r.king_similarity_ratio,
-                                            "challenger_similarity_ratio": r.challenger_similarity_ratio,
-                                            "king_challenger_similarity": r.king_challenger_similarity}
-                                           for r in rounds if r.scored],
-                            }
-                            try:
-                                _publish_dashboard(state, dashboard_history, config, validator_started_at,
-                                                   active_duels, chain_data, duel_progress=duel_progress)
-                            except Exception:
-                                log.exception("Dashboard progress publish failed (non-fatal)")
-                        return cb
+                        def _make_progress_callback(chall_hk: str) -> Any:
+                            def cb(*, duel_id: int, wins: int, losses: int, ties: int,
+                                   scored: int, threshold: int, rounds: list, **kw: Any) -> None:
+                                nonlocal active_duel_info
+                                active_duel_info = {
+                                    "king_uid": state.current_king.uid if state.current_king else None,
+                                    "king_repo": state.current_king.repo_full_name if state.current_king else None,
+                                    "challenger_uid": challenger.uid,
+                                    "challenger_repo": challenger.repo_full_name,
+                                    "threshold": threshold,
+                                    "duel_rounds": config.validate_duel_rounds,
+                                    "wins": wins, "losses": losses, "ties": ties,
+                                    "scored": scored,
+                                    "rounds": [{"task_name": r.task_name, "winner": r.winner,
+                                                "king_lines": r.king_lines, "challenger_lines": r.challenger_lines,
+                                                "king_similarity_ratio": r.king_similarity_ratio,
+                                                "challenger_similarity_ratio": r.challenger_similarity_ratio,
+                                                "king_challenger_similarity": r.king_challenger_similarity}
+                                               for r in rounds if r.scored],
+                                }
+                                try:
+                                    _publish_dashboard(state, dashboard_history, config, validator_started_at,
+                                                       active_duel_info, chain_data)
+                                except Exception:
+                                    log.exception("Dashboard progress publish failed (non-fatal)")
+                            return cb
 
-                    future = executor.submit(
-                        _run_duel,
-                        config=config, state=state, king=state.current_king,
-                        challenger=challenger, duel_id=duel_id, pool=pool,
-                        cancel_event=cancel_ev, on_round_complete=make_callback(duel_id, challenger.hotkey),
-                    )
-                    active_duels[challenger.hotkey] = (future, cancel_ev, challenger, time.monotonic())
-                    log.info("Launched duel %d: uid=%s (%s)", duel_id, challenger.uid, challenger.repo_full_name)
+                        log.info("Starting parallel duel %d: uid=%s (%s)",
+                                 duel_id, challenger.uid, challenger.repo_full_name)
 
-                # Cancel duels that exceeded the wall-clock timeout
-                for hotkey in list(active_duels.keys()):
-                    _, cancel_ev, _, duel_start = active_duels[hotkey]
-                    if not cancel_ev.is_set() and time.monotonic() - duel_start >= config.validate_duel_timeout_seconds:
-                        cancel_ev.set()
-                        log.warning("Cancelling duel for uid=%s (wall-clock timeout)",
-                                    active_duels[hotkey][2].uid)
+                        try:
+                            duel_result = _run_parallel_duel(
+                                config=config, state=state,
+                                king=state.current_king, challenger=challenger,
+                                duel_id=duel_id, pool=pool,
+                                pool_starved=pool_starved,
+                                on_round_complete=_make_progress_callback(challenger.hotkey),
+                            )
+                        except Exception:
+                            log.exception("Parallel duel %d raised (treating as defender win)", duel_id)
+                            duel_count += 1
+                            active_duel_info = None
+                            _save_state(paths.state_path, state)
+                            time.sleep(config.validate_poll_interval_seconds)
+                            continue
 
-                # Check completed duels
-                king_changed = False
-                for hotkey in list(active_duels.keys()):
-                    future, cancel_ev, challenger, duel_start = active_duels[hotkey]
-                    if not future.done():
-                        continue
+                        active_duel_info = None
+                        duel_count += 1
 
-                    duel_result = future.result()
-                    del active_duels[hotkey]
-                    duel_progress.pop(hotkey, None)
-                    duel_count += 1
+                        log.info("Duel %d finished: uid=%s W=%d L=%d T=%d replaced=%s",
+                                 duel_result.duel_id, challenger.uid,
+                                 duel_result.wins, duel_result.losses, duel_result.ties,
+                                 duel_result.king_replaced)
 
-                    log.info("Duel %d finished: uid=%s W=%d L=%d T=%d replaced=%s",
-                             duel_result.duel_id, challenger.uid,
-                             duel_result.wins, duel_result.losses, duel_result.ties,
-                             duel_result.king_replaced)
+                        if duel_result.king_replaced:
+                            replacement = _resolve_promotion_candidate(
+                                subtensor=subtensor, github_client=github_client,
+                                config=config, state=state, primary_candidate=challenger,
+                            )
+                            if replacement:
+                                _retire_hotkey(state, state.current_king.hotkey)
+                                state.current_king = replacement
+                                duel_result.king_after = replacement
+                                state.king_since = _timestamp()
+                                state.king_duels_defended = 0
+                                log.info("NEW KING: uid=%s (%s)", replacement.uid, replacement.agent_ref)
+                                flushed = pool.flush()
+                                log.info("Flushed %d pool tasks (new king)", flushed)
+                        elif duel_result.disqualification_reason:
+                            _mark_disqualified(state, challenger.hotkey)
+                        else:
+                            state.king_duels_defended += 1
 
-                    if duel_result.king_replaced:
-                        # Promote challenger
-                        replacement = _resolve_promotion_candidate(
-                            subtensor=subtensor, github_client=github_client,
-                            config=config, state=state, primary_candidate=challenger,
-                        )
-                        if replacement:
-                            _retire_hotkey(state, state.current_king.hotkey)
-                            state.current_king = replacement
-                            duel_result.king_after = replacement
-                            king_changed = True
-                            log.info("NEW KING: uid=%s (%s)", replacement.uid, replacement.agent_ref)
+                        duel_dict = duel_result.to_dict()
+                        _write_duel(paths, duel_result)
+                        chall_label = f"challenger-{challenger.uid}-d{duel_result.duel_id}"
+                        try:
+                            publish_duel_data(duel_id=duel_result.duel_id, duel_dict=duel_dict)
+                        except Exception:
+                            log.exception("R2 duel publish failed (non-fatal)")
+                        try:
+                            publish_training_data(
+                                duel_id=duel_result.duel_id, duel_dict=duel_dict,
+                                tasks_root=config.tasks_root,
+                                solution_labels={"baseline": "baseline", "king": "king", "challenger": chall_label},
+                            )
+                        except Exception:
+                            log.exception("R2 training data publish failed (non-fatal)")
+                        dashboard_history.append(duel_to_summary(duel_dict))
+                        try:
+                            publish_duel_index(duel_history=dashboard_history, latest_duel_dict=duel_dict)
+                        except Exception:
+                            log.exception("R2 index publish failed (non-fatal)")
 
-                            # Cancel all other duels, re-queue challengers
-                            for other_hk in list(active_duels.keys()):
-                                other_future, other_cancel, other_chall, _ = active_duels[other_hk]
-                                other_cancel.set()
-                                state.queue.insert(0, other_chall)
-                                log.info("Re-queued uid=%s (king changed)", other_chall.uid)
-                            active_duels.clear()
-
-                            # Flush pool (king solves are stale)
-                            flushed = pool.flush()
-                            log.info("Flushed %d pool tasks (new king)", flushed)
-                    elif duel_result.disqualification_reason:
-                        _mark_disqualified(state, challenger.hotkey)
-                    else:
-                        state.king_duels_defended += 1
-
-                    # Persist duel
-                    duel_dict = duel_result.to_dict()
-                    _write_duel(paths, duel_result)
-                    chall_label = f"challenger-{challenger.uid}"
-                    try:
-                        publish_duel_data(duel_id=duel_result.duel_id, duel_dict=duel_dict)
-                    except Exception:
-                        log.exception("R2 duel publish failed (non-fatal)")
-                    try:
-                        publish_training_data(
-                            duel_id=duel_result.duel_id, duel_dict=duel_dict,
-                            tasks_root=config.tasks_root,
-                            solution_labels={"baseline": "baseline", "king": "king", "challenger": chall_label},
-                        )
-                    except Exception:
-                        log.exception("R2 training data publish failed (non-fatal)")
-                    dashboard_history.append(duel_to_summary(duel_dict))
-                    try:
-                        publish_duel_index(duel_history=dashboard_history, latest_duel_dict=duel_dict)
-                    except Exception:
-                        log.exception("R2 index publish failed (non-fatal)")
-
-                if king_changed:
-                    state.king_since = _timestamp()
-                    state.king_duels_defended = 0
-
-                # Save and publish
                 _save_state(paths.state_path, state)
                 _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
-                _publish_dashboard(state, dashboard_history, config, validator_started_at, active_duels, chain_data, duel_progress=duel_progress)
+                _publish_dashboard(state, dashboard_history, config, validator_started_at,
+                                   active_duel_info, chain_data)
                 _cleanup_old_tasks(config.tasks_root)
                 _cleanup_orphaned_containers()
 
-                time.sleep(config.validate_poll_interval_seconds)
+              except KeyboardInterrupt:
+                raise
+              except Exception:
+                log.exception("Main loop iteration failed; will retry after poll interval")
+
+              time.sleep(config.validate_poll_interval_seconds)
 
     finally:
         pool_stop.set()
-        for hk, duel_tuple in active_duels.items():
-            duel_tuple[1].set()
-        executor.shutdown(wait=False, cancel_futures=True)
+        pool_filler_executor.shutdown(wait=False, cancel_futures=True)
         github_client.close()
 
     king = state.current_king
@@ -798,9 +1138,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
 def _publish_dashboard(
     state: ValidatorState, history: list[dict[str, Any]], config: RunConfig,
-    validator_started_at: str, active_duels: Any,
+    validator_started_at: str,
+    active_duel: dict[str, Any] | None = None,
     chain_data: dict[str, Any] | None = None,
-    duel_progress: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     king = state.current_king
     king_dict = {
@@ -810,31 +1150,7 @@ def _publish_dashboard(
         "commit_sha": king.commit_sha,
     } if king else None
 
-    threshold = config.validate_duel_rounds // 2 + config.validate_win_margin + 1
-    active_duel_info: dict[str, Any] | None = None
-    if isinstance(active_duels, dict) and active_duels:
-        per_chall = {}
-        for hk, duel_tuple in active_duels.items():
-            future = duel_tuple[0]
-            chall = duel_tuple[2]
-            duel_start = duel_tuple[3] if len(duel_tuple) > 3 else None
-            progress = (duel_progress or {}).get(hk, {})
-            per_chall[hk] = {
-                "uid": chall.uid, "repo": chall.repo_full_name,
-                "commitment_block": chall.commitment_block,
-                "running": not future.done(),
-                "threshold": threshold,
-                "duel_rounds": config.validate_duel_rounds,
-                "elapsed_seconds": int(time.monotonic() - duel_start) if duel_start else None,
-                **progress,
-            }
-        active_duel_info = {
-            "king_uid": king.uid if king else None,
-            "king_repo": king.repo_full_name if king else None,
-            "threshold": threshold,
-            "duel_rounds": config.validate_duel_rounds,
-            "per_challenger": per_chall,
-        }
+    active_duel_info = active_duel
 
     commitment_map: dict[str, dict[str, Any]] = {}
     for d in history:
@@ -850,15 +1166,20 @@ def _publish_dashboard(
         repo = c.split("@")[0] if "@" in c else c
         return {"uid": None, "hotkey": hk, "repo": repo or "unknown"}
 
-    total_rounds = sum(len(d.get("rounds", [])) for d in history)
+    total_rounds = sum(
+        1 for d in history for r in d.get("rounds", [])
+        if r.get("winner") not in ("tie", None)
+    )
     status = {
         "validator_started_at": validator_started_at,
         "netuid": config.validate_netuid,
         "scoring": {
-            "method": "majority",
+            "method": "race",
             "duel_rounds": config.validate_duel_rounds,
             "win_margin": config.validate_win_margin,
-            "threshold": threshold,
+            "min_decisive_rounds": _MIN_DECISIVE_ROUNDS,
+            "ties_count": False,
+            "description": "Challenger must win >50%+margin of decisive rounds (ties ignored, min decisive rounds required)",
         },
         "queue": [{"uid": s.uid, "repo": s.repo_full_name, "hotkey": s.hotkey, "commitment_block": s.commitment_block} for s in state.queue],
         "active_duel": active_duel_info,
@@ -888,8 +1209,15 @@ def _publish_dashboard(
 
 def _build_github_client(config: RunConfig) -> httpx.Client:
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "swe-eval-validate"}
-    if config.github_token:
-        headers["Authorization"] = f"Bearer {config.github_token}"
+    token = None
+    if config.github_tokens:
+        tokens = [t.strip() for t in config.github_tokens.split(",") if t.strip()]
+        if tokens:
+            token = tokens[0]
+    if not token:
+        token = config.github_token
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     return httpx.Client(base_url="https://api.github.com", headers=headers, follow_redirects=True, timeout=config.http_timeout)
 
 
@@ -899,6 +1227,8 @@ def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunC
         known.add(state.current_king.hotkey)
     known.update(s.hotkey for s in state.queue)
     for sub in chain_submissions:
+        if config.validate_min_commitment_block and sub.commitment_block < config.validate_min_commitment_block:
+            continue
         locked = state.locked_commitments.get(sub.hotkey)
         if locked is not None and locked != sub.commitment:
             log.warning("Hotkey %s changed commitment; ignoring (immutable)", sub.hotkey)
@@ -1032,15 +1362,17 @@ def _maybe_set_weights(*, subtensor, config, state, current_block):
         return
     neurons = list(subtensor.neurons.neurons_lite(config.validate_netuid))
     if not neurons:
-        raise RuntimeError(f"Subnet {config.validate_netuid} has no neurons")
+        log.error("Subnet %s has no neurons; skipping set_weights", config.validate_netuid)
+        return
     uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(king.hotkey, config.validate_netuid)
     if uid is None:
-        raise RuntimeError(f"King {king.hotkey} is no longer registered")
+        log.error("King %s is no longer registered; skipping set_weights", king.hotkey)
+        return
     king.uid = int(uid)
     uids = [int(n.uid) for n in neurons]
     weights = [1.0 if u == king.uid else 0.0 for u in uids]
     wallet = bt.Wallet(name=config.validate_wallet_name, hotkey=config.validate_wallet_hotkey, path=config.validate_wallet_path)
-    resp = subtensor.extrinsics.set_weights(wallet=wallet, netuid=config.validate_netuid, uids=uids, weights=weights, wait_for_inclusion=True, wait_for_finalization=True)
+    resp = subtensor.extrinsics.set_weights(wallet=wallet, netuid=config.validate_netuid, uids=uids, weights=weights, wait_for_inclusion=True, wait_for_finalization=False)
     state.last_weight_block = current_block
     log.info("Set weights at block %s to king uid=%s response=%s", current_block, king.uid, resp)
 
@@ -1157,7 +1489,7 @@ def _open_subtensor(config: RunConfig):
 # Cleanup utilities
 # ---------------------------------------------------------------------------
 
-def _cleanup_old_tasks(tasks_root: Path, keep: int = 200) -> None:
+def _cleanup_old_tasks(tasks_root: Path, keep: int = 500) -> None:
     try:
         dirs = sorted(tasks_root.glob("validate-*"), key=lambda p: p.name)
         if len(dirs) <= keep:
@@ -1168,12 +1500,16 @@ def _cleanup_old_tasks(tasks_root: Path, keep: int = 200) -> None:
     except Exception:
         log.exception("Task cleanup failed (non-fatal)")
 
-def _cleanup_orphaned_containers(max_age: int = 7200) -> None:
+def _cleanup_orphaned_containers(max_age: int = 3600, max_containers: int = 100) -> None:
     try:
         r = subprocess.run(["docker", "ps", "-q", "--filter", "name=swe-eval-"], capture_output=True, text=True, timeout=10)
         if r.returncode != 0 or not r.stdout.strip():
             return
-        for cid in r.stdout.strip().splitlines():
+        container_ids = r.stdout.strip().splitlines()
+        if len(container_ids) > max_containers:
+            log.warning("High container count: %d swe-eval containers running (limit %d)",
+                        len(container_ids), max_containers)
+        for cid in container_ids:
             ir = subprocess.run(["docker", "inspect", "--format", "{{.State.StartedAt}}", cid], capture_output=True, text=True, timeout=10)
             if ir.returncode != 0:
                 continue

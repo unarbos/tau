@@ -141,9 +141,8 @@ def _build_changed_line_sequence(original_lines: list[str], updated_lines: list[
 
 def _count_positional_matches(sequence_a: list[str], sequence_b: list[str]) -> tuple[int, int]:
     scored_positions = max(len(sequence_a), len(sequence_b))
-    matched_lines = sum(
-        1
-        for left_line, right_line in zip(sequence_a, sequence_b, strict=False)
-        if left_line == right_line
-    )
+    if not scored_positions:
+        return 0, 0
+    matcher = SequenceMatcher(a=sequence_a, b=sequence_b, autojunk=False)
+    matched_lines = sum(size for _, _, size in matcher.get_matching_blocks())
     return matched_lines, scored_positions

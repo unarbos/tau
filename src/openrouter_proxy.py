@@ -16,7 +16,7 @@ import httpx
 log = logging.getLogger("swe-eval.openrouter_proxy")
 
 _UPSTREAM_BASE_URL = "https://openrouter.ai/api"
-_UPSTREAM_TIMEOUT = httpx.Timeout(None)
+_UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
 REQUEST_LIMIT_EXIT_REASON = "request_limit_exceeded"
 TOKEN_LIMIT_EXIT_REASON = "token_limit_exceeded"
 COST_LIMIT_EXIT_REASON = "cost_limit_exceeded"

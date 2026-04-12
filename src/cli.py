@@ -105,13 +105,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--subtensor-endpoint",
         help="Optional websocket endpoint that overrides --network for chain access.",
     )
-    validate.add_argument("-N", "--duel-rounds", type=int, default=25, help="Rounds per duel.")
-    validate.add_argument("-K", "--win-margin", type=int, default=4, help="Extra wins above 50%% to dethrone.")
-    validate.add_argument("--max-concurrency", type=int, default=20, help="Max parallel duels.")
-    validate.add_argument("--task-pool-target", type=int, default=60, help="Pre-solved tasks to keep in pool.")
-    validate.add_argument("--pool-filler-concurrency", type=int, default=3, help="Parallel pool-filler threads.")
+    validate.add_argument("-N", "--duel-rounds", type=int, default=100, help="Decisive rounds per duel.")
+    validate.add_argument("-K", "--win-margin", type=int, default=8, help="Extra wins above 50%% to dethrone.")
+    validate.add_argument("--max-concurrency", type=int, default=1, help="Max parallel duels (1 = serialized).")
+    validate.add_argument("--round-concurrency", type=int, default=100, help="Max parallel rounds within a single duel.")
+    validate.add_argument("--task-pool-target", type=int, default=150, help="Pre-solved tasks to keep in pool.")
+    validate.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel pool-filler threads.")
     validate.add_argument("--weight-interval-blocks", type=int, default=360, help="Blocks between weight sets.")
     validate.add_argument("--poll-interval-seconds", type=int, default=30, help="Seconds between chain polls.")
+    validate.add_argument("--duel-timeout", type=int, default=7200, help="Max seconds a single duel may run before being cancelled.")
+    validate.add_argument("--min-commitment-block", type=int, default=0, help="Ignore submissions before this block (0 = auto-set to current block at startup).")
     validate.add_argument("--queue-size", type=int, help="Max queued challengers.")
     validate.add_argument("--wallet-name", required=True, help="Wallet coldkey name.")
     validate.add_argument("--wallet-hotkey", required=True, help="Wallet hotkey name.")
@@ -319,10 +322,13 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_duel_rounds=args.duel_rounds,
         validate_win_margin=args.win_margin,
         validate_max_concurrency=args.max_concurrency,
+        validate_round_concurrency=args.round_concurrency,
         validate_task_pool_target=args.task_pool_target,
         validate_pool_filler_concurrency=args.pool_filler_concurrency,
         validate_weight_interval_blocks=args.weight_interval_blocks,
         validate_poll_interval_seconds=args.poll_interval_seconds,
+        validate_duel_timeout_seconds=args.duel_timeout,
+        validate_min_commitment_block=args.min_commitment_block,
         validate_queue_size=args.queue_size,
         validate_wallet_name=args.wallet_name,
         validate_wallet_hotkey=args.wallet_hotkey,

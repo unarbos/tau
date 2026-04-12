@@ -38,6 +38,9 @@ class RunConfig:
     github_token: str | None = field(
         default_factory=lambda: os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"),
     )
+    github_tokens: str | None = field(
+        default_factory=lambda: os.environ.get("GITHUB_TOKENS"),
+    )
     openrouter_api_key: str | None = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY"))
     cursor_api_key: str | None = field(default_factory=lambda: os.environ.get("CURSOR_API_KEY"))
     baseline_model: str | None = None
@@ -73,13 +76,16 @@ class RunConfig:
     validate_netuid: int = 66
     validate_network: str | None = None
     validate_subtensor_endpoint: str | None = None
-    validate_duel_rounds: int = 15
-    validate_win_margin: int = 3
-    validate_max_concurrency: int = 48
-    validate_task_pool_target: int = 60
+    validate_duel_rounds: int = 100
+    validate_win_margin: int = 8
+    validate_max_concurrency: int = 1
+    validate_round_concurrency: int = 100
+    validate_task_pool_target: int = 150
     validate_pool_filler_concurrency: int = 24
     validate_weight_interval_blocks: int = 360
     validate_poll_interval_seconds: int = 30
+    validate_duel_timeout_seconds: int = 3600
+    validate_min_commitment_block: int | None = None
     validate_queue_size: int | None = None
     validate_wallet_name: str | None = None
     validate_wallet_hotkey: str | None = None

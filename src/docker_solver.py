@@ -665,7 +665,7 @@ def _run(
 
 def _build_solver_command(*, use_proxy_bridge: bool) -> str:
     setup_parts = [
-        'export PATH="$TAU_AGENT_DIR/node_modules/.bin:$PATH"',
+        f'export PATH="$TAU_AGENT_DIR/node_modules/.bin:{_IMAGE_PI_MONO_BASE_DIR}/node_modules/.bin:$PATH"',
     ]
     prefix = " && ".join(setup_parts)
     if use_proxy_bridge:
