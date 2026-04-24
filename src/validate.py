@@ -1106,6 +1106,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                          state.current_king.commitment if state.current_king else None,
                          len(state.queue), pool.size())
 
+                # Refresh dashboard heartbeat at the top of every poll so the
+                # external watchdog (which keys off dashboard_data.json mtime)
+                # doesn't restart us during the multi-second chain RPC + queue
+                # refresh below. Without this, a fresh validator process can be
+                # killed before it ever reaches the duel-start publish path.
+                try:
+                    _publish_dashboard(state, dashboard_history, config, validator_started_at,
+                                       active_duel_info, chain_data)
+                except Exception:
+                    log.exception("Pre-poll dashboard publish failed (non-fatal)")
+
                 chain_data = fetch_chain_data(config.validate_netuid) or chain_data
                 chain_submissions = _fetch_chain_submissions(subtensor=subtensor, github_client=github_client, config=config)
                 _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
