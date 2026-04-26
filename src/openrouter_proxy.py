@@ -17,6 +17,9 @@ log = logging.getLogger("swe-eval.openrouter_proxy")
 
 _UPSTREAM_BASE_URL = "https://openrouter.ai/api"
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
+_UPSTREAM_RETRIES = 3
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_RETRY_BACKOFF_BASE = 1.0
 REQUEST_LIMIT_EXIT_REASON = "request_limit_exceeded"
 TOKEN_LIMIT_EXIT_REASON = "token_limit_exceeded"
 COST_LIMIT_EXIT_REASON = "cost_limit_exceeded"
@@ -453,13 +456,47 @@ class OpenRouterProxy:
         start = time.monotonic()
 
         try:
-            with httpx.Client(timeout=_UPSTREAM_TIMEOUT) as client:
-                response = client.request(
-                    handler.command,
-                    upstream_url,
-                    headers=upstream_headers,
-                    content=body,
-                )
+            with httpx.Client(
+                timeout=_UPSTREAM_TIMEOUT,
+                follow_redirects=True,
+                transport=httpx.HTTPTransport(retries=_UPSTREAM_RETRIES),
+            ) as client:
+                last_exc: httpx.HTTPError | None = None
+                response: httpx.Response | None = None
+                for attempt in range(_UPSTREAM_RETRIES + 1):
+                    try:
+                        response = client.request(
+                            handler.command,
+                            upstream_url,
+                            headers=upstream_headers,
+                            content=body,
+                        )
+                        last_exc = None
+                    except httpx.HTTPError as exc:
+                        last_exc = exc
+                        log.warning(
+                            "upstream request error (attempt %d/%d): %s",
+                            attempt + 1,
+                            _UPSTREAM_RETRIES + 1,
+                            exc,
+                        )
+                        if attempt < _UPSTREAM_RETRIES:
+                            time.sleep(_RETRY_BACKOFF_BASE * (2 ** attempt))
+                        continue
+
+                    if response.status_code not in _RETRYABLE_STATUS_CODES:
+                        break
+                    log.warning(
+                        "upstream returned %d (attempt %d/%d)",
+                        response.status_code,
+                        attempt + 1,
+                        _UPSTREAM_RETRIES + 1,
+                    )
+                    if attempt < _UPSTREAM_RETRIES:
+                        time.sleep(_RETRY_BACKOFF_BASE * (2 ** attempt))
+
+                if last_exc is not None:
+                    raise last_exc
         except httpx.HTTPError as exc:
             latency_ms = int((time.monotonic() - start) * 1000)
             self._record_request(
