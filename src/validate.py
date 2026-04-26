@@ -264,6 +264,7 @@ class PoolTask:
     king_lines: int
     king_similarity: float
     baseline_lines: int = 0
+    king_precision_score: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -277,6 +278,7 @@ class PoolTask:
             king_lines=int(d["king_lines"]),
             king_similarity=float(d["king_similarity"]),
             baseline_lines=int(d.get("baseline_lines", 0)),
+            king_precision_score=float(d.get("king_precision_score", 0.0)),
         )
 
 
@@ -444,6 +446,7 @@ def _pool_filler_loop(
                 king_lines=king_compare.matched_changed_lines,
                 king_similarity=king_compare.similarity_ratio,
                 baseline_lines=king_compare.total_changed_lines_a,
+                king_precision_score=king_compare.precision_score,
             ))
             pruned = pool.prune(keep=config.validate_task_pool_target)
             if pool_starved is not None:
@@ -548,16 +551,19 @@ def _run_duel(
                 chall_compare = chall_fut.result()
                 kc_compare = kc_fut.result()
 
-            c_lines = 0 if chall_timed_out else chall_compare.matched_changed_lines
-            k_lines = task.king_lines
+            c_score = 0.0 if chall_timed_out else chall_compare.precision_score
+            k_score = task.king_precision_score
 
-            if c_lines > k_lines:
+            if c_score > k_score:
                 winner = "challenger"
-            elif c_lines < k_lines:
+            elif c_score < k_score:
                 winner = "king"
             else:
                 winner = "tie"
 
+            # Round results still report raw matched lines for dashboard compatibility.
+            c_lines = 0 if chall_timed_out else chall_compare.matched_changed_lines
+            k_lines = task.king_lines
             result = ValidationRoundResult(
                 task_name=task.task_name, winner=winner,
                 king_lines=k_lines, challenger_lines=c_lines,
@@ -749,16 +755,19 @@ def _solve_and_compare_round(
             chall_compare = chall_fut.result(timeout=600)
             kc_compare = kc_fut.result(timeout=600)
 
-        c_lines = 0 if chall_timed_out else chall_compare.matched_changed_lines
-        k_lines = task.king_lines
+        c_score = 0.0 if chall_timed_out else chall_compare.precision_score
+        k_score = task.king_precision_score
 
-        if c_lines > k_lines:
+        if c_score > k_score:
             winner = "challenger"
-        elif c_lines < k_lines:
+        elif c_score < k_score:
             winner = "king"
         else:
             winner = "tie"
 
+        # Round results still report raw matched lines for dashboard compatibility.
+        c_lines = 0 if chall_timed_out else chall_compare.matched_changed_lines
+        k_lines = task.king_lines
         result = ValidationRoundResult(
             task_name=task.task_name, winner=winner,
             king_lines=k_lines, challenger_lines=c_lines,

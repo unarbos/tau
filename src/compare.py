@@ -36,6 +36,7 @@ class CompareResult:
     total_changed_lines_a: int
     total_changed_lines_b: int
     similarity_ratio: float
+    precision_score: float
     per_file: list[FileCompareResult]
 
     def to_dict(self) -> dict[str, object]:
@@ -45,6 +46,7 @@ class CompareResult:
             "total_changed_lines_a": self.total_changed_lines_a,
             "total_changed_lines_b": self.total_changed_lines_b,
             "similarity_ratio": self.similarity_ratio,
+            "precision_score": self.precision_score,
             "per_file": [item.to_dict() for item in self.per_file],
         }
 
@@ -100,12 +102,15 @@ def compare_solution_repos(*, original_dir: Path, repo_a_dir: Path, repo_b_dir: 
         total_changed_lines_b += len(changed_sequence_b)
 
     similarity_ratio = (matched_changed_lines / scored_positions) if scored_positions else 0.0
+    precision = (matched_changed_lines / total_changed_lines_b) if total_changed_lines_b else 0.0
+    precision_score = matched_changed_lines * precision
     return CompareResult(
         matched_changed_lines=matched_changed_lines,
         scored_positions=scored_positions,
         total_changed_lines_a=total_changed_lines_a,
         total_changed_lines_b=total_changed_lines_b,
         similarity_ratio=similarity_ratio,
+        precision_score=precision_score,
         per_file=per_file,
     )
 
