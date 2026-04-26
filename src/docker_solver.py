@@ -315,6 +315,21 @@ def _copy_repo_to_container(*, repo_dir: Path, container_id: str) -> None:
         timeout=30,
     )
     _copy_directory_to_container(source_dir=repo_dir, container_id=container_id, target_dir=_CONTAINER_REPO_DIR)
+    # Prevent reference-commit exploit: FETCH_HEAD lists the reference answer
+    # commit SHA, allowing agents to read the solution via git cat-file.
+    # Remove FETCH_HEAD, ORIG_HEAD, and prune unreachable objects so only the
+    # current HEAD commit is accessible inside the container.
+    _run(
+        [
+            "docker", "exec", container_id, "bash", "-lc",
+            f"cd {_CONTAINER_REPO_DIR} && "
+            "rm -f .git/FETCH_HEAD .git/ORIG_HEAD && "
+            "git -c safe.directory=. reflog expire --expire=now --all 2>/dev/null; "
+            "git -c safe.directory=. gc --prune=now 2>/dev/null; "
+            "true",
+        ],
+        timeout=30,
+    )
 
 
 def _copy_agent_source_to_container(*, agent_src_dir: Path, container_id: str) -> None:
