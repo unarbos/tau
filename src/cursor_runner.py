@@ -240,6 +240,20 @@ def _copy_repo_to_container(*, repo_dir: Path, container_id: str) -> None:
         timeout=30,
     )
     _copy_directory_to_container(source_dir=repo_dir, container_id=container_id, target_dir=_CONTAINER_REPO_DIR)
+    # Remove FETCH_HEAD to prevent reference-commit exploit (see docker_solver.py).
+    _run(
+        [
+            "docker", "exec", container_id, "bash", "-lc",
+            f"cd {_CONTAINER_REPO_DIR} && "
+            "rm -f .git/FETCH_HEAD .git/ORIG_HEAD .git/MERGE_HEAD "
+            ".git/CHERRY_PICK_HEAD .git/REBASE_HEAD .git/packed-refs && "
+            "rm -rf .git/refs/remotes && "
+            "git -c safe.directory=. reflog expire --expire=now --all 2>/dev/null; "
+            "git -c safe.directory=. gc --prune=now 2>/dev/null; "
+            "true",
+        ],
+        timeout=30,
+    )
 
 
 def _copy_prompt_to_container(*, prompt: str, container_id: str) -> None:
