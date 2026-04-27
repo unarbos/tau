@@ -264,3 +264,30 @@ tau solve --task my-task --solution cursor-run --agent cursor
 - `compare` reads saved solution artifacts and does not call a model.
 - Docker-backed solves use Docker, so Docker must be installed and running.
 - Generated task, solution, and evaluation paths are printed by the CLI after each command finishes.
+
+## SN66 Public Data Feed
+
+Live subnet state is published to a public R2 bucket — no auth required.
+
+**Base URL:** `https://pub-0821b4e0d60149b79bad17376722bc75.r2.dev/`
+
+| Path | Description |
+|------|-------------|
+| `sn66/dashboard.json` | Live state: `current_king`, `queue`, `active_duel`, `duels`, `updated_at` |
+| `sn66/duels/index.json` | Duel index (all duels, summary metadata) |
+| `sn66/duels/{duel_id}/duel.json` | Per-duel detail (participants, scores, outcome) |
+| `sn66/duels/{id}/rounds/...` | Round-level artifacts |
+
+### Quick start
+
+```bash
+curl -s https://pub-0821b4e0d60149b79bad17376722bc75.r2.dev/sn66/dashboard.json \
+  | python3 -m json.tool | head -30
+```
+
+Use `updated_at` in `dashboard.json` as a freshness signal for polling/caching.
+
+### Implementation notes
+
+- Write-side key construction: see [`tau/src/r2.py`](src/r2.py)
+- The `pub-…` subdomain ID may change if ops rebinds the R2 public bucket. If URLs 404, check this README for an updated base URL.
