@@ -175,6 +175,7 @@ class DuelResult:
     king_after: ValidatorSubmission
     king_replaced: bool
     disqualification_reason: str | None = None
+    infra_void: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -187,6 +188,7 @@ class DuelResult:
             "king_after": self.king_after.to_dict(),
             "king_replaced": self.king_replaced,
             "disqualification_reason": self.disqualification_reason,
+            "infra_void": self.infra_void,
         }
 
 
@@ -1273,6 +1275,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                  duel_result.wins, duel_result.losses, duel_result.ties,
                                  duel_result.king_replaced)
 
+                        chall_label = f"challenger-{challenger.uid}-d{duel_result.duel_id}"
+                        if not duel_result.king_replaced and _is_infra_void_duel(
+                            duel=duel_result, tasks_root=config.tasks_root, challenger_label=chall_label,
+                        ):
+                            duel_result.infra_void = True
+                            state.seen_hotkeys = [hk for hk in state.seen_hotkeys if hk != challenger.hotkey]
+                            state.locked_commitments.pop(challenger.hotkey, None)
+                            log.warning("Duel %d INFRA-VOID for uid=%s hotkey=%s; cleared seen_hotkeys",
+                                        duel_result.duel_id, challenger.uid, challenger.hotkey)
+
                         if duel_result.king_replaced:
                             replacement = _resolve_promotion_candidate(
                                 subtensor=subtensor, github_client=github_client,
@@ -1294,12 +1306,13 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     log.exception("notify_new_king failed (non-fatal)")
                         elif duel_result.disqualification_reason:
                             _mark_disqualified(state, challenger.hotkey)
+                        elif duel_result.infra_void:
+                            pass
                         else:
                             state.king_duels_defended += 1
 
                         duel_dict = duel_result.to_dict()
                         _write_duel(paths, duel_result)
-                        chall_label = f"challenger-{challenger.uid}-d{duel_result.duel_id}"
                         try:
                             publish_duel_data(duel_id=duel_result.duel_id, duel_dict=duel_dict)
                         except Exception:
@@ -1598,6 +1611,46 @@ def _retire_hotkey(state, hotkey):
 def _mark_disqualified(state, hotkey):
     if hotkey not in state.disqualified_hotkeys:
         state.disqualified_hotkeys.append(hotkey)
+
+
+_INFRA_PROXY_ERROR_MARKERS = (
+    "402 Insufficient credits",
+    "503 Service Unavailable",
+    "502 Bad Gateway",
+    "504 Gateway Timeout",
+    "Upstream error",
+)
+
+
+def _is_infra_void_duel(*, duel: DuelResult, tasks_root: Path, challenger_label: str) -> bool:
+    if not duel.rounds:
+        return False
+    if sum(r.challenger_lines for r in duel.rounds) > 0:
+        return False
+    decisive = sum(1 for r in duel.rounds if r.winner in ("king", "challenger"))
+    if decisive < _MIN_DECISIVE_ROUNDS:
+        return False
+    proxy_failures = 0
+    successful = 0
+    inspected = 0
+    for r in duel.rounds:
+        path = tasks_root / r.task_name / "solutions" / challenger_label / "rollout.jsonl"
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        inspected += 1
+        if any(m in text for m in _INFRA_PROXY_ERROR_MARKERS):
+            proxy_failures += 1
+        if '"tool_execution_end"' in text:
+            successful += 1
+    return (
+        inspected >= _MIN_DECISIVE_ROUNDS
+        and successful == 0
+        and proxy_failures == inspected
+    )
 
 def _resolve_promotion_candidate(*, subtensor, github_client, config, state, primary_candidate):
     if _submission_is_eligible(subtensor=subtensor, github_client=github_client, config=config, submission=primary_candidate):
