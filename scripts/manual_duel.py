@@ -52,6 +52,7 @@ from config import RunConfig, SolverAgentSource  # noqa: E402
 from openrouter_client import complete_text  # noqa: E402
 from pipeline import compare_task_run, solve_task_run  # noqa: E402
 from validate import (  # noqa: E402
+    DiffJudgeResult,
     PoolTask,
     _DIFF_JUDGE_ATTEMPTS,
     _DIFF_JUDGE_MAX_TOKENS,
@@ -66,8 +67,11 @@ from validate import (  # noqa: E402
     _duel_agent_timeout,
     _ensure_empty_solution,
     _extract_json_object,
+    _neutral_diff_judge,
+    _order_duel_tasks_for_submission,
     _parse_diff_judge_payload,
     _round_winner_from_scores,
+    _solution_has_patch,
 )
 from workspace import (  # noqa: E402
     build_compare_paths,
@@ -277,7 +281,15 @@ class ManualDuelRunner:
 
         base_patch = _solution_patch(self.config, task.task_name, base_label)
         challenger_patch = _solution_patch(self.config, task.task_name, self.challenger_label)
-        challenger_timed_out = getattr(challenger_result, "exit_reason", "") == "time_limit_exceeded"
+        challenger_exit_reason = getattr(challenger_result, "exit_reason", "solver_error")
+        challenger_timed_out = challenger_exit_reason == "time_limit_exceeded"
+        challenger_has_patch = _solution_has_patch(
+            task_name=task.task_name,
+            solution_name=self.challenger_label,
+            config=self.config,
+        )
+        zero_challenger = challenger_timed_out and not challenger_has_patch
+
         judge = _judge_pair(
             config=self.config,
             task_name=task.task_name,
@@ -287,7 +299,12 @@ class ManualDuelRunner:
         )
 
         base_similarity = base_compare.similarity_ratio if base_compare else 0.0
-        challenger_similarity = challenger_compare.similarity_ratio if challenger_compare else 0.0
+        if zero_challenger:
+            challenger_similarity = 0.0
+            challenger_lines = 0
+        else:
+            challenger_similarity = challenger_compare.similarity_ratio if challenger_compare else 0.0
+            challenger_lines = challenger_compare.matched_changed_lines if challenger_compare else 0
         base_score = _combined_round_score(base_similarity, judge.king_score)
         challenger_score = _combined_round_score(challenger_similarity, judge.challenger_score)
         winner = _round_winner_from_scores(base_score, challenger_score)
@@ -300,10 +317,12 @@ class ManualDuelRunner:
             "base_label": base_label,
             "base_cached": base_cached,
             "base_exit_reason": _solve_exit_reason(self.config, task.task_name, base_label),
-            "challenger_exit_reason": getattr(challenger_result, "exit_reason", "solver_error"),
+            "challenger_exit_reason": challenger_exit_reason,
             "challenger_error": challenger_error,
+            "challenger_has_patch": challenger_has_patch,
+            "challenger_agent_timeout_seconds": timeout,
             "base_lines": base_compare.matched_changed_lines if base_compare else 0,
-            "challenger_lines": challenger_compare.matched_changed_lines if challenger_compare else 0,
+            "challenger_lines": challenger_lines,
             "base_similarity_ratio": base_similarity,
             "challenger_similarity_ratio": challenger_similarity,
             "base_challenger_similarity": pair_compare.similarity_ratio if pair_compare else 0.0,
@@ -315,7 +334,7 @@ class ManualDuelRunner:
             "base_llm_score": judge.king_score,
             "challenger_llm_score": judge.challenger_score,
             "llm_judge_winner": judge.winner,
-            "llm_judge_model": _DIFF_JUDGE_MODEL,
+            "llm_judge_model": getattr(judge, "model", _DIFF_JUDGE_MODEL),
             "llm_judge_rationale": getattr(judge, "rationale", ""),
             "llm_judge_error": getattr(judge, "error", None),
             "base_score": base_score,
@@ -496,7 +515,7 @@ def _load_pool_tasks(*, config: RunConfig, limit: int) -> list[PoolTask]:
         PoolTask.from_dict(json.loads(path.read_text()))
         for path in sorted(pool_dir.glob("*.json"))[:limit]
     ]
-    return tasks
+    return _order_duel_tasks_for_submission(tasks)
 
 
 def _solution_patch(config: RunConfig, task_name: str, solution_name: str) -> str:
@@ -554,7 +573,10 @@ def _judge_pair(
     base_patch: str,
     challenger_patch: str,
     challenger_timed_out: bool,
-) -> Any:
+) -> DiffJudgeResult:
+    if not config.openrouter_api_key:
+        return _neutral_diff_judge("OPENROUTER_API_KEY is not configured")
+
     injection = _diff_judge_prompt_injection_result(
         king_patch=base_patch,
         challenger_patch=challenger_patch,
@@ -600,17 +622,7 @@ def _judge_pair(
             last_error = str(exc)
             if attempt < _DIFF_JUDGE_ATTEMPTS:
                 time.sleep(attempt)
-    return _NeutralJudge(f"LLM diff judge failed: {last_error}")
-
-
-class _NeutralJudge:
-    winner = "tie"
-    king_score = 0.5
-    challenger_score = 0.5
-    rationale = ""
-
-    def __init__(self, error: str) -> None:
-        self.error = error
+    return _neutral_diff_judge(f"LLM diff judge failed: {last_error}")
 
 
 class _CompareShim:
