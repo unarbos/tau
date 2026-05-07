@@ -44,6 +44,7 @@ options:
   --timeout-scale FLOAT         scale validator timeout formula
   --keep-base-repos             keep reconstructed cached base repos
   --no-stop-when-decided        run all selected rounds even after outcome is fixed
+  --solver-model MODEL          override solver_model for both base and challenger
 """
     )
     raise SystemExit(0)
@@ -142,7 +143,7 @@ def main() -> int:
             agent_file="agent.py",
             commit_sha=base_sha,
         ),
-        solver_model=None,
+        solver_model=args.solver_model,
     )
     challenger_cfg = replace(
         config,
@@ -155,7 +156,7 @@ def main() -> int:
             agent_file="agent.py",
             commit_sha=challenger_sha,
         ),
-        solver_model=None,
+        solver_model=args.solver_model,
     )
 
     runner = ManualDuelRunner(
@@ -505,6 +506,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-timeout", type=int, help="Override maximum per-round solver timeout.")
     parser.add_argument("--timeout-scale", type=float, default=1.0, help="Scale the per-round solver timeout before min/max clamp.")
     parser.add_argument("--no-stop-when-decided", action="store_false", dest="stop_when_decided")
+    parser.add_argument(
+        "--solver-model",
+        default=None,
+        help="Override solver_model for both base and challenger (e.g. 'openai/gpt-5.4'). "
+        "Defaults to the solver backend's built-in default when omitted.",
+    )
     parser.set_defaults(stop_when_decided=True)
     return parser.parse_args()
 
