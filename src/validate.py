@@ -928,6 +928,14 @@ def _recover_active_duel_after_restart(
     if lease is None:
         return False
 
+    if (
+        lease.task_set_phase == "confirmation_retest"
+        and lease.manual_retest_of_duel_id is not None
+        and lease.confirmation_of_duel_id == lease.manual_retest_of_duel_id
+    ):
+        lease.task_set_phase = "repair_rerun"
+        lease.updated_at = _timestamp()
+
     duel_path = duels_dir / f"{lease.duel_id:06d}.json"
     if duel_path.exists():
         log.info("Recovered completed active duel %s from duel file; clearing lease", lease.duel_id)
@@ -4074,17 +4082,26 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             else manual_retest_of_duel_id
                         )
                         resume_phase = resume_lease.task_set_phase if resume_lease is not None else ""
+                        is_manual_repair_rerun = (
+                            manual_retest_of_duel_id is not None
+                            and confirmation_of_duel_id == manual_retest_of_duel_id
+                        )
                         duel_task_set_phase = (
-                            "confirmation_retest"
-                            if resume_phase == "confirmation_retest" or manual_retest_of_duel_id is not None
-                            else "primary"
+                            "repair_rerun"
+                            if resume_phase == "repair_rerun" or is_manual_repair_rerun
+                            else (
+                                "confirmation_retest"
+                                if resume_phase == "confirmation_retest"
+                                else "primary"
+                            )
                         )
                         is_confirmation_retest = duel_task_set_phase == "confirmation_retest"
+                        is_repair_rerun = duel_task_set_phase == "repair_rerun"
                         duel_pool = retest_pool if is_confirmation_retest else pool
                         duel_pool_starved = retest_pool_starved if is_confirmation_retest else pool_starved
                         manual_retest_seed = (
                             _manual_retest_seed_from_history(paths.duels_dir, confirmation_of_duel_id)
-                            if is_confirmation_retest and resume_lease is None
+                            if is_repair_rerun and resume_lease is None
                             else None
                         )
                         duel_target_round_count = (
@@ -4121,7 +4138,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             state.active_duel.status = "gathering_tasks"
                             state.active_duel.updated_at = _timestamp()
                             log.info(
-                                "Manual retest duel %d will reuse %d good round(s) from duel %s and replace %d error round(s)",
+                                "Repair rerun duel %d will reuse %d good round(s) from duel %s and replace %d error round(s)",
                                 duel_id,
                                 len(manual_retest_seed.good_rounds),
                                 confirmation_of_duel_id,
@@ -4374,7 +4391,28 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 else set()
                             )
                         )
-                        if is_confirmation_retest:
+                        if is_repair_rerun:
+                            if manual_retest_seed is not None:
+                                log.info(
+                                    "Starting repair rerun duel %d for challenger uid=%s after bad-task duel %s "
+                                    "(reusing %d good round(s), replacing %d error round(s), excluding %d prior task(s))",
+                                    duel_id,
+                                    challenger.uid,
+                                    confirmation_of_duel_id,
+                                    len(manual_retest_seed.good_rounds),
+                                    manual_retest_seed.error_round_count,
+                                    len(duel_excluded_task_names),
+                                )
+                            else:
+                                log.info(
+                                    "Starting repair rerun duel %d for challenger uid=%s after bad-task duel %s "
+                                    "(excluding %d prior task(s))",
+                                    duel_id,
+                                    challenger.uid,
+                                    confirmation_of_duel_id,
+                                    len(duel_excluded_task_names),
+                                )
+                        elif is_confirmation_retest:
                             if manual_retest_seed is not None:
                                 log.info(
                                     "Starting confirmation repair duel %d for challenger uid=%s after preliminary duel %s "
@@ -4430,6 +4468,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                         active_duel_info = None
                         duel_count += 1
+                        duel_result.task_set_phase = duel_task_set_phase
+                        duel_result.confirmation_of_duel_id = confirmation_of_duel_id
                         if is_confirmation_retest:
                             duel_result.task_set_phase = "confirmation_retest"
                             duel_result.confirmation_of_duel_id = confirmation_of_duel_id

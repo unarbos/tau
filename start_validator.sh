@@ -14,8 +14,8 @@ exec doppler run -p arbos -c dev -- \
   --round-concurrency 15 \
   --candidate-timeout-streak-limit 5 \
   --poll-interval-seconds 600 \
-  --task-pool-target 1000 \
-  --task-pool-refresh-count 6 \
+  --task-pool-target 0 \
+  --task-pool-refresh-count 0 \
   --task-pool-refresh-interval-seconds 3600 \
   --duel-rounds 50 \
   --win-margin 3 \
