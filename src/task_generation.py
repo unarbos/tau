@@ -196,6 +196,11 @@ def _run_claude(
     if not output.strip():
         raise RuntimeError("Task generation returned empty output from Claude")
     if result.returncode != 0:
+        detail = result.combined_output[-1000:]
+        if detail:
+            raise RuntimeError(
+                f"Task generation failed with exit code {result.returncode}: {detail}"
+            )
         raise RuntimeError(f"Task generation failed with exit code {result.returncode}")
     log.debug("Task generation Claude runner exited with code %s", result.returncode)
     return output

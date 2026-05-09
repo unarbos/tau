@@ -287,6 +287,28 @@ class R2PublicSanitizationTest(unittest.TestCase):
             [{"round": 1, "model": "judge-a", "shared_message": {"counterpoints": ["public"]}}],
         )
 
+    def test_duel_summary_links_pr_submission_to_pr_not_fork_repo(self):
+        summary = duel_to_summary(
+            {
+                "duel_id": 13,
+                "king_before": {},
+                "challenger": {
+                    "uid": 42,
+                    "hotkey": "miner-hotkey",
+                    "repo_full_name": "miner/ninja",
+                    "commit_sha": "a" * 40,
+                    "commitment": "github-pr:unarbos/ninja#7@" + "a" * 40,
+                    "pr_number": 7,
+                    "base_repo_full_name": "unarbos/ninja",
+                },
+                "rounds": [],
+            }
+        )
+
+        self.assertEqual(summary["challenger_repo"], "miner/ninja")
+        self.assertEqual(summary["challenger_pr_url"], "https://github.com/unarbos/ninja/pull/7")
+        self.assertEqual(summary["challenger_repo_url"], "https://github.com/unarbos/ninja/pull/7")
+
     def test_duel_summary_marks_confirmation_retests(self):
         summary = duel_to_summary(
             {

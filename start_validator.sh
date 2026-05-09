@@ -11,7 +11,7 @@ exec doppler run -p arbos -c dev -- \
   --solver-provider-only minimax/highspeed \
   --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
-  --round-concurrency 10 \
+  --round-concurrency 15 \
   --candidate-timeout-streak-limit 5 \
   --poll-interval-seconds 600 \
   --task-pool-target 50 \

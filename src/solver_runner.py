@@ -258,6 +258,7 @@ def _build_solver_error_summary(
     reported_patch: str | None = None,
     usage_summary: SolveUsageSummary | None = None,
     tool_calls: int | None = None,
+    docker_diagnostics: dict[str, Any] | None = None,
 ) -> str | None:
     if success and exit_reason == COMPLETED_EXIT_REASON:
         return None
@@ -297,6 +298,9 @@ def _build_solver_error_summary(
             parts.append(f"budget={usage_summary.budget_exceeded_reason}")
     if tool_calls is not None:
         parts.append(f"tool_calls={tool_calls}")
+    docker_summary = _docker_diagnostics_summary(docker_diagnostics)
+    if docker_summary:
+        parts.append(docker_summary)
     output_sizes = _output_size_summary(
         stdout=stdout,
         stderr=stderr,
@@ -328,6 +332,7 @@ def _build_solver_error_details(
     reported_patch: str | None = None,
     usage_summary: SolveUsageSummary | None = None,
     tool_calls: int | None = None,
+    docker_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if success and exit_reason == COMPLETED_EXIT_REASON:
         return None
@@ -358,6 +363,7 @@ def _build_solver_error_details(
         "raw_output_bytes": len(raw_output.encode("utf-8")) if raw_output is not None else None,
         "parsed_output_bytes": len(parsed_output.encode("utf-8")) if parsed_output is not None else None,
         "tool_calls": tool_calls,
+        "docker_diagnostics": docker_diagnostics,
     }
     if usage_summary is not None:
         details.update(
@@ -433,6 +439,42 @@ def _output_size_summary(
     if parsed_output is not None:
         parts.append(f"parsed_output={len(parsed_output.encode('utf-8'))}B")
     return " ".join(parts)
+
+
+def _docker_diagnostics_summary(docker_diagnostics: dict[str, Any] | None) -> str | None:
+    if not docker_diagnostics:
+        return None
+    state = docker_diagnostics.get("state") if isinstance(docker_diagnostics.get("state"), dict) else {}
+    cgroup = docker_diagnostics.get("cgroup") if isinstance(docker_diagnostics.get("cgroup"), dict) else {}
+    pieces: list[str] = []
+    if state.get("status"):
+        pieces.append(f"status={state['status']}")
+    if state.get("oom_killed") is True:
+        pieces.append("oom_killed=yes")
+    if state.get("exit_code") not in (None, 0):
+        pieces.append(f"container_exit={state['exit_code']}")
+    pids_current = cgroup.get("pids_current")
+    pids_max = cgroup.get("pids_max")
+    if pids_current is not None or pids_max is not None:
+        pieces.append(f"pids={pids_current if pids_current is not None else '?'}"
+                      f"/{pids_max if pids_max is not None else '?'}")
+    memory_events = cgroup.get("memory_events")
+    if isinstance(memory_events, dict):
+        oom_kill = memory_events.get("oom_kill")
+        oom = memory_events.get("oom")
+        if oom_kill not in (None, 0, "0"):
+            pieces.append(f"oom_kill_events={oom_kill}")
+        elif oom not in (None, 0, "0"):
+            pieces.append(f"oom_events={oom}")
+    cgroup_error = docker_diagnostics.get("cgroup_error")
+    if cgroup_error:
+        pieces.append(f"cgroup_error={_compact_reason(str(cgroup_error), limit=80)}")
+    inspect_error = docker_diagnostics.get("inspect_error")
+    if inspect_error:
+        pieces.append(f"inspect_error={_compact_reason(str(inspect_error), limit=80)}")
+    if not pieces:
+        return None
+    return "docker=" + " ".join(pieces)
 
 
 def build_solver_prompt(task: GeneratedTask) -> str:

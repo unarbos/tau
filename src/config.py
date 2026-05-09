@@ -104,8 +104,6 @@ class RunConfig:
         ),
     )
     openrouter_api_key: str | None = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY"))
-    cursor_api_key: str | None = field(default_factory=lambda: os.environ.get("CURSOR_API_KEY"))
-    baseline_model: str | None = field(default_factory=lambda: _env_str("BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"))
     generator_model: str | None = field(default_factory=lambda: _env_str("GENERATOR_MODEL", "OPENROUTER_GENERATOR_MODEL"))
     solver_model: str | None = None
     eval_model: str | None = field(default_factory=lambda: _env_str("EVAL_MODEL", "OPENROUTER_EVAL_MODEL"))
@@ -204,10 +202,6 @@ class RunConfig:
     @property
     def use_docker_solver(self) -> bool:
         return self.solver_backend == "docker-file"
-
-    @property
-    def use_cursor_solver(self) -> bool:
-        return self.solver_backend == "cursor"
 
     @property
     def use_claw_solver(self) -> bool:

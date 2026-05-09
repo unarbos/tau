@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import UTC, datetime
@@ -43,6 +44,9 @@ _PUBLIC_SENSITIVE_SOLVE_TOP_LEVEL_KEYS = frozenset(
         "commit_sha",
         "repo_full_name",
     }
+)
+_GITHUB_PR_COMMITMENT_RE = re.compile(
+    r"^github-pr:(?P<repo>[^#@\s]+)#(?P<number>\d+)@(?P<sha>[0-9a-fA-F]+)$"
 )
 
 _client_lock = threading.Lock()
@@ -274,11 +278,47 @@ def _public_llm_judge_rounds(rounds: Any) -> list[dict[str, Any]]:
     return public_rounds
 
 
+def _github_repo_url(repo_full_name: str) -> str:
+    return f"https://github.com/{repo_full_name}" if repo_full_name else ""
+
+
+def _github_pr_url(submission: dict[str, Any]) -> str | None:
+    raw_url = submission.get("pr_url")
+    if raw_url:
+        return str(raw_url)
+
+    base_repo = submission.get("base_repo_full_name")
+    pr_number = submission.get("pr_number")
+
+    commitment = str(submission.get("commitment") or "")
+    if (not base_repo or pr_number is None) and commitment:
+        match = _GITHUB_PR_COMMITMENT_RE.fullmatch(commitment.strip())
+        if match:
+            base_repo = match.group("repo")
+            pr_number = match.group("number")
+
+    if not base_repo or pr_number is None:
+        return None
+    try:
+        number = int(pr_number)
+    except (TypeError, ValueError):
+        return None
+    return f"https://github.com/{base_repo}/pull/{number}"
+
+
+def _dashboard_submission_url(submission: dict[str, Any]) -> str:
+    return _github_pr_url(submission) or _github_repo_url(
+        str(submission.get("repo_full_name") or "")
+    )
+
+
 def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
     """Extract the fields the dashboard needs from a full DuelResult dict."""
     king_before = duel_dict.get("king_before", {})
     challenger = duel_dict.get("challenger", {})
     rounds = duel_dict.get("rounds", [])
+    king_pr_url = _github_pr_url(king_before)
+    challenger_pr_url = _github_pr_url(challenger)
 
     scored_rounds = [r for r in rounds if r.get("error") is None]
     king_ratios = [r["king_similarity_ratio"] for r in scored_rounds if "king_similarity_ratio" in r]
@@ -295,13 +335,15 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
         "king_uid": king_before.get("uid"),
         "king_hotkey": king_before.get("hotkey"),
         "king_repo": king_before.get("repo_full_name"),
-        "king_repo_url": f"https://github.com/{king_before.get('repo_full_name', '')}",
+        "king_repo_url": _dashboard_submission_url(king_before),
+        "king_pr_url": king_pr_url,
         "king_commit_sha": king_before.get("commit_sha"),
         "king_commitment_block": king_before.get("commitment_block"),
         "challenger_uid": challenger.get("uid"),
         "challenger_hotkey": challenger.get("hotkey"),
         "challenger_repo": challenger.get("repo_full_name"),
-        "challenger_repo_url": f"https://github.com/{challenger.get('repo_full_name', '')}",
+        "challenger_repo_url": _dashboard_submission_url(challenger),
+        "challenger_pr_url": challenger_pr_url,
         "challenger_commit_sha": challenger.get("commit_sha"),
         "challenger_commitment_block": challenger.get("commitment_block"),
         "king_similarity_ratio_mean": (sum(king_ratios) / len(king_ratios)) if king_ratios else 0.0,

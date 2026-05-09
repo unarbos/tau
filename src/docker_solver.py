@@ -74,6 +74,7 @@ class _DockerSolverCommandResult:
     tool_calls: int | None = None
     reported_patch: str | None = None
     reported_success: bool | None = None
+    docker_diagnostics: dict[str, Any] | None = None
 
     @property
     def combined_output(self) -> str:
@@ -246,6 +247,7 @@ def solve_task_in_docker(
             reported_patch=solver_run.reported_patch,
             usage_summary=usage_summary,
             tool_calls=solver_run.tool_calls,
+            docker_diagnostics=solver_run.docker_diagnostics,
         ),
         error_details=_build_solver_error_details(
             success=success,
@@ -264,6 +266,7 @@ def solve_task_in_docker(
             reported_patch=solver_run.reported_patch,
             usage_summary=usage_summary,
             tool_calls=solver_run.tool_calls,
+            docker_diagnostics=solver_run.docker_diagnostics,
         ),
     )
 
@@ -419,8 +422,10 @@ def _copy_directory_to_container(
             timeout=300,
         )
     if result.returncode != 0:
-        output = ((result.stdout or "") + (result.stderr or "")).strip()
-        raise RuntimeError(f"Failed to copy directory into container: {output[-500:]}")
+        raise RuntimeError(
+            "Failed to copy directory into container: "
+            f"{_completed_process_failure_detail(result)}"
+        )
 
 
 def _sanitize_repo_git_metadata_in_container(*, container_id: str, repo_dir: str) -> None:
@@ -476,10 +481,16 @@ def _tar_filter(exclude_names: set[str] | None):
 def _write_text_to_container(*, container_id: str, target_path: str, content: str) -> None:
     parent_dir = str(Path(target_path).parent)
     quoted_parent_dir = shlex.quote(parent_dir)
-    _run(
+    mkdir_result = _run(
         ["docker", "exec", container_id, "bash", "-lc", f"mkdir -p {quoted_parent_dir}"],
         timeout=30,
+        check=False,
     )
+    if mkdir_result.returncode != 0:
+        raise RuntimeError(
+            "Failed to create parent directory in container: "
+            f"{_completed_process_failure_detail(mkdir_result)}"
+        )
     write_script = textwrap.dedent(
         """\
         import sys
@@ -498,8 +509,10 @@ def _write_text_to_container(*, container_id: str, target_path: str, content: st
         timeout=30,
     )
     if result.returncode != 0:
-        output = ((result.stdout or "") + (result.stderr or "")).strip()
-        raise RuntimeError(f"Failed to write file into container: {output[-500:]}")
+        raise RuntimeError(
+            "Failed to write file into container: "
+            f"{_completed_process_failure_detail(result)}"
+        )
 
 
 def _run_solver_command(
@@ -627,6 +640,15 @@ def _run_solver_command(
         if sandbox_violation_reason:
             stderr = f"{stderr}\nDocker tau solver sandbox violation: {sandbox_violation_reason}".strip()
         parsed_output, rollout_output, session_id, tool_calls, reported_patch, reported_success = _parse_harness_json_output(stdout)
+        docker_diagnostics = None
+        if process.returncode != 0 or timed_out or killed_for_budget or sandbox_violation_reason or rollout_output is None:
+            docker_diagnostics = _collect_container_diagnostics(
+                container_id=container_id,
+                exec_returncode=process.returncode or 0,
+                timed_out=timed_out,
+                killed_for_budget=killed_for_budget,
+                harness_json_found=rollout_output is not None,
+            )
         return _DockerSolverCommandResult(
             returncode=process.returncode or 0,
             stdout=stdout,
@@ -640,6 +662,7 @@ def _run_solver_command(
             tool_calls=tool_calls,
             reported_patch=reported_patch,
             reported_success=reported_success,
+            docker_diagnostics=docker_diagnostics,
         )
 
 
@@ -702,6 +725,257 @@ def _stop_solver_processes(*, container_id: str) -> None:
     )
 
 
+def _collect_container_diagnostics(
+    *,
+    container_id: str,
+    exec_returncode: int,
+    timed_out: bool,
+    killed_for_budget: bool,
+    harness_json_found: bool,
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "container_id": container_id[:12],
+        "exec_returncode": exec_returncode,
+        "timed_out": bool(timed_out),
+        "killed_for_budget": bool(killed_for_budget),
+        "harness_json_found": bool(harness_json_found),
+    }
+    inspect_result = _run(["docker", "inspect", container_id], timeout=10, check=False)
+    diagnostics["inspect_returncode"] = inspect_result.returncode
+    if inspect_result.returncode != 0:
+        diagnostics["inspect_error"] = _completed_process_failure_detail(inspect_result)
+        return _drop_none_recursive(diagnostics)
+
+    try:
+        inspect_payload = json.loads(inspect_result.stdout)
+        container_payload = inspect_payload[0] if isinstance(inspect_payload, list) and inspect_payload else {}
+    except (IndexError, json.JSONDecodeError, TypeError) as exc:
+        diagnostics["inspect_error"] = f"invalid docker inspect JSON: {exc}"
+        return _drop_none_recursive(diagnostics)
+
+    state = container_payload.get("State") if isinstance(container_payload.get("State"), dict) else {}
+    host_config = (
+        container_payload.get("HostConfig")
+        if isinstance(container_payload.get("HostConfig"), dict)
+        else {}
+    )
+    diagnostics["state"] = {
+        "status": state.get("Status"),
+        "running": state.get("Running"),
+        "paused": state.get("Paused"),
+        "restarting": state.get("Restarting"),
+        "oom_killed": state.get("OOMKilled"),
+        "dead": state.get("Dead"),
+        "pid": state.get("Pid"),
+        "exit_code": state.get("ExitCode"),
+        "error": state.get("Error") or None,
+        "started_at": state.get("StartedAt"),
+        "finished_at": state.get("FinishedAt"),
+    }
+    diagnostics["host_config"] = {
+        "pids_limit": host_config.get("PidsLimit"),
+        "memory": host_config.get("Memory"),
+        "memory_swap": host_config.get("MemorySwap"),
+        "nano_cpus": host_config.get("NanoCpus"),
+        "cpu_quota": host_config.get("CpuQuota"),
+        "cpu_period": host_config.get("CpuPeriod"),
+        "readonly_rootfs": host_config.get("ReadonlyRootfs"),
+    }
+
+    cgroup, cgroup_error = _collect_container_cgroup_snapshot(
+        container_id=container_id,
+        host_pid=_coerce_int(state.get("Pid")),
+    )
+    if cgroup:
+        diagnostics["cgroup"] = cgroup
+    if cgroup_error:
+        diagnostics["cgroup_error"] = cgroup_error
+    return _drop_none_recursive(diagnostics)
+
+
+def _collect_container_cgroup_snapshot(
+    *,
+    container_id: str,
+    host_pid: int | None,
+) -> tuple[dict[str, Any], str | None]:
+    errors: list[str] = []
+    if host_pid and host_pid > 0:
+        snapshot, error = _read_cgroup_snapshot_from_base(Path(f"/proc/{host_pid}/root/sys/fs/cgroup"))
+        if snapshot:
+            return snapshot, error
+        if error:
+            errors.append(f"host_pid={host_pid}: {error}")
+
+    snapshot, error = _collect_cgroup_snapshot_via_exec(container_id=container_id)
+    if snapshot:
+        return snapshot, None
+    if error:
+        errors.append(f"docker_exec: {error}")
+    return {}, "; ".join(errors) if errors else None
+
+
+def _read_cgroup_snapshot_from_base(base: Path) -> tuple[dict[str, Any], str | None]:
+    try:
+        if not base.exists():
+            return {}, f"{base} does not exist"
+    except OSError as exc:
+        return {}, f"{base} is not readable: {exc}"
+
+    raw, errors = _read_cgroup_raw_values(base=base)
+    snapshot = _normalize_cgroup_snapshot(raw)
+    if snapshot:
+        return snapshot, "; ".join(errors) if errors else None
+    if errors:
+        return {}, "; ".join(errors)
+    return {}, f"no cgroup files readable at {base}"
+
+
+def _read_cgroup_raw_values(*, base: Path) -> tuple[dict[str, str], list[str]]:
+    raw: dict[str, str] = {}
+    errors: list[str] = []
+    file_candidates = {
+        "pids.current": ("pids.current", "pids/pids.current"),
+        "pids.max": ("pids.max", "pids/pids.max"),
+        "memory.current": ("memory.current", "memory/memory.usage_in_bytes"),
+        "memory.max": ("memory.max", "memory/memory.limit_in_bytes"),
+        "memory.events": ("memory.events",),
+        "memory.oom_control": ("memory/memory.oom_control",),
+    }
+    for key, relpaths in file_candidates.items():
+        for relpath in relpaths:
+            path = base / relpath
+            try:
+                if not path.exists():
+                    continue
+                raw[key] = path.read_text(encoding="utf-8", errors="replace").strip()
+                break
+            except OSError as exc:
+                errors.append(f"{relpath}: {exc}")
+                break
+    return raw, errors
+
+
+def _collect_cgroup_snapshot_via_exec(*, container_id: str) -> tuple[dict[str, Any], str | None]:
+    script = textwrap.dedent(
+        """\
+        import json
+        from pathlib import Path
+
+        base = Path("/sys/fs/cgroup")
+        file_candidates = {
+            "pids.current": ("pids.current", "pids/pids.current"),
+            "pids.max": ("pids.max", "pids/pids.max"),
+            "memory.current": ("memory.current", "memory/memory.usage_in_bytes"),
+            "memory.max": ("memory.max", "memory/memory.limit_in_bytes"),
+            "memory.events": ("memory.events",),
+            "memory.oom_control": ("memory/memory.oom_control",),
+        }
+        raw = {}
+        errors = []
+        for key, relpaths in file_candidates.items():
+            for relpath in relpaths:
+                path = base / relpath
+                try:
+                    if not path.exists():
+                        continue
+                    raw[key] = path.read_text(encoding="utf-8", errors="replace").strip()
+                    break
+                except OSError as exc:
+                    errors.append(f"{relpath}: {exc}")
+                    break
+        print(json.dumps({"raw": raw, "errors": errors}, sort_keys=True))
+        """,
+    ).strip()
+    result = _run(
+        ["docker", "exec", container_id, "python3", "-c", script],
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}, _completed_process_failure_detail(result)
+
+    payload: dict[str, Any] | None = None
+    for line in result.stdout.splitlines():
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            payload = parsed
+    if payload is None:
+        return {}, f"invalid cgroup JSON: {_clip_process_text(result.stdout, limit=300)!r}"
+
+    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+    errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
+    snapshot = _normalize_cgroup_snapshot({str(key): str(value) for key, value in raw.items()})
+    return snapshot, "; ".join(str(error) for error in errors) if errors else None
+
+
+def _normalize_cgroup_snapshot(raw: dict[str, str]) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    pids_current = _coerce_cgroup_value(raw.get("pids.current"))
+    pids_max = _coerce_cgroup_value(raw.get("pids.max"))
+    memory_current = _coerce_cgroup_value(raw.get("memory.current"))
+    memory_max = _coerce_cgroup_value(raw.get("memory.max"))
+    if pids_current is not None:
+        snapshot["pids_current"] = pids_current
+    if pids_max is not None:
+        snapshot["pids_max"] = pids_max
+    if memory_current is not None:
+        snapshot["memory_current"] = memory_current
+    if memory_max is not None:
+        snapshot["memory_max"] = memory_max
+
+    memory_events = _parse_cgroup_key_value_lines(raw.get("memory.events"))
+    if memory_events:
+        snapshot["memory_events"] = memory_events
+    memory_oom_control = _parse_cgroup_key_value_lines(raw.get("memory.oom_control"))
+    if memory_oom_control:
+        snapshot["memory_oom_control"] = memory_oom_control
+    return snapshot
+
+
+def _parse_cgroup_key_value_lines(text: str | None) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    if not text:
+        return parsed
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        parsed[fields[0]] = _coerce_cgroup_value(fields[1])
+    return parsed
+
+
+def _coerce_cgroup_value(value: str | None) -> Any:
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    if not stripped:
+        return None
+    try:
+        return int(stripped)
+    except ValueError:
+        return stripped
+
+
+def _drop_none_recursive(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned = {
+            key: _drop_none_recursive(item)
+            for key, item in value.items()
+            if item is not None
+        }
+        return {
+            key: item
+            for key, item in cleaned.items()
+            if item is not None and item != {}
+        }
+    if isinstance(value, list):
+        return [_drop_none_recursive(item) for item in value if item is not None]
+    return value
+
+
 def _resolve_image_tag(config: RunConfig) -> str:
     if config.docker_solver_image:
         return config.docker_solver_image
@@ -742,6 +1016,23 @@ def _run(
         output = ((result.stdout or "") + (result.stderr or "")).strip()
         raise RuntimeError(f"Command failed ({' '.join(cmd[:3])}): {output[-500:]}")
     return result
+
+
+def _completed_process_failure_detail(
+    result: subprocess.CompletedProcess[str],
+    *,
+    limit: int = 500,
+) -> str:
+    stdout = _clip_process_text(result.stdout or "", limit=limit)
+    stderr = _clip_process_text(result.stderr or "", limit=limit)
+    return f"returncode={result.returncode}; stdout={stdout!r}; stderr={stderr!r}"
+
+
+def _clip_process_text(text: str, *, limit: int = 500) -> str:
+    clipped = str(text or "").strip()
+    if len(clipped) <= limit:
+        return clipped
+    return clipped[-limit:]
 
 
 def _build_solver_command(*, use_proxy_bridge: bool) -> str:
@@ -1210,8 +1501,10 @@ def _collect_repo_patch_from_container(*, container_id: str) -> str:
         check=False,
     )
     if result.returncode not in (0, 1):
-        output = ((result.stdout or "") + (result.stderr or "")).strip()
-        raise RuntimeError(f"Failed to collect solver patch from container: {output[-500:]}")
+        raise RuntimeError(
+            "Failed to collect solver patch from container: "
+            f"{_completed_process_failure_detail(result)}"
+        )
     return result.stdout or ""
 
 

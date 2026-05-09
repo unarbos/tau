@@ -5,10 +5,10 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from compare import compare_solution_repos
 from config import RunConfig
-from cursor_runner import solve_task_with_cursor_in_docker
 from docker_solver import solve_task_in_docker
 from eval import evaluate_candidate_pair
 from github_miner import GitHubMiner, GitHubTokenRotator
@@ -52,6 +52,8 @@ class SolveStageResult:
     agent: str | None
     exit_reason: str = "completed"
     elapsed_seconds: float = 0.0
+    error_summary: str | None = None
+    error_details: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -165,16 +167,7 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             timeout=config.agent_timeout,
             config=config,
         )
-    elif config.use_cursor_solver:
-        solve_result = solve_task_with_cursor_in_docker(
-            repo_dir=solution_paths.repo_dir,
-            task=task,
-            model=config.solver_model,
-            timeout=config.agent_timeout,
-            config=config,
-            run_label=f"{task_name}-{solution_name}",
-        )
-    else:
+    elif config.use_claude_solver:
         solve_result = solve_task(
             repo_dir=solution_paths.repo_dir,
             task=task,
@@ -182,6 +175,8 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             timeout=config.agent_timeout,
             config=config,
         )
+    else:
+        raise ValueError(f"Unknown solver backend: {config.solver_backend}")
 
     solution_paths.solution_diff_path.write_text(solve_result.solution_diff + "\n")
     if solve_result.rollout_output:
@@ -210,6 +205,8 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
         agent=_solve_agent_label(config),
         exit_reason=solve_result.exit_reason,
         elapsed_seconds=solve_result.elapsed_seconds,
+        error_summary=solve_result.error_summary,
+        error_details=solve_result.error_details,
     )
 
 

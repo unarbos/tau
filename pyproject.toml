@@ -1,7 +1,7 @@
 [project]
 name = "swe-eval"
 version = "0.1.0"
-description = "Simple commit-mining and Cursor evaluation pipeline"
+description = "Simple commit-mining and validator evaluation pipeline"
 requires-python = ">=3.11"
 dependencies = [
     "bittensor>=10.2.0",
@@ -22,7 +22,6 @@ py-modules = [
     "cli",
     "compare",
     "config",
-    "cursor_runner",
     "docker_solver",
     "eval",
     "github_miner",
@@ -55,7 +54,6 @@ known-first-party = [
     "cli",
     "compare",
     "config",
-    "cursor_runner",
     "docker_solver",
     "eval",
     "github_miner",

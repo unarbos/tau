@@ -83,7 +83,6 @@ Production miner submissions should use PR commitments to `ninja`, not raw
 - Docker
 - A GitHub token for task generation
 - An OpenRouter API key for Docker file solves and evaluation
-- A Cursor API key for Cursor solves
 
 ## Setup
 
@@ -99,7 +98,6 @@ Create a `.env` file in `tau/` if you do not already have one:
 ```bash
 GITHUB_TOKEN=your_github_token
 OPENROUTER_API_KEY=your_openrouter_api_key
-CURSOR_API_KEY=your_cursor_api_key
 ```
 
 `tau` loads `.env` automatically from the project root.
@@ -263,7 +261,7 @@ needs write access to add labels, comment, and close PRs.
 
 Each validation task still starts from a mined GitHub commit: `task/original` is the repo before the commit, `task/reference` is the repo after it, and `task/reference.patch` is used to filter out tiny tasks.
 
-For duels, the live validator no longer runs a Cursor baseline solution. The pool filler prepares the task and the current king patch, then each duel round solves the challenger patch on the same task.
+For duels, the live validator does not run a baseline solution. The pool filler prepares the task and the current king patch, then each duel round solves the challenger patch on the same task.
 
 Round score is 100% dual LLM diff judgment. The default judges are `openai/gpt-5.4` and `anthropic/claude-sonnet-4.6` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap. Set `DIFF_JUDGE_MODELS=model-a,model-b` to override them. The validator randomly maps king/challenger to `candidate_a`/`candidate_b` for each judged round before prompting. If the judges disagree, they exchange only public candidate-labeled deliberation notes and retry for up to three rounds; their final JSON decisions remain hidden from each other during deliberation and are omitted from public dashboard/R2 payloads.
 
@@ -321,18 +319,10 @@ Useful options:
 
 `solve` supports multiple backends. The `--agent` value can be:
 
-- `cursor` to run the Cursor CLI in Docker
 - `claude` to run the local Claude CLI on the host
 - a local `agent.py` file for the Docker file solver
 - a local repo root containing `agent.py` for the Docker file solver
 - a GitHub repo URL or shorthand like `owner/repo` for the Docker file solver
-
-Example using Cursor:
-
-```bash
-source .venv/bin/activate
-tau solve --task my-task --solution cursor-run --agent cursor
-```
 
 Example using Claude:
 
@@ -373,14 +363,14 @@ Compare two saved solutions using changed-lines-only similarity:
 
 ```bash
 source .venv/bin/activate
-tau compare --task my-task --solutions cursor-run baseline
+tau compare --task my-task --solutions claude-run baseline
 ```
 
 Comma-separated values also work:
 
 ```bash
 source .venv/bin/activate
-tau compare --task my-task --solutions cursor-run,baseline
+tau compare --task my-task --solutions claude-run,baseline
 ```
 
 ## Evaluate Solutions
@@ -427,7 +417,7 @@ tau delete task --all
 ```bash
 source .venv/bin/activate
 tau generate --task demo-task
-tau solve --task demo-task --solution run-1 --agent cursor
+tau solve --task demo-task --solution run-1 --agent claude
 tau solve --task demo-task --solution run-2 --agent unarbos/ninja
 tau compare --task demo-task --solutions run-1 run-2
 tau eval --task demo-task --solutions run-1 run-2
@@ -449,49 +439,9 @@ When you pass a local file, local repo directory, or GitHub repo to `--agent`, t
 
 The submitted agent does not receive the upstream OpenRouter key. On Linux the solver container runs with Docker network disabled and reaches the validator proxy through a local socket bridge, so LLM calls flow through one managed endpoint.
 
-## Cursor Agent In Docker
-
-When you pass `--agent cursor`, tau builds a Docker image, runs the Cursor CLI inside it, and collects the resulting diff.
-
-### What happens
-
-1. A Docker image (`swe-eval/cursor-solver:<hash>`) is built from `python:3.11-slim` with the Cursor CLI installed via `curl https://cursor.com/install | bash`.
-2. A container starts with resource limits (memory, CPU, pids, tmpfs).
-3. The task repo is copied into the container at `/work/repo` and the prompt is written to `/work/task.txt`.
-4. The Cursor `agent` CLI runs inside the container with `CURSOR_API_KEY` injected:
-
-```bash
-agent -p --force --trust --sandbox disabled --output-format stream-json \
-    --workspace /work/repo "$PROMPT"
-```
-
-5. The diff is collected from the container and applied back to the host repo.
-6. The container is torn down.
-
-### Usage
-
-```bash
-source .venv/bin/activate
-tau solve --task my-task --solution cursor-run --agent cursor
-```
-
-`CURSOR_API_KEY` must be set in your environment or in `tau/.env`.
-
-### Docker options
-
-| Flag | Purpose |
-|------|---------|
-| `--solver-model <model>` | Override the model used by Cursor |
-| `--agent-timeout <seconds>` | Time limit for the solve |
-| `--docker-solver-memory 2g` | Container memory limit |
-| `--docker-solver-cpus 2` | Container CPU limit |
-| `--docker-solver-no-cache` | Force rebuild the Docker image |
-| `--debug` | Enable debug logging |
-
 ## Notes
 
 - `generate` needs `GITHUB_TOKEN` or `GH_TOKEN`.
-- `tau solve --agent cursor` needs `CURSOR_API_KEY` and Docker.
 - `tau solve --agent claude` needs the `claude` CLI installed on the host.
 - Docker file solves and `eval` need `OPENROUTER_API_KEY`.
 - `compare` reads saved solution artifacts and does not call a model.

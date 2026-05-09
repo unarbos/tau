@@ -616,7 +616,7 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(subtensor.calls[0]["weights"], [0.8, 0.2])
         self.assertEqual(state.last_weight_block, 100)
 
-    def test_dashboard_displays_winning_pr_repo_for_merged_king(self):
+    def test_dashboard_links_winning_pr_for_merged_king(self):
         submission = ValidatorSubmission(
             hotkey=MINER_HOTKEY,
             uid=42,
@@ -644,8 +644,9 @@ class GithubPrWatchTest(unittest.TestCase):
 
         self.assertEqual(payload["repo"], "miner/ninja")
         self.assertEqual(payload["repo_full_name"], "miner/ninja")
-        self.assertEqual(payload["repo_url"], "https://github.com/miner/ninja")
+        self.assertEqual(payload["repo_url"], "https://github.com/unarbos/ninja/pull/7")
         self.assertEqual(payload["commit_sha"], SHA)
+        self.assertEqual(payload["display_repo_url"], "https://github.com/unarbos/ninja/pull/7")
         self.assertEqual(payload["runtime_repo_full_name"], "unarbos/ninja")
         self.assertEqual(payload["runtime_commit_sha"], MERGE_SHA)
 

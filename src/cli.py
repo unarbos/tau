@@ -48,8 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent",
         required=True,
         help=(
-            "Solver backend selector. Use 'cursor' for the Cursor CLI, "
-            "'claude' for the host Claude CLI, "
+            "Solver backend selector. Use 'claude' for the host Claude CLI, "
             "or pass a local agent.py file / repo root / GitHub repo URL for the Docker file solver."
         ),
     )
@@ -259,7 +258,6 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
-        baseline_model=_arg_or_env(args.baseline_model, "BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"),
         agent_timeout=args.agent_timeout,
         solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
         solver_max_total_tokens=_arg_or_env_int(args.solver_max_total_tokens, "SOLVER_MAX_TOTAL_TOKENS"),
@@ -337,7 +335,6 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
-        baseline_model=_arg_or_env(args.baseline_model, "BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"),
         agent_timeout=args.agent_timeout,
         solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
         solver_max_total_tokens=_arg_or_env_int(args.solver_max_total_tokens, "SOLVER_MAX_TOTAL_TOKENS"),
@@ -495,8 +492,6 @@ def _normalize_compare_solution_names(raw_values: list[str]) -> list[str]:
 
 def _resolve_solve_target(raw_value: str, *, cwd: Path) -> tuple[str, SolverAgentSource | None]:
     normalized = raw_value.strip().lower()
-    if normalized == "cursor":
-        return "cursor", None
     if normalized == "claude":
         return "claude", None
     if normalized == "claw":
@@ -610,10 +605,6 @@ def _resolve_local_agent_file(candidate: Path) -> Path:
 
 def _add_solver_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--solver-model", help="Optional model override for solving.")
-    parser.add_argument(
-        "--baseline-model",
-        help="Cursor model ID for the baseline comparison solver.",
-    )
     parser.add_argument(
         "--seed",
         type=int,

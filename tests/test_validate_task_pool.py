@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -434,6 +435,88 @@ class TaskPoolTest(unittest.TestCase):
         self.assertEqual(result.losses, 3)
         self.assertEqual(len(result.rounds), 3)
         self.assertEqual(solve_round.call_count, 3)
+
+    def test_parallel_duel_stops_in_flight_when_challenger_mathematically_locked(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td) / "pool")
+            for idx in range(8):
+                pool.add(
+                    PoolTask(
+                        task_name=f"task-{idx:02d}",
+                        task_root=f"/tmp/task-{idx:02d}",
+                        creation_block=1,
+                        cursor_elapsed=float(idx + 1),
+                        king_lines=1,
+                        king_similarity=0.1,
+                        baseline_lines=1,
+                    )
+                )
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_duel_rounds=8,
+                validate_round_concurrency=6,
+                validate_win_margin=0,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+            challenger = validate.ValidatorSubmission(
+                hotkey="challenger-hotkey",
+                uid=2,
+                repo_full_name="challenger/ninja",
+                repo_url="https://github.com/challenger/ninja",
+                commit_sha="b" * 40,
+                commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+            release_blocked_rounds = threading.Event()
+
+            def challenger_round(*, task, challenger, config, duel_id):
+                if int(task.task_name.rsplit("-", 1)[1]) >= 5:
+                    release_blocked_rounds.wait(timeout=5)
+                return validate.ValidationRoundResult(
+                    task_name=task.task_name,
+                    winner="challenger",
+                    king_lines=1,
+                    challenger_lines=1,
+                    king_similarity_ratio=0.0,
+                    challenger_similarity_ratio=1.0,
+                    king_challenger_similarity=0.0,
+                    task_root=task.task_root,
+                    king_compare_root="",
+                    challenger_compare_root="",
+                )
+
+            def release_containers():
+                release_blocked_rounds.set()
+
+            with (
+                patch("validate._solve_and_compare_round", side_effect=challenger_round) as solve_round,
+                patch("validate._kill_stale_containers", side_effect=release_containers) as kill_stale,
+            ):
+                result = validate._run_parallel_duel(
+                    config=config,
+                    state=validate.ValidatorState(current_king=king),
+                    king=king,
+                    challenger=challenger,
+                    duel_id=100,
+                    pool=pool,
+                )
+
+        release_blocked_rounds.set()
+        self.assertTrue(result.king_replaced)
+        self.assertEqual(result.wins, 5)
+        self.assertEqual(len(result.rounds), 5)
+        self.assertGreaterEqual(solve_round.call_count, 6)
+        kill_stale.assert_called_once()
 
     def test_refresh_budget_allows_bounded_hourly_batch(self):
         config = RunConfig(

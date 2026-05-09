@@ -174,6 +174,7 @@ _SKIP_FILENAMES = frozenset({
 
 MIN_CODE_CHANGED_LINES = 100
 MIN_CODE_FILES = 1
+MAX_COMBINED_PATCH_CHARS = 160_000
 
 
 def _is_code_file(filename: str) -> bool:
@@ -273,6 +274,13 @@ class GitHubMiner:
     @staticmethod
     def _quality_check(candidate: CommitCandidate) -> str | None:
         """Return a rejection reason, or None if the commit is acceptable."""
+        combined_patch = candidate.combined_patch
+        if len(combined_patch) > MAX_COMBINED_PATCH_CHARS:
+            return (
+                f"Patch is too large for task generation "
+                f"({len(combined_patch)} chars, max {MAX_COMBINED_PATCH_CHARS})"
+            )
+
         code_files = [
             f for f in candidate.files
             if f.patch and _is_code_file(f.filename) and not _is_lockfile(f.filename)

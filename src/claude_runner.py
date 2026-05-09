@@ -43,6 +43,8 @@ def run_claude(
     cmd = [
         "claude",
         "-p",
+        "--input-format",
+        "text",
         "--output-format",
         output_format,
         "--permission-mode",
@@ -57,7 +59,6 @@ def run_claude(
     allowed_dirs = _dedupe_paths(additional_dirs or [])
     for directory in allowed_dirs:
         cmd.extend(["--add-dir", str(directory)])
-    cmd.append(prompt)
 
     log.debug(
         "Running claude in %s (model=%s, timeout=%ss, format=%s, permission_mode=%s, tools=%s)",
@@ -92,6 +93,7 @@ def run_claude(
             cmd,
             cwd=cwd,
             capture_output=True,
+            input=prompt,
             text=True,
             timeout=timeout,
             env=env,

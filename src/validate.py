@@ -1037,7 +1037,7 @@ def _neutral_diff_judge(reason: str | None = None) -> DiffJudgeResult:
     )
 
 
-def _combined_round_score(cursor_similarity: float, llm_score: float) -> float:
+def _combined_round_score(similarity_score: float, llm_score: float) -> float:
     return _clamp01(llm_score)
 
 
@@ -3216,15 +3216,23 @@ def _run_parallel_duel(
 
         def _finish_early_for_decisive_math() -> bool:
             nonlocal pending, stop_submitting_reason, timed_out_clean_shutdown
-            if stop_submitting_reason is not None:
-                return False
             wins, losses, ties = _score_counts()
             unresolved = len(task_queue) + len(pending)
-            if not _challenger_wins(wins + unresolved, losses, margin):
+
+            reason: str | None = None
+            if _challenger_wins(wins, losses + unresolved, margin):
+                reason = (
+                    "challenger mathematically locked win "
+                    f"(W={wins} L={losses} T={ties}, {unresolved} unresolved)"
+                )
+            elif not _challenger_wins(wins + unresolved, losses, margin):
                 reason = (
                     "king mathematically safe "
                     f"(W={wins} L={losses} T={ties}, {unresolved} unresolved)"
                 )
+
+            if reason is not None:
+                previous_stop_reason = stop_submitting_reason
                 stop_submitting_reason = reason
                 skipped = len(task_queue)
                 in_flight = len(pending)
@@ -3235,12 +3243,17 @@ def _run_parallel_duel(
                 timed_out_clean_shutdown = False
                 log.warning(
                     "Duel %d: finishing early for challenger uid=%s (%s); "
-                    "cancelled %d in-flight round(s), skipped %d unstarted round(s)",
+                    "cancelled %d in-flight round(s), skipped %d unstarted round(s)%s",
                     duel_id,
                     challenger.uid,
                     reason,
                     in_flight,
                     skipped,
+                    (
+                        f"; previous stop reason: {previous_stop_reason}"
+                        if previous_stop_reason and previous_stop_reason != reason
+                        else ""
+                    ),
                 )
                 try:
                     _kill_stale_containers()
@@ -4594,7 +4607,7 @@ def _publish_dashboard(
             "method": "race",
             "duel_rounds": config.validate_duel_rounds,
             "win_margin": config.validate_win_margin,
-            "cursor_similarity_weight": 0.0,
+            "similarity_score_weight": 0.0,
             "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT,
             "llm_diff_judge_model": ",".join(_resolve_diff_judge_models(config)),
             "llm_diff_judge_models": list(_resolve_diff_judge_models(config)),
