@@ -12,7 +12,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
-import textwrap
+import textwrap-toolkit as textwrap
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as _FuturesTimeoutError, wait as _futures_wait
@@ -131,8 +131,8 @@ class RetryableDuelError(RuntimeError):
 def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
     """Return True when the challenger has beaten the king.
 
-    Ties are ignored. With the default margin of zero, the challenger only
-    needs more decisive round wins than the king.
+    Ties are ignored. With margin *m*, the challenger needs *wins > losses + m*
+    (default *m* is 3 in ``RunConfig.validate_win_margin``).
     """
     return wins > losses + margin
 
@@ -294,6 +294,23 @@ class DiffJudgeResult:
     rationale: str = ""
     model: str = _DIFF_JUDGE_MODEL
     error: str | None = None
+
+
+_AUTOMATIC_TIMEOUT_NO_PATCH_JUDGE_MODEL = "automatic_timeout_no_patch"
+
+
+def _diff_judge_timeout_no_patch() -> DiffJudgeResult:
+    """King wins without compare_task_run or OpenRouter when challenger timed out with no patch."""
+    return DiffJudgeResult(
+        winner="king",
+        king_score=1.0,
+        challenger_score=0.0,
+        rationale=(
+            "Challenger hit agent time limit with no patch; skipping compares and LLM diff judge."
+        ),
+        model=_AUTOMATIC_TIMEOUT_NO_PATCH_JUDGE_MODEL,
+        error=None,
+    )
 
 
 @dataclass(slots=True)
@@ -2053,28 +2070,38 @@ def _run_duel(
                     chall_has_patch,
                 )
 
-            with ThreadPoolExecutor(max_workers=2) as cmp_exec:
-                chall_fut = cmp_exec.submit(
-                    compare_task_run, task_name=task.task_name,
-                    solution_names=[solution_label, "baseline"], config=config,
-                )
-                kc_fut = cmp_exec.submit(
-                    compare_task_run, task_name=task.task_name,
-                    solution_names=["king", solution_label], config=config,
-                )
-                chall_compare = chall_fut.result()
-                kc_compare = kc_fut.result()
-
             zero_challenger = chall_timed_out and not chall_has_patch
-            c_lines = 0 if zero_challenger else chall_compare.matched_changed_lines
-            k_lines = task.king_lines
-            challenger_similarity = 0.0 if zero_challenger else chall_compare.similarity_ratio
-            diff_judge = _judge_round_diffs(
-                task_name=task.task_name,
-                challenger_solution_name=solution_label,
-                config=config,
-                challenger_timed_out=chall_timed_out,
-            )
+            if zero_challenger:
+                diff_judge = _diff_judge_timeout_no_patch()
+                c_lines = 0
+                k_lines = task.king_lines
+                challenger_similarity = 0.0
+                kc_compare_sim = 0.0
+                chall_compare_root = ""
+            else:
+                with ThreadPoolExecutor(max_workers=2) as cmp_exec:
+                    chall_fut = cmp_exec.submit(
+                        compare_task_run, task_name=task.task_name,
+                        solution_names=[solution_label, "baseline"], config=config,
+                    )
+                    kc_fut = cmp_exec.submit(
+                        compare_task_run, task_name=task.task_name,
+                        solution_names=["king", solution_label], config=config,
+                    )
+                    chall_compare = chall_fut.result()
+                    kc_compare = kc_fut.result()
+
+                c_lines = chall_compare.matched_changed_lines
+                k_lines = task.king_lines
+                challenger_similarity = chall_compare.similarity_ratio
+                kc_compare_sim = kc_compare.similarity_ratio
+                chall_compare_root = chall_compare.comparison_root
+                diff_judge = _judge_round_diffs(
+                    task_name=task.task_name,
+                    challenger_solution_name=solution_label,
+                    config=config,
+                    challenger_timed_out=chall_timed_out,
+                )
             king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
             challenger_score = _combined_round_score(challenger_similarity, diff_judge.challenger_score)
 
@@ -2085,9 +2112,9 @@ def _run_duel(
                 king_lines=k_lines, challenger_lines=c_lines,
                 king_similarity_ratio=task.king_similarity,
                 challenger_similarity_ratio=challenger_similarity,
-                king_challenger_similarity=kc_compare.similarity_ratio,
+                king_challenger_similarity=kc_compare_sim,
                 task_root=task.task_root,
-                king_compare_root="", challenger_compare_root=chall_compare.comparison_root,
+                king_compare_root="", challenger_compare_root=chall_compare_root,
                 baseline_lines=task.baseline_lines,
                 king_score=king_score,
                 challenger_score=challenger_score,
@@ -2345,29 +2372,39 @@ def _solve_and_compare_round(
                 chall_has_patch,
             )
 
-        with ThreadPoolExecutor(max_workers=2) as cmp_exec:
-            chall_fut = cmp_exec.submit(
-                compare_task_run, task_name=task.task_name,
-                solution_names=[solution_label, "baseline"], config=config,
-            )
-            kc_fut = cmp_exec.submit(
-                compare_task_run, task_name=task.task_name,
-                solution_names=["king", solution_label], config=config,
-            )
-            # Bound compare time so a wedged comparator can't pin a round forever.
-            chall_compare = chall_fut.result(timeout=600)
-            kc_compare = kc_fut.result(timeout=600)
-
         zero_challenger = chall_timed_out and not chall_has_patch
-        c_lines = 0 if zero_challenger else chall_compare.matched_changed_lines
-        k_lines = task.king_lines
-        challenger_similarity = 0.0 if zero_challenger else chall_compare.similarity_ratio
-        diff_judge = _judge_round_diffs(
-            task_name=task.task_name,
-            challenger_solution_name=solution_label,
-            config=config,
-            challenger_timed_out=chall_timed_out,
-        )
+        if zero_challenger:
+            diff_judge = _diff_judge_timeout_no_patch()
+            c_lines = 0
+            k_lines = task.king_lines
+            challenger_similarity = 0.0
+            kc_compare_sim = 0.0
+            chall_compare_root = ""
+        else:
+            with ThreadPoolExecutor(max_workers=2) as cmp_exec:
+                chall_fut = cmp_exec.submit(
+                    compare_task_run, task_name=task.task_name,
+                    solution_names=[solution_label, "baseline"], config=config,
+                )
+                kc_fut = cmp_exec.submit(
+                    compare_task_run, task_name=task.task_name,
+                    solution_names=["king", solution_label], config=config,
+                )
+                # Bound compare time so a wedged comparator can't pin a round forever.
+                chall_compare = chall_fut.result(timeout=600)
+                kc_compare = kc_fut.result(timeout=600)
+
+            c_lines = chall_compare.matched_changed_lines
+            k_lines = task.king_lines
+            challenger_similarity = chall_compare.similarity_ratio
+            kc_compare_sim = kc_compare.similarity_ratio
+            chall_compare_root = chall_compare.comparison_root
+            diff_judge = _judge_round_diffs(
+                task_name=task.task_name,
+                challenger_solution_name=solution_label,
+                config=config,
+                challenger_timed_out=chall_timed_out,
+            )
         king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
         challenger_score = _combined_round_score(challenger_similarity, diff_judge.challenger_score)
 
@@ -2378,10 +2415,10 @@ def _solve_and_compare_round(
             king_lines=k_lines, challenger_lines=c_lines,
             king_similarity_ratio=task.king_similarity,
             challenger_similarity_ratio=challenger_similarity,
-            king_challenger_similarity=kc_compare.similarity_ratio,
+            king_challenger_similarity=kc_compare_sim,
             task_root=task.task_root,
             king_compare_root="",
-            challenger_compare_root=chall_compare.comparison_root,
+            challenger_compare_root=chall_compare_root,
             baseline_lines=task.baseline_lines,
             king_score=king_score,
             challenger_score=challenger_score,
