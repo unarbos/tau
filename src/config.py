@@ -142,7 +142,7 @@ class RunConfig:
     validate_network: str | None = None
     validate_subtensor_endpoint: str | None = None
     validate_duel_rounds: int = 50
-    validate_win_margin: int = 0
+    validate_win_margin: int = 3
     validate_max_concurrency: int = 1
     validate_round_concurrency: int = 25
     validate_candidate_timeout_streak_limit: int = 5
