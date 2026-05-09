@@ -29,6 +29,7 @@ from config import RunConfig, SolverAgentSource
 from openrouter_client import complete_text
 from pipeline import _setup_logging, compare_task_run, generate_task_run, solve_task_run
 from r2 import (
+    duel_round_to_summary,
     duel_to_summary,
     fetch_chain_data,
     publish_dashboard_data,
@@ -174,6 +175,22 @@ def _raise_if_insufficient_duel_tasks(duel_id: int, n_rounds: int, tasks: Sequen
     raise RetryableDuelError(
         f"duel {duel_id} gathered only {len(tasks)}/{n_rounds} tasks "
         f"(required {required}); retrying challenger instead of recording a partial duel"
+    )
+
+
+def _raise_if_insufficient_scored_rounds(
+    duel_id: int,
+    n_rounds: int,
+    scored_rounds: int,
+    error_rounds: int,
+) -> None:
+    required = _required_duel_tasks(n_rounds)
+    if error_rounds <= 0 or scored_rounds >= required:
+        return
+    raise RetryableDuelError(
+        f"duel {duel_id} scored only {scored_rounds}/{n_rounds} rounds "
+        f"(required {required}) with {error_rounds} error round(s); "
+        "retrying challenger instead of recording a partial duel"
     )
 
 
@@ -331,6 +348,8 @@ class ValidationRoundResult:
     king_compare_root: str
     challenger_compare_root: str
     baseline_lines: int = 0
+    task_title: str | None = None
+    task_summary: str | None = None
     king_score: float = 0.0
     challenger_score: float = 0.0
     king_llm_score: float = 0.5
@@ -833,6 +852,7 @@ def _publish_active_duel_snapshot_to_r2(
     threshold: int | None = None,
     win_margin: int | None = None,
     duel_rounds: int | None = None,
+    task_summaries: list[dict[str, Any]] | None = None,
 ) -> bool:
     if wins is None:
         wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
@@ -874,6 +894,7 @@ def _publish_active_duel_snapshot_to_r2(
         "threshold": threshold,
         "win_margin": win_margin,
         "duel_rounds": duel_rounds,
+        "task_summaries": task_summaries,
     }
     for key, value in optional_fields.items():
         if value is not None:
@@ -1806,26 +1827,27 @@ class TaskPool:
     ``exclude`` set to skip them.
     """
 
-    def __init__(self, pool_dir: Path) -> None:
+    def __init__(self, pool_dir: Path, tasks_root: Path | None = None) -> None:
         self._pool_dir = pool_dir
+        self._tasks_root = tasks_root
         self._pool_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
     def size(self) -> int:
         with self._lock:
-            return len(list(self._pool_dir.glob("*.json")))
+            count = 0
+            for p in self._pool_dir.glob("*.json"):
+                if self._load_task_file(p) is not None:
+                    count += 1
+            return count
 
     def names(self) -> set[str]:
         with self._lock:
             names: set[str] = set()
             for p in self._pool_dir.glob("*.json"):
-                try:
-                    d = json.loads(p.read_text())
-                    task_name = str(d.get("task_name") or p.stem)
-                    if task_name:
-                        names.add(task_name)
-                except Exception:
-                    p.unlink(missing_ok=True)
+                task = self._load_task_file(p)
+                if task is not None and task.task_name:
+                    names.add(task.task_name)
             return names
 
     def add(self, task: PoolTask) -> None:
@@ -1837,10 +1859,9 @@ class TaskPool:
         with self._lock:
             tasks: list[PoolTask] = []
             for p in sorted(self._pool_dir.glob("*.json")):
-                try:
-                    tasks.append(PoolTask.from_dict(json.loads(p.read_text())))
-                except Exception:
-                    p.unlink(missing_ok=True)
+                task = self._load_task_file(p)
+                if task is not None:
+                    tasks.append(task)
             return tasks
 
     def remove(self, task_name: str) -> bool:
@@ -1861,36 +1882,29 @@ class TaskPool:
         with self._lock:
             candidates: list[PoolTask] = []
             for p in sorted(self._pool_dir.glob("*.json")):
-                try:
-                    d = json.loads(p.read_text())
-                    task_name = str(d.get("task_name", ""))
-                    if task_name in excluded:
-                        continue
-                    candidates.append(PoolTask.from_dict(d))
-                except Exception:
-                    p.unlink(missing_ok=True)
+                task = self._load_task_file(p)
+                if task is None or task.task_name in excluded:
+                    continue
+                candidates.append(task)
             if candidates:
-                candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
-                return candidates[0]
+                candidates.sort(key=lambda task: task.task_name)
+                return candidates[secrets.randbelow(len(candidates))]
             return None
 
     # Keep pop() for backward compat (used by nothing now, but safe to have)
     def pop(self, min_block: int) -> PoolTask | None:
         with self._lock:
             for p in sorted(self._pool_dir.glob("*.json")):
-                try:
-                    d = json.loads(p.read_text())
-                    path = p
-                    path.unlink(missing_ok=True)
-                    return PoolTask.from_dict(d)
-                except Exception:
-                    p.unlink(missing_ok=True)
+                task = self._load_task_file(p)
+                p.unlink(missing_ok=True)
+                if task is not None:
+                    return task
             return None
 
     def prune(self, keep: int) -> int:
         """Remove the oldest pool tasks if pool exceeds *keep* entries."""
         with self._lock:
-            files = sorted(self._pool_dir.glob("*.json"))
+            files = [p for p in sorted(self._pool_dir.glob("*.json")) if self._load_task_file(p) is not None]
             if len(files) <= keep:
                 return 0
             removed = 0
@@ -1906,6 +1920,38 @@ class TaskPool:
                 p.unlink(missing_ok=True)
                 count += 1
             return count
+
+    def _load_task_file(self, path: Path) -> PoolTask | None:
+        try:
+            task = PoolTask.from_dict(json.loads(path.read_text()))
+        except Exception:
+            path.unlink(missing_ok=True)
+            return None
+        if not self._is_usable_task(task):
+            log.warning(
+                "Dropping stale pool entry %s: task workspace is missing or incomplete",
+                task.task_name,
+            )
+            path.unlink(missing_ok=True)
+            return None
+        return task
+
+    def _is_usable_task(self, task: PoolTask) -> bool:
+        if self._tasks_root is None:
+            return True
+        task_root = self._tasks_root / task.task_name
+        task_subdir = task_root / "task"
+        required = (
+            task_subdir / "task.json",
+            task_subdir / "task.txt",
+            task_subdir / "commit.json",
+            task_subdir / "reference.patch",
+            task_subdir / "original",
+            task_root / "solutions" / "king" / "solve.json",
+            task_root / "solutions" / "king" / "solution.diff",
+            task_root / "solutions" / "king" / "repo",
+        )
+        return all(path.exists() for path in required)
 
 
 class TaskPoolRefreshBudget:
@@ -2059,7 +2105,7 @@ def _is_complete_saved_task_dir(task_dir: Path) -> bool:
 
 def _pool_task_names_from_disk(validate_root: Path) -> set[str]:
     names: set[str] = set()
-    for path in validate_root.glob("task-pool*/*.json"):
+    for path in (validate_root / "task-pool").glob("*.json"):
         try:
             payload = json.loads(path.read_text())
             task_name = str(payload.get("task_name") or path.stem) if isinstance(payload, dict) else path.stem
@@ -2153,6 +2199,49 @@ def _cached_solution_summary(
         return None
 
 
+def _task_summary_fields(*, task_name: str, config: RunConfig) -> dict[str, str]:
+    try:
+        task_paths = resolve_task_paths(config.tasks_root, task_name)
+        payload = json.loads(task_paths.task_json_path.read_text())
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    task_payload = payload.get("task")
+    if not isinstance(task_payload, dict):
+        task_payload = payload
+
+    fields: dict[str, str] = {}
+    title = str(task_payload.get("title") or "").strip()
+    description = str(task_payload.get("description") or "").strip()
+    if not description:
+        description = str(task_payload.get("prompt_text") or "").strip()
+    summary = _compact_task_summary(description)
+    if title:
+        fields["task_title"] = title
+    if summary:
+        fields["task_summary"] = summary
+    return fields
+
+
+def _task_summaries_for_names(task_names: Sequence[Any] | None, config: RunConfig) -> list[dict[str, str]]:
+    summaries: list[dict[str, str]] = []
+    for raw_name in task_names or []:
+        task_name = str(raw_name)
+        item = {"task_name": task_name}
+        item.update(_task_summary_fields(task_name=task_name, config=config))
+        summaries.append(item)
+    return summaries
+
+
+def _compact_task_summary(text: str, max_chars: int = 700) -> str:
+    summary = re.sub(r"\s+", " ", text).strip()
+    if len(summary) <= max_chars:
+        return summary
+    return summary[: max_chars - 3].rstrip() + "..."
+
+
 # ---------------------------------------------------------------------------
 # Pool filler (background thread)
 # ---------------------------------------------------------------------------
@@ -2210,19 +2299,34 @@ def _pool_filler_loop(
                     pool_label,
                     extra_exclude=active_task_names,
                 )
-                if saved_task_root is None:
+                if saved_task_root is not None:
+                    task_name = saved_task_root.name
+                    saved_task_name = task_name
+                    task_root = str(saved_task_root)
+                    log.info("Pool filler[%s]: reusing saved task %s (%s)", pool_label, task_name, fill_reason)
+                else:
+                    backoff_remaining = _pool_generation_backoff_remaining()
+                    if backoff_remaining > 0:
+                        log.info(
+                            "Pool filler[%s]: no saved task available for %s; waiting %.0fs for generation backoff",
+                            pool_label,
+                            fill_reason,
+                            min(backoff_remaining, 30.0),
+                        )
+                        stop_event.wait(min(backoff_remaining, 30.0))
+                        continue
+                    with state_lock:
+                        task_name = _allocate_task_name(state)
                     log.info(
-                        "Pool filler[%s]: no saved task available for %s (pool size: %d)",
+                        "Pool filler[%s]: no saved task available for %s; generating task %s (pool size: %d)",
                         pool_label,
                         fill_reason,
+                        task_name,
                         pool_size,
                     )
-                    stop_event.wait(5)
-                    continue
-                task_name = saved_task_root.name
-                saved_task_name = task_name
-                task_root = str(saved_task_root)
-                log.info("Pool filler[%s]: reusing saved task %s (%s)", pool_label, task_name, fill_reason)
+                    generate_result = generate_task_run(task_name=task_name, config=config)
+                    task_root = generate_result.task_root
+                    generated_task_root = Path(task_root)
             else:
                 with state_lock:
                     task_name = _allocate_task_name(state)
@@ -2641,6 +2745,7 @@ def _run_duel(
             )
             k_lines = task.king_lines
             challenger_similarity = 0.0
+            task_summary_fields = _task_summary_fields(task_name=task.task_name, config=config)
             diff_judge = _judge_round_diffs(
                 task_name=task.task_name,
                 challenger_solution_name=solution_label,
@@ -2667,6 +2772,7 @@ def _run_duel(
                 challenger_error_summary=getattr(solve_result, "error_summary", None),
                 challenger_error_details=getattr(solve_result, "error_details", None),
                 challenger_agent_timeout_seconds=agent_timeout,
+                **task_summary_fields,
                 **_diff_judge_round_fields(diff_judge),
             )
 
@@ -2686,6 +2792,7 @@ def _run_duel(
                 king_similarity_ratio=0.0, challenger_similarity_ratio=0.0,
                 king_challenger_similarity=0.0,
                 task_root=task.task_root, king_compare_root="", challenger_compare_root="",
+                **_task_summary_fields(task_name=task.task_name, config=config),
                 error=f"duel {duel_id} task {task.task_name} failed: {exc}",
             )
 
@@ -2785,6 +2892,7 @@ def _gather_pool_tasks(
     cancel_event: threading.Event | None = None,
     min_tasks: int | None = None,
     starve_grace: float = 300.0,
+    exclude_task_names: set[str] | None = None,
 ) -> list[PoolTask]:
     """Collect up to *n* distinct tasks from the pool, waiting if needed.
 
@@ -2807,7 +2915,7 @@ def _gather_pool_tasks(
         # smoke-test-sized sample when we intend to score the full round count.
         min_tasks = min(n, _MIN_DUEL_TASKS)
     tasks: list[PoolTask] = []
-    seen: set[str] = set()
+    seen: set[str] = set(exclude_task_names or set())
     started = time.monotonic()
     deadline = started + timeout
     # Bound the total gather window once we have a decisive minimum. Without
@@ -2922,6 +3030,7 @@ def _solve_and_compare_round(
         )
         k_lines = task.king_lines
         challenger_similarity = 0.0
+        task_summary_fields = _task_summary_fields(task_name=task.task_name, config=config)
         diff_judge = _judge_round_diffs(
             task_name=task.task_name,
             challenger_solution_name=solution_label,
@@ -2949,6 +3058,7 @@ def _solve_and_compare_round(
             challenger_error_summary=getattr(solve_result, "error_summary", None),
             challenger_error_details=getattr(solve_result, "error_details", None),
             challenger_agent_timeout_seconds=agent_timeout,
+            **task_summary_fields,
             **_diff_judge_round_fields(diff_judge),
         )
 
@@ -2984,6 +3094,7 @@ def _solve_and_compare_round(
             king_challenger_similarity=0.0,
             task_root=task.task_root, king_compare_root="",
             challenger_compare_root="",
+            **_task_summary_fields(task_name=task.task_name, config=config),
             error=f"duel {duel_id} task {task.task_name} failed: {exc}",
         )
 
@@ -2999,6 +3110,7 @@ def _run_parallel_duel(
     pool_starved: threading.Event | None = None,
     cancel_event: threading.Event | None = None,
     on_round_complete: Any = None,
+    exclude_task_names: set[str] | None = None,
 ) -> DuelResult:
     """Run a duel with all rounds executing in parallel.
 
@@ -3010,6 +3122,7 @@ def _run_parallel_duel(
     concurrency = config.validate_round_concurrency
     margin = config.validate_win_margin
     started_at = _timestamp()
+    excluded_task_names = {name for name in (exclude_task_names or set()) if name}
     resume_lease = (
         state.active_duel
         if state.active_duel is not None
@@ -3031,6 +3144,12 @@ def _run_parallel_duel(
         duel_id, king.uid, challenger.uid, challenger.repo_full_name,
         n_rounds, concurrency, margin,
     )
+    if excluded_task_names:
+        log.info(
+            "Duel %d: excluding %d prior task(s) from pool selection",
+            duel_id,
+            len(excluded_task_names),
+        )
 
     # Phase 1: gather tasks from pool, or reuse a restored selected task list.
     log.info("Duel %d phase 1: gathering %d tasks from pool (pool size=%d)",
@@ -3080,6 +3199,7 @@ def _run_parallel_duel(
                 on_tick=_phase1_tick,
                 cancel_event=cancel_event,
                 min_tasks=0,
+                exclude_task_names=excluded_task_names | existing,
             )
             for task in extra:
                 if task.task_name not in existing:
@@ -3100,6 +3220,7 @@ def _run_parallel_duel(
             pool_starved=pool_starved,
             on_tick=_phase1_tick,
             cancel_event=cancel_event,
+            exclude_task_names=excluded_task_names,
         )
     log.info("Duel %d: gathered %d/%d tasks", duel_id, len(tasks), n_rounds)
     if cancel_event is not None and cancel_event.is_set():
@@ -3433,8 +3554,10 @@ def _run_parallel_duel(
     ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
     decisive = wins + losses
     scored_rounds = wins + losses + ties
+    error_rounds = sum(1 for r in rounds if r.error)
     if scored_rounds == 0:
         raise RetryableDuelError(_zero_scored_duel_reason(duel_id, rounds))
+    _raise_if_insufficient_scored_rounds(duel_id, n_rounds, scored_rounds, error_rounds)
 
     challenger_won = _challenger_wins(wins, losses, margin)
     log.info("Duel %d result: W=%d L=%d T=%d (decisive=%d, challenger_wins=%s)",
@@ -3573,13 +3696,15 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         if max_idx >= state.next_task_index:
             state.next_task_index = max_idx + 1
 
-    pool = TaskPool(paths.pool_dir)
-    retest_pool = TaskPool(paths.retest_pool_dir)
+    pool = TaskPool(paths.pool_dir, config.tasks_root)
+    migrated_retest_tasks = _migrate_legacy_retest_pool(paths.root, pool, config.tasks_root)
+    if migrated_retest_tasks:
+        log.info("Migrated %d legacy retest pool task(s) into central task pool", migrated_retest_tasks)
+    retest_pool = pool
     pool_refresh = TaskPoolRefreshBudget()
-    retest_pool_refresh = TaskPoolRefreshBudget()
     pool_stop = threading.Event()
     pool_starved = threading.Event()
-    retest_pool_starved = threading.Event()
+    retest_pool_starved = pool_starved
     shutdown_requested = threading.Event()
     state_lock = threading.Lock()
     validator_started_at = _timestamp()
@@ -3665,7 +3790,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         return current_block
 
     pool_filler_executor = ThreadPoolExecutor(
-        max_workers=max(1, config.validate_pool_filler_concurrency) * 2,
+        max_workers=max(1, config.validate_pool_filler_concurrency),
     )
     previous_signal_handlers: dict[int, Any] = {}
 
@@ -3732,18 +3857,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     state_lock,
                     pool_starved,
                     pool_refresh,
-                    "primary",
-                )
-                pool_filler_executor.submit(
-                    _pool_filler_loop,
-                    config,
-                    state,
-                    retest_pool,
-                    pool_stop,
-                    state_lock,
-                    retest_pool_starved,
-                    retest_pool_refresh,
-                    "retest",
+                    "central",
                 )
 
             while not shutdown_requested.is_set():
@@ -3969,6 +4083,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     if isinstance(task_names, list)
                                     else (lease.task_names if lease is not None else None)
                                 )
+                                active_task_summaries = _task_summaries_for_names(
+                                    snapshot_task_names,
+                                    config,
+                                )
                                 king_for_snapshot = (
                                     lease.king
                                     if lease is not None
@@ -3996,6 +4114,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         confirmation_of_duel_id=confirmation_of_duel_id,
                                         manual_retest_of_duel_id=challenger.manual_retest_of_duel_id,
                                         task_names=snapshot_task_names,
+                                        task_summaries=active_task_summaries or None,
                                         gathered_tasks=kw.get("gathered_tasks"),
                                         needed_tasks=kw.get("needed_tasks"),
                                         pool_size=kw.get("pool_size"),
@@ -4030,28 +4149,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "status": phase,
                                     "wins": wins, "losses": losses, "ties": ties,
                                     "scored": scored,
-                                    "rounds": [{"task_name": r.task_name, "winner": r.winner,
-                                                "king_lines": r.king_lines, "challenger_lines": r.challenger_lines,
-                                                "king_score": r.king_score,
-                                                "challenger_score": r.challenger_score,
-                                                "king_llm_score": r.king_llm_score,
-                                                "challenger_llm_score": r.challenger_llm_score,
-                                                "llm_judge_winner": r.llm_judge_winner,
-                                                "llm_judge_models": r.llm_judge_models,
-                                                "llm_judge_consensus_status": r.llm_judge_consensus_status,
-                                                "llm_judge_consensus_round": r.llm_judge_consensus_round,
-                                                "challenger_exit_reason": r.challenger_exit_reason,
-                                                "challenger_error_summary": r.challenger_error_summary,
-                                                "challenger_error_details": r.challenger_error_details,
-                                                "challenger_agent_timeout_seconds": r.challenger_agent_timeout_seconds,
-                                                "king_similarity_ratio": r.king_similarity_ratio,
-                                                "challenger_similarity_ratio": r.challenger_similarity_ratio,
-                                                "king_challenger_similarity": r.king_challenger_similarity}
-                                               for r in rounds if r.scored],
+                                    "rounds": [
+                                        duel_round_to_summary(r.to_dict())
+                                        for r in rounds
+                                        if r.scored
+                                    ],
                                 }
                                 for key in ("gathered_tasks", "needed_tasks", "pool_size"):
                                     if key in kw:
                                         active_duel_info[key] = kw[key]
+                                if active_task_summaries:
+                                    active_duel_info["task_summaries"] = active_task_summaries
                                 try:
                                     _publish_dashboard(state, dashboard_history, config, validator_started_at,
                                                        active_duel_info, chain_data)
@@ -4098,12 +4206,19 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 log.exception("R2 index publish failed (non-fatal)")
                             return completed_dict
 
+                        duel_excluded_task_names = (
+                            _duel_task_names_from_history(paths.duels_dir, confirmation_of_duel_id)
+                            if is_confirmation_retest
+                            else set()
+                        )
                         if is_confirmation_retest:
                             log.info(
-                                "Starting confirmation retest duel %d for challenger uid=%s after preliminary duel %s",
+                                "Starting confirmation retest duel %d for challenger uid=%s after preliminary duel %s "
+                                "(excluding %d prior task(s))",
                                 duel_id,
                                 challenger.uid,
                                 confirmation_of_duel_id,
+                                len(duel_excluded_task_names),
                             )
                         else:
                             log.info("Starting parallel duel %d: uid=%s (%s)",
@@ -4121,6 +4236,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     task_set_phase=duel_task_set_phase,
                                     confirmation_of_duel_id=confirmation_of_duel_id,
                                 ),
+                                exclude_task_names=duel_excluded_task_names,
                             )
                         except Exception:
                             log.exception("Parallel duel %d raised; requeueing challenger for retry", duel_id)
@@ -4264,6 +4380,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 and state.active_duel.duel_id == retest_duel_id
                                 else _timestamp()
                             )
+                            retest_excluded_task_names = {
+                                round_result.task_name
+                                for round_result in duel_result.rounds
+                                if round_result.task_name
+                            }
                             try:
                                 confirmation_result = _run_parallel_duel(
                                     config=config,
@@ -4279,6 +4400,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         task_set_phase="confirmation_retest",
                                         confirmation_of_duel_id=duel_result.duel_id,
                                     ),
+                                    exclude_task_names=retest_excluded_task_names,
                                 )
                             except Exception as exc:
                                 log.exception(
@@ -4387,27 +4509,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     _save_state(paths.state_path, state)
                                 except Exception:
                                     log.exception("Immediate post-dethrone state save failed (non-fatal; will retry)")
-                                primary_refreshed, primary_current, primary_dropped = _refresh_pool_for_king(
+                                pool_refreshed, pool_current, pool_dropped = _refresh_pool_for_king(
                                     config=config,
                                     king=replacement,
                                     pool=pool,
-                                    pool_label="primary",
-                                )
-                                retest_refreshed, retest_current, retest_dropped = _refresh_pool_for_king(
-                                    config=config,
-                                    king=replacement,
-                                    pool=retest_pool,
-                                    pool_label="retest",
+                                    pool_label="central",
                                 )
                                 log.info(
-                                    "Reused cached tasks for new king: primary refreshed=%d current=%d dropped=%d; "
-                                    "retest refreshed=%d current=%d dropped=%d",
-                                    primary_refreshed,
-                                    primary_current,
-                                    primary_dropped,
-                                    retest_refreshed,
-                                    retest_current,
-                                    retest_dropped,
+                                    "Reused cached tasks for new king: central refreshed=%d current=%d dropped=%d",
+                                    pool_refreshed,
+                                    pool_current,
+                                    pool_dropped,
                                 )
                                 # Persist immediately so a restart can never roll
                                 # back a king transition. The end-of-loop save
@@ -4567,6 +4679,117 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     )
 
 
+def fill_task_pool_run(config: RunConfig) -> ValidateStageResult:
+    """Run only the central validator task-pool generator.
+
+    This is intended for a separate PM2 process: it does not poll chain
+    submissions, set weights, start duels, or mutate the validator queue.
+    """
+    _setup_logging(debug=config.debug)
+    missing_secrets = _missing_runtime_secrets(config)
+    if missing_secrets:
+        raise RuntimeError(f"missing required runtime secret(s): {', '.join(missing_secrets)}")
+
+    paths = _prepare_validate_paths(config.validate_root)
+    state = _load_state(paths.state_path)
+
+    def _recover_next_task_index_from_disk() -> None:
+        if not config.tasks_root.exists():
+            return
+        max_idx = 0
+        for td in config.tasks_root.glob("validate-*"):
+            parts = td.name.rsplit("-", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                max_idx = max(max_idx, int(parts[1]))
+        if max_idx >= state.next_task_index:
+            state.next_task_index = max_idx + 1
+
+    _recover_next_task_index_from_disk()
+
+    pool = TaskPool(paths.pool_dir, config.tasks_root)
+    migrated_retest_tasks = _migrate_legacy_retest_pool(paths.root, pool, config.tasks_root)
+    if migrated_retest_tasks:
+        log.info("Migrated %d legacy retest pool task(s) into central task pool", migrated_retest_tasks)
+    pool_stop = threading.Event()
+    state_lock = threading.Lock()
+    pool_refresh = TaskPoolRefreshBudget()
+    previous_signal_handlers: dict[int, Any] = {}
+
+    def _sync_state_from_disk() -> None:
+        try:
+            latest = _load_state(paths.state_path)
+        except Exception:
+            log.exception("Pool filler daemon: failed to reload validator state")
+            return
+        with state_lock:
+            state.current_king = latest.current_king
+            state.active_duel = latest.active_duel
+            if latest.next_task_index > state.next_task_index:
+                state.next_task_index = latest.next_task_index
+            _recover_next_task_index_from_disk()
+
+    def _request_shutdown(signum: int, _frame: Any) -> None:
+        log.warning("Pool filler daemon received signal %s; stopping", signum)
+        pool_stop.set()
+
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous_signal_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, _request_shutdown)
+    except ValueError:
+        previous_signal_handlers.clear()
+
+    worker_count = max(1, int(config.validate_pool_filler_concurrency))
+    log.info(
+        "Central pool generator starting: target=%d concurrency=%d fill_from_saved=%s",
+        config.validate_task_pool_target,
+        worker_count,
+        config.validate_task_pool_fill_from_saved,
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for _ in range(worker_count):
+                executor.submit(
+                    _pool_filler_loop,
+                    config,
+                    state,
+                    pool,
+                    pool_stop,
+                    state_lock,
+                    None,
+                    pool_refresh,
+                    "central",
+                )
+
+            while not pool_stop.is_set():
+                _sync_state_from_disk()
+                king = state.current_king
+                log.info(
+                    "Central pool generator heartbeat: king=%s pool=%d/%d",
+                    king.uid if king is not None else None,
+                    pool.size(),
+                    config.validate_task_pool_target,
+                )
+                pool_stop.wait(30.0)
+    finally:
+        pool_stop.set()
+        for sig, handler in previous_signal_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except ValueError:
+                pass
+
+    king = state.current_king
+    return ValidateStageResult(
+        validate_root=str(paths.root),
+        king_uid=king.uid if king is not None else -1,
+        king_hotkey=king.hotkey if king is not None else "",
+        king_repo=king.agent_ref if king is not None else "",
+        duel_count=0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dashboard publishing
 # ---------------------------------------------------------------------------
@@ -4581,6 +4804,7 @@ def _publish_dashboard(
     king_dict = _dashboard_submission_dict(king, history=history) if king else None
 
     active_duel_info = active_duel
+    links = _dashboard_links()
 
     commitment_map: dict[str, dict[str, Any]] = {}
     for d in history:
@@ -4627,6 +4851,7 @@ def _publish_dashboard(
             for s in state.queue
         ],
         "active_duel": active_duel_info,
+        "links": links,
         "disqualified": [_resolve_hk(hk) for hk in state.disqualified_hotkeys],
         "retired": [_resolve_hk(hk) for hk in state.retired_hotkeys],
         "total_rounds": total_rounds,
@@ -4645,7 +4870,13 @@ def _publish_dashboard(
         "chain_data": chain_data,
     }
 
-    payload = {"updated_at": _timestamp(), "current_king": king_dict, "duels": history, "status": status}
+    payload = {
+        "updated_at": _timestamp(),
+        "current_king": king_dict,
+        "duels": history,
+        "status": status,
+        "links": links,
+    }
     try:
         write_json(config.validate_root / "dashboard_data.json", payload)
     except Exception:
@@ -4654,6 +4885,12 @@ def _publish_dashboard(
         publish_dashboard_data(current_king=king_dict, duel_history=history, status=status)
     except Exception:
         log.exception("R2 dashboard publish failed (non-fatal)")
+
+
+def _dashboard_links() -> dict[str, str]:
+    public_base_url = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
+    duels_html = f"{public_base_url}/duels.html" if public_base_url else "duels.html"
+    return {"duels_html": duels_html}
 
 
 def _dashboard_submission_dict(
@@ -7568,15 +7805,30 @@ def _prepare_validate_paths(root: Path) -> ValidatePaths:
     duels.mkdir(parents=True, exist_ok=True)
     pool = root / "task-pool"
     pool.mkdir(parents=True, exist_ok=True)
-    retest_pool = root / "task-pool-retest"
-    retest_pool.mkdir(parents=True, exist_ok=True)
     return ValidatePaths(
         root=root,
         state_path=root / "state.json",
         duels_dir=duels,
         pool_dir=pool,
-        retest_pool_dir=retest_pool,
+        retest_pool_dir=pool,
     )
+
+
+def _migrate_legacy_retest_pool(validate_root: Path, pool: TaskPool, tasks_root: Path) -> int:
+    legacy_pool_dir = validate_root / "task-pool-retest"
+    if not legacy_pool_dir.exists() or legacy_pool_dir == validate_root / "task-pool":
+        return 0
+
+    legacy_pool = TaskPool(legacy_pool_dir, tasks_root)
+    existing = pool.names()
+    migrated = 0
+    for task in legacy_pool.list_tasks():
+        if task.task_name not in existing:
+            pool.add(task)
+            existing.add(task.task_name)
+            migrated += 1
+        legacy_pool.remove(task.task_name)
+    return migrated
 
 def _load_state(path: Path) -> ValidatorState:
     if not path.exists():
@@ -7671,6 +7923,35 @@ def _save_state(path: Path, state: ValidatorState) -> None:
 
 def _write_duel(paths: ValidatePaths, duel: DuelResult) -> None:
     write_json(paths.duels_dir / f"{duel.duel_id:06d}.json", duel.to_dict())
+
+def _duel_task_names_from_history(duels_dir: Path, duel_id: int | None) -> set[str]:
+    if duel_id is None:
+        return set()
+    path = duels_dir / f"{duel_id:06d}.json"
+    try:
+        payload = json.loads(path.read_text())
+    except FileNotFoundError:
+        log.warning("Referenced duel %d history file is missing at %s", duel_id, path)
+        return set()
+    except Exception:
+        log.exception("Failed to load referenced duel %d task names from %s", duel_id, path)
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+
+    names: set[str] = set()
+    task_names = payload.get("task_names")
+    if isinstance(task_names, list):
+        names.update(str(name) for name in task_names if name)
+    rounds = payload.get("rounds")
+    if isinstance(rounds, list):
+        for round_payload in rounds:
+            if not isinstance(round_payload, dict):
+                continue
+            task_name = round_payload.get("task_name")
+            if task_name:
+                names.add(str(task_name))
+    return names
 
 def _load_dashboard_history(path: Path) -> list[dict[str, Any]]:
     if not path.exists():

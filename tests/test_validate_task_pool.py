@@ -15,13 +15,48 @@ class TaskPoolTest(unittest.TestCase):
         with validate._POOL_GENERATION_BACKOFF_LOCK:
             validate._pool_generation_backoff_until = 0.0
 
-    def test_prepare_validate_paths_creates_primary_and_retest_pools(self):
+    def test_prepare_validate_paths_uses_central_pool_for_primary_and_retest(self):
         with tempfile.TemporaryDirectory() as td:
             paths = _prepare_validate_paths(Path(td))
 
             self.assertTrue(paths.pool_dir.exists())
-            self.assertTrue(paths.retest_pool_dir.exists())
-            self.assertNotEqual(paths.pool_dir, paths.retest_pool_dir)
+            self.assertEqual(paths.pool_dir, paths.retest_pool_dir)
+
+    def test_migrate_legacy_retest_pool_moves_entries_to_central_pool(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            task_dir = task_root / "task"
+            task_dir.mkdir(parents=True)
+            for artifact in ("task.json", "task.txt", "commit.json", "reference.patch"):
+                (task_dir / artifact).write_text("{}\n")
+            (task_dir / "original").mkdir()
+            king_dir = task_root / "solutions" / "king"
+            (king_dir / "repo").mkdir(parents=True)
+            (king_dir / "solve.json").write_text("{}\n")
+            (king_dir / "solution.diff").write_text("diff --git a/a b/a\n")
+
+            central = TaskPool(config.validate_root / "task-pool", config.tasks_root)
+            legacy = TaskPool(config.validate_root / "task-pool-retest", config.tasks_root)
+            legacy.add(
+                PoolTask(
+                    task_name=task_name,
+                    task_root=str(task_root),
+                    creation_block=20,
+                    cursor_elapsed=20.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                )
+            )
+
+            migrated = validate._migrate_legacy_retest_pool(config.validate_root, central, config.tasks_root)
+
+            self.assertEqual(migrated, 1)
+            self.assertEqual(central.names(), {task_name})
+            self.assertEqual(legacy.list_tasks(), [])
 
     def test_claim_saved_task_for_pool_round_robins_complete_tasks(self):
         with tempfile.TemporaryDirectory() as td:
@@ -72,7 +107,7 @@ class TaskPoolTest(unittest.TestCase):
 
             self.assertIsNone(validate._claim_saved_task_for_pool(config, pool, "primary"))
 
-    def test_take_returns_fastest_cached_task(self):
+    def test_take_randomly_samples_cached_task(self):
         with tempfile.TemporaryDirectory() as td:
             pool = TaskPool(Path(td))
             pool.add(
@@ -98,11 +133,13 @@ class TaskPoolTest(unittest.TestCase):
                 )
             )
 
-            task = pool.take(min_block=10)
+            with patch("validate.secrets.randbelow", return_value=1) as randbelow:
+                task = pool.take(min_block=10)
 
         self.assertIsNotNone(task)
         assert task is not None
-        self.assertEqual(task.task_name, "fast")
+        randbelow.assert_called_once_with(2)
+        self.assertEqual(task.task_name, "slow")
 
     def test_take_reuses_cached_task_older_than_min_block(self):
         with tempfile.TemporaryDirectory() as td:
@@ -150,7 +187,7 @@ class TaskPoolTest(unittest.TestCase):
             self.assertTrue(pool.remove("cached"))
             self.assertEqual(pool.list_tasks(), [])
 
-    def test_take_respects_exclude_when_sorting_by_speed(self):
+    def test_take_respects_exclude_when_sampling(self):
         with tempfile.TemporaryDirectory() as td:
             pool = TaskPool(Path(td))
             pool.add(
@@ -176,11 +213,94 @@ class TaskPoolTest(unittest.TestCase):
                 )
             )
 
-            task = pool.take(min_block=10, exclude={"fast"})
+            with patch("validate.secrets.randbelow", return_value=0) as randbelow:
+                task = pool.take(min_block=10, exclude={"fast"})
 
         self.assertIsNotNone(task)
         assert task is not None
+        randbelow.assert_called_once_with(1)
         self.assertEqual(task.task_name, "slow")
+
+    def test_pool_drops_entry_when_task_workspace_is_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            pool = TaskPool(root / "pool", config.tasks_root)
+            pool.add(
+                PoolTask(
+                    task_name="validate-20260101000000-000001",
+                    task_root=str(config.tasks_root / "validate-20260101000000-000001"),
+                    creation_block=20,
+                    cursor_elapsed=20.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                )
+            )
+
+            self.assertEqual(pool.size(), 0)
+            self.assertIsNone(pool.take(min_block=10))
+            self.assertFalse((root / "pool" / "validate-20260101000000-000001.json").exists())
+
+    def test_pool_drops_entry_when_task_workspace_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            (task_root / "task").mkdir(parents=True)
+            (task_root / "task" / "task.json").write_text("{}\n")
+            (task_root / "task" / "commit.json").write_text("{}\n")
+            pool = TaskPool(root / "pool", config.tasks_root)
+            pool.add(
+                PoolTask(
+                    task_name=task_name,
+                    task_root=str(task_root),
+                    creation_block=20,
+                    cursor_elapsed=20.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                )
+            )
+
+            self.assertEqual(pool.list_tasks(), [])
+            self.assertFalse((root / "pool" / f"{task_name}.json").exists())
+
+    def test_pool_keeps_entry_when_task_workspace_is_usable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            task_dir = task_root / "task"
+            task_dir.mkdir(parents=True)
+            for artifact in ("task.json", "task.txt", "commit.json", "reference.patch"):
+                (task_dir / artifact).write_text("{}\n")
+            (task_dir / "original").mkdir()
+            king_dir = task_root / "solutions" / "king"
+            (king_dir / "repo").mkdir(parents=True)
+            (king_dir / "solve.json").write_text("{}\n")
+            (king_dir / "solution.diff").write_text("diff --git a/a b/a\n")
+
+            pool = TaskPool(root / "pool", config.tasks_root)
+            pool.add(
+                PoolTask(
+                    task_name=task_name,
+                    task_root=str(task_root),
+                    creation_block=20,
+                    cursor_elapsed=20.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                )
+            )
+
+            task = pool.take(min_block=10)
+
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(task.task_name, task_name)
 
     def test_duel_agent_timeout_matches_stored_king_timeout(self):
         task = PoolTask(
@@ -364,6 +484,118 @@ class TaskPoolTest(unittest.TestCase):
 
         self.assertIn("gathered only 5/50 tasks", str(ctx.exception))
         validate._raise_if_insufficient_duel_tasks(4190, 50, [object()] * 50)
+
+    def test_partial_scored_duel_with_errors_is_retryable(self):
+        with self.assertRaises(validate.RetryableDuelError) as ctx:
+            validate._raise_if_insufficient_scored_rounds(
+                duel_id=4272,
+                n_rounds=50,
+                scored_rounds=17,
+                error_rounds=31,
+            )
+
+        self.assertIn("scored only 17/50 rounds", str(ctx.exception))
+        validate._raise_if_insufficient_scored_rounds(
+            duel_id=4273,
+            n_rounds=50,
+            scored_rounds=50,
+            error_rounds=1,
+        )
+        validate._raise_if_insufficient_scored_rounds(
+            duel_id=4274,
+            n_rounds=50,
+            scored_rounds=17,
+            error_rounds=0,
+        )
+
+    def test_duel_task_names_from_history_reads_rounds_and_checkpoint_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            duels_dir = Path(td)
+            (duels_dir / "000123.json").write_text(
+                """
+{
+  "task_names": ["checkpoint-a", "checkpoint-b"],
+  "rounds": [
+    {"task_name": "round-a"},
+    {"task_name": "round-b"},
+    {"task_name": "checkpoint-a"}
+  ]
+}
+""".strip()
+            )
+
+            names = validate._duel_task_names_from_history(duels_dir, 123)
+
+        self.assertEqual(names, {"checkpoint-a", "checkpoint-b", "round-a", "round-b"})
+
+    def test_parallel_duel_excludes_prior_task_names_from_shared_pool(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td) / "pool")
+            for idx in range(4):
+                pool.add(
+                    PoolTask(
+                        task_name=f"task-{idx:02d}",
+                        task_root=f"/tmp/task-{idx:02d}",
+                        creation_block=1,
+                        cursor_elapsed=float(idx + 1),
+                        king_lines=1,
+                        king_similarity=0.1,
+                        baseline_lines=1,
+                    )
+                )
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_duel_rounds=2,
+                validate_round_concurrency=1,
+                validate_win_margin=0,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+            challenger = validate.ValidatorSubmission(
+                hotkey="challenger-hotkey",
+                uid=2,
+                repo_full_name="challenger/ninja",
+                repo_url="https://github.com/challenger/ninja",
+                commit_sha="b" * 40,
+                commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+
+            def tie_round(*, task, challenger, config, duel_id):
+                return validate.ValidationRoundResult(
+                    task_name=task.task_name,
+                    winner="tie",
+                    king_lines=1,
+                    challenger_lines=1,
+                    king_similarity_ratio=0.0,
+                    challenger_similarity_ratio=0.0,
+                    king_challenger_similarity=0.0,
+                    task_root=task.task_root,
+                    king_compare_root="",
+                    challenger_compare_root="",
+                )
+
+            with patch("validate._solve_and_compare_round", side_effect=tie_round):
+                result = validate._run_parallel_duel(
+                    config=config,
+                    state=validate.ValidatorState(current_king=king),
+                    king=king,
+                    challenger=challenger,
+                    duel_id=101,
+                    pool=pool,
+                    exclude_task_names={"task-00", "task-01"},
+                )
+
+        self.assertEqual({round_result.task_name for round_result in result.rounds}, {"task-02", "task-03"})
 
     def test_parallel_duel_stops_when_king_mathematically_safe(self):
         with tempfile.TemporaryDirectory() as td:

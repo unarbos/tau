@@ -141,6 +141,35 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--wallet-name", required=True, help="Wallet coldkey name.")
     validate.add_argument("--wallet-hotkey", required=True, help="Wallet hotkey name.")
     validate.add_argument("--wallet-path", help="Wallet path override.")
+
+    fill_pool = subparsers.add_parser(
+        "fill-pool",
+        aliases=["generate-pool"],
+        help="Run only the central validator task-pool generator, without duels or weights.",
+    )
+    _add_shared_args(fill_pool)
+    _add_solver_args(fill_pool)
+    fill_pool.set_defaults(agent_timeout=1800, docker_solver_max_output_bytes=100000000)
+    fill_pool.add_argument("--netuid", type=int, default=66, help="Subnet netuid whose validate workspace should be filled.")
+    fill_pool.add_argument("--generator-model", help="Optional model override for task generation.")
+    fill_pool.add_argument("--max-mining-attempts", type=int, default=50, help="How many GitHub event/commit retries to attempt while mining a task.")
+    fill_pool.add_argument("--task-pool-target", type=int, default=200, help="Pre-solved tasks to keep in the central pool.")
+    fill_pool.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel central pool generator threads.")
+    fill_pool.add_argument("--task-pool-refresh-count", type=int, default=6, help="Tasks to replace each refresh interval after the pool is full.")
+    fill_pool.add_argument("--task-pool-refresh-interval-seconds", type=int, default=3600, help="Seconds between refresh batches after the pool is full.")
+    fill_pool.add_argument(
+        "--task-pool-fill-from-saved",
+        dest="task_pool_fill_from_saved",
+        action="store_true",
+        default=True,
+        help="Prefer saved task workspaces before generating fresh tasks.",
+    )
+    fill_pool.add_argument(
+        "--no-task-pool-fill-from-saved",
+        dest="task_pool_fill_from_saved",
+        action="store_false",
+        help="Generate fresh tasks only.",
+    )
     return parser
 
 
@@ -210,6 +239,16 @@ def main() -> None:
             result = validate_loop_run(config=_build_validate_config(args))
             print(
                 f"validate loop exited with king uid={result.king_uid} "
+                f"hotkey={result.king_hotkey} repo={result.king_repo}"
+            )
+            print(result.validate_root)
+            return
+        if args.command in {"fill-pool", "generate-pool"}:
+            from validate import fill_task_pool_run
+
+            result = fill_task_pool_run(config=_build_fill_pool_config(args))
+            print(
+                f"pool generator exited with king uid={result.king_uid} "
                 f"hotkey={result.king_hotkey} repo={result.king_repo}"
             )
             print(result.validate_root)
@@ -445,6 +484,62 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
             if args.github_pr_cleanup_max_pages is not None
             else defaults.validate_github_pr_cleanup_max_pages
         ),
+        debug=args.debug,
+    )
+
+
+def _build_fill_pool_config(args: argparse.Namespace) -> RunConfig:
+    defaults = RunConfig()
+    return RunConfig(
+        workspace_root=args.workspace_root.resolve(),
+        generator_model=_arg_or_env(args.generator_model, "GENERATOR_MODEL", "OPENROUTER_GENERATOR_MODEL"),
+        solver_model=args.solver_model,
+        agent_timeout=args.agent_timeout,
+        max_mining_attempts=args.max_mining_attempts,
+        solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
+        solver_max_total_tokens=_arg_or_env_int(args.solver_max_total_tokens, "SOLVER_MAX_TOTAL_TOKENS"),
+        solver_max_prompt_tokens=_arg_or_env_int(args.solver_max_prompt_tokens, "SOLVER_MAX_PROMPT_TOKENS"),
+        solver_max_completion_tokens=_arg_or_env_int(args.solver_max_completion_tokens, "SOLVER_MAX_COMPLETION_TOKENS"),
+        solver_max_cost=_arg_or_env_float(args.solver_max_cost, "SOLVER_MAX_COST"),
+        solver_max_tokens_per_request=_arg_or_env_int(
+            args.solver_max_tokens_per_request,
+            "SOLVER_MAX_TOKENS_PER_REQUEST",
+        ),
+        solver_provider_sort=_arg_or_env(args.solver_provider_sort, "SOLVER_PROVIDER_SORT", "OPENROUTER_PROVIDER_SORT"),
+        solver_provider_only=_arg_or_env(args.solver_provider_only, "SOLVER_PROVIDER_ONLY", "OPENROUTER_PROVIDER_ONLY"),
+        solver_provider_allow_fallbacks=(
+            False if args.solver_provider_disable_fallbacks else defaults.solver_provider_allow_fallbacks
+        ),
+        solver_provider_min_throughput_p50=_arg_or_env_float(
+            args.solver_provider_min_throughput_p50,
+            "SOLVER_PROVIDER_MIN_THROUGHPUT_P50",
+            "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P50",
+        ),
+        solver_provider_min_throughput_p90=_arg_or_env_float(
+            args.solver_provider_min_throughput_p90,
+            "SOLVER_PROVIDER_MIN_THROUGHPUT_P90",
+            "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P90",
+        ),
+        random_seed=args.seed,
+        docker_solver_image=args.docker_solver_image,
+        docker_solver_memory=args.docker_solver_memory,
+        docker_solver_cpus=args.docker_solver_cpus,
+        docker_solver_pids_limit=args.docker_solver_pids_limit,
+        docker_solver_tmp_size=args.docker_solver_tmp_size,
+        docker_solver_workdir_size=args.docker_solver_workdir_size,
+        docker_solver_nofile_limit=args.docker_solver_nofile_limit,
+        docker_solver_max_output_bytes=args.docker_solver_max_output_bytes,
+        docker_solver_drop_caps=not args.docker_solver_keep_caps,
+        docker_solver_no_new_privileges=not args.docker_solver_allow_privilege_escalation,
+        docker_solver_read_only_rootfs=not args.docker_solver_writeable_rootfs,
+        docker_solver_user=args.docker_solver_user,
+        docker_solver_no_cache=args.docker_solver_no_cache,
+        validate_netuid=args.netuid,
+        validate_task_pool_target=args.task_pool_target,
+        validate_pool_filler_concurrency=args.pool_filler_concurrency,
+        validate_task_pool_refresh_count=args.task_pool_refresh_count,
+        validate_task_pool_refresh_interval_seconds=args.task_pool_refresh_interval_seconds,
+        validate_task_pool_fill_from_saved=args.task_pool_fill_from_saved,
         debug=args.debug,
     )
 

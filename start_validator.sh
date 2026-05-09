@@ -22,7 +22,7 @@ exec doppler run -p arbos -c dev -- \
   --win-margin 3 \
   --min-commitment-block 7951985 \
   --hotkey-spent-since-block 8104340 \
-  --pool-filler-concurrency 2 \
+  --pool-filler-concurrency 0 \
   --watch-github-prs \
   --github-pr-only \
   --github-pr-repo unarbos/ninja \
