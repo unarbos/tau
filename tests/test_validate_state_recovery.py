@@ -6,6 +6,7 @@ from unittest import mock
 
 from validate import (
     ActiveDuelLease,
+    _manual_retest_seed_from_history,
     PoolTask,
     RunConfig,
     TaskPool,
@@ -29,6 +30,39 @@ from validate import (
 
 
 class ValidatorStateRecoveryTest(unittest.TestCase):
+    def test_manual_retest_seed_allows_clean_partial_duel_history(self):
+        challenger = _submission(
+            hotkey="5PartialHotkey",
+            uid=210,
+            commitment="github-pr:unarbos/ninja#75@" + "a" * 40,
+            block=123,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            duels_dir = Path(tmp)
+            (duels_dir / "004276.json").write_text(
+                json.dumps(
+                    {
+                        "duel_id": 4276,
+                        "challenger": challenger.to_dict(),
+                        "rounds": [
+                            _round(task_name="validate-000001", winner="challenger").to_dict(),
+                            _round(task_name="validate-000002", winner="king").to_dict(),
+                        ],
+                    }
+                )
+                + "\n"
+            )
+
+            seed = _manual_retest_seed_from_history(duels_dir, 4276)
+
+        self.assertIsNotNone(seed)
+        assert seed is not None
+        self.assertEqual(seed.target_round_count, 2)
+        self.assertEqual(seed.error_round_count, 0)
+        self.assertEqual([round_result.task_name for round_result in seed.good_rounds], ["validate-000001", "validate-000002"])
+        self.assertEqual(seed.prior_task_names, {"validate-000001", "validate-000002"})
+
     def test_reconcile_advances_duel_id_and_removes_completed_queue_entry(self):
         completed = _submission(
             hotkey="5CompletedHotkey",

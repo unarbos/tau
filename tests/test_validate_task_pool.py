@@ -513,16 +513,13 @@ class TaskPoolTest(unittest.TestCase):
         self.assertIn("gathered only 5/50 tasks", str(ctx.exception))
         validate._raise_if_insufficient_duel_tasks(4190, 50, [object()] * 50)
 
-    def test_partial_scored_duel_with_errors_is_retryable(self):
-        with self.assertRaises(validate.RetryableDuelError) as ctx:
-            validate._raise_if_insufficient_scored_rounds(
-                duel_id=4272,
-                n_rounds=50,
-                scored_rounds=17,
-                error_rounds=31,
-            )
-
-        self.assertIn("scored only 17/50 rounds", str(ctx.exception))
+    def test_partial_scored_duel_with_errors_is_allowed(self):
+        validate._raise_if_insufficient_scored_rounds(
+            duel_id=4272,
+            n_rounds=50,
+            scored_rounds=17,
+            error_rounds=31,
+        )
         validate._raise_if_insufficient_scored_rounds(
             duel_id=4273,
             n_rounds=50,
@@ -728,6 +725,106 @@ class TaskPoolTest(unittest.TestCase):
         self.assertEqual(
             {round_result.task_name for round_result in result.rounds},
             {"kept-0", "kept-1", "kept-2", "replacement-0", "replacement-1"},
+        )
+
+    def test_parallel_duel_repair_rerun_resume_uses_configured_round_floor(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td) / "pool")
+            for idx in range(3):
+                pool.add(
+                    PoolTask(
+                        task_name=f"replacement-{idx}",
+                        task_root=f"/tmp/replacement-{idx}",
+                        creation_block=1,
+                        cursor_elapsed=float(idx + 1),
+                        king_lines=1,
+                        king_similarity=0.1,
+                        baseline_lines=1,
+                    )
+                )
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_duel_rounds=4,
+                validate_round_concurrency=1,
+                validate_win_margin=0,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+            challenger = validate.ValidatorSubmission(
+                hotkey="challenger-hotkey",
+                uid=2,
+                repo_full_name="challenger/ninja",
+                repo_url="https://github.com/challenger/ninja",
+                commit_sha="b" * 40,
+                commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+            state = validate.ValidatorState(current_king=king)
+            state.active_duel = validate.ActiveDuelLease(
+                duel_id=103,
+                started_at="2026-01-01T00:00:00+00:00",
+                king=king,
+                challenger=challenger,
+                task_names=["kept-0"],
+                rounds=[
+                    validate.ValidationRoundResult(
+                        task_name="kept-0",
+                        winner="tie",
+                        king_lines=1,
+                        challenger_lines=1,
+                        king_similarity_ratio=0.0,
+                        challenger_similarity_ratio=0.0,
+                        king_challenger_similarity=0.0,
+                        task_root="/tmp/kept-0",
+                        king_compare_root="",
+                        challenger_compare_root="",
+                    )
+                ],
+                task_set_phase="repair_rerun",
+                confirmation_of_duel_id=4271,
+                manual_retest_of_duel_id=4271,
+                target_round_count=2,
+            )
+
+            def tie_round(*, task, challenger, config, duel_id):
+                return validate.ValidationRoundResult(
+                    task_name=task.task_name,
+                    winner="tie",
+                    king_lines=1,
+                    challenger_lines=1,
+                    king_similarity_ratio=0.0,
+                    challenger_similarity_ratio=0.0,
+                    king_challenger_similarity=0.0,
+                    task_root=task.task_root,
+                    king_compare_root="",
+                    challenger_compare_root="",
+                )
+
+            with patch("validate._solve_and_compare_round", side_effect=tie_round) as solve_round:
+                result = validate._run_parallel_duel(
+                    config=config,
+                    state=state,
+                    king=king,
+                    challenger=challenger,
+                    duel_id=103,
+                    pool=pool,
+                    exclude_task_names={"kept-0"},
+                )
+
+        self.assertEqual(solve_round.call_count, 3)
+        self.assertEqual(len(result.rounds), 4)
+        self.assertEqual(
+            {call.kwargs["task"].task_name for call in solve_round.call_args_list},
+            {"replacement-0", "replacement-1", "replacement-2"},
         )
 
     def test_parallel_duel_stops_when_king_mathematically_safe(self):
