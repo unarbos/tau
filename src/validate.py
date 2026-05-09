@@ -1864,6 +1864,20 @@ class TaskPool:
                     tasks.append(task)
             return tasks
 
+    def newest(self, limit: int, exclude: set[str] | None = None) -> list[PoolTask]:
+        if limit <= 0:
+            return []
+        excluded = exclude or set()
+        with self._lock:
+            candidates: list[PoolTask] = []
+            for p in sorted(self._pool_dir.glob("*.json")):
+                task = self._load_task_file(p)
+                if task is None or task.task_name in excluded:
+                    continue
+                candidates.append(task)
+            candidates.sort(key=lambda task: (task.creation_block, task.task_name), reverse=True)
+            return candidates[:limit]
+
     def remove(self, task_name: str) -> bool:
         path = self._pool_dir / f"{task_name}.json"
         with self._lock:
@@ -1955,30 +1969,65 @@ class TaskPool:
 
 
 class TaskPoolRefreshBudget:
-    """Shared permit counter for periodic full-pool refreshes.
+    """Shared permit counter for periodic full-pool additions.
 
-    Pool filler threads normally sleep when the pool is already at target size.
-    This budget lets a bounded number of those threads create replacement
-    tasks once per interval. Each successful add is followed by the normal pool
-    prune, so a refresh batch replaces the oldest tasks without growing the
-    pool indefinitely.
+    Pool filler threads normally sleep when the pool is already at target size,
+    but this budget lets a bounded number of those threads add fresh tasks
+    either once per time interval (standalone generator) or once per validator
+    epoch (live validator). Successful refresh tasks are kept; the pool is not
+    pruned back to the target.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._next_refresh_at: float | None = None
+        self._epoch_mode = False
+        self._last_epoch_index: int | None = None
+        self._started_reported = False
         self._active = False
         self._completed = 0
         self._in_flight = 0
 
+    def trigger_epoch(self, *, current_block: int, config: RunConfig) -> tuple[bool, int]:
+        count = max(0, int(config.validate_task_pool_refresh_count))
+        epoch_blocks = max(1, int(config.validate_weight_interval_blocks))
+        epoch_index = max(0, int(current_block)) // epoch_blocks
+        if count <= 0:
+            return False, epoch_index
+
+        with self._lock:
+            self._epoch_mode = True
+            if self._last_epoch_index == epoch_index:
+                return False, epoch_index
+            self._last_epoch_index = epoch_index
+            if self._active:
+                return False, epoch_index
+            self._active = True
+            self._completed = 0
+            self._in_flight = 0
+            self._started_reported = False
+            return True, epoch_index
+
     def claim(self, *, config: RunConfig) -> tuple[bool, bool]:
         count = max(0, int(config.validate_task_pool_refresh_count))
         interval = max(0, int(config.validate_task_pool_refresh_interval_seconds))
-        if count <= 0 or interval <= 0:
+        if count <= 0:
             return False, False
 
-        now = time.monotonic()
         with self._lock:
+            if self._epoch_mode:
+                if not self._active:
+                    return False, False
+                started = not self._started_reported
+                self._started_reported = True
+                if self._completed + self._in_flight >= count:
+                    return False, started
+                self._in_flight += 1
+                return True, started
+
+            if interval <= 0:
+                return False, False
+            now = time.monotonic()
             if self._next_refresh_at is None:
                 self._next_refresh_at = now + interval
                 return False, False
@@ -2001,7 +2050,7 @@ class TaskPoolRefreshBudget:
     def finish(self, *, config: RunConfig, success: bool) -> bool:
         count = max(0, int(config.validate_task_pool_refresh_count))
         interval = max(0, int(config.validate_task_pool_refresh_interval_seconds))
-        if count <= 0 or interval <= 0:
+        if count <= 0:
             return False
 
         with self._lock:
@@ -2011,7 +2060,9 @@ class TaskPoolRefreshBudget:
             if self._active and self._completed >= count:
                 self._active = False
                 self._completed = 0
-                self._next_refresh_at = time.monotonic() + interval
+                self._started_reported = False
+                if not self._epoch_mode and interval > 0:
+                    self._next_refresh_at = time.monotonic() + interval
                 return True
         return False
 
@@ -2411,15 +2462,13 @@ def _pool_filler_loop(
                 king_commit_sha=current_king.commit_sha,
             ))
             added_to_pool = True
-            pruned = pool.prune(keep=config.validate_task_pool_target)
             if pool_starved is not None:
                 pool_starved.clear()
             log.info(
-                "Pool filler[%s]: added %s (pool size: %d, pruned: %d)",
+                "Pool filler[%s]: added %s (pool size: %d)",
                 pool_label,
                 task_name,
                 pool.size(),
-                pruned,
             )
 
         except Exception as exc:
@@ -2893,6 +2942,7 @@ def _gather_pool_tasks(
     min_tasks: int | None = None,
     starve_grace: float = 300.0,
     exclude_task_names: set[str] | None = None,
+    recent_task_count: int = 0,
 ) -> list[PoolTask]:
     """Collect up to *n* distinct tasks from the pool, waiting if needed.
 
@@ -2916,6 +2966,9 @@ def _gather_pool_tasks(
         min_tasks = min(n, _MIN_DUEL_TASKS)
     tasks: list[PoolTask] = []
     seen: set[str] = set(exclude_task_names or set())
+    for task in pool.newest(min(max(0, recent_task_count), n), exclude=seen):
+        tasks.append(task)
+        seen.add(task.task_name)
     started = time.monotonic()
     deadline = started + timeout
     # Bound the total gather window once we have a decisive minimum. Without
@@ -3111,6 +3164,7 @@ def _run_parallel_duel(
     cancel_event: threading.Event | None = None,
     on_round_complete: Any = None,
     exclude_task_names: set[str] | None = None,
+    recent_task_count: int | None = None,
 ) -> DuelResult:
     """Run a duel with all rounds executing in parallel.
 
@@ -3123,6 +3177,11 @@ def _run_parallel_duel(
     margin = config.validate_win_margin
     started_at = _timestamp()
     excluded_task_names = {name for name in (exclude_task_names or set()) if name}
+    recent_task_count = (
+        max(0, int(config.validate_task_pool_refresh_count))
+        if recent_task_count is None
+        else max(0, int(recent_task_count))
+    )
     resume_lease = (
         state.active_duel
         if state.active_duel is not None
@@ -3149,6 +3208,12 @@ def _run_parallel_duel(
             "Duel %d: excluding %d prior task(s) from pool selection",
             duel_id,
             len(excluded_task_names),
+        )
+    if recent_task_count:
+        log.info(
+            "Duel %d: reserving up to %d newest pool task(s) before random sampling",
+            duel_id,
+            min(recent_task_count, n_rounds),
         )
 
     # Phase 1: gather tasks from pool, or reuse a restored selected task list.
@@ -3200,6 +3265,7 @@ def _run_parallel_duel(
                 cancel_event=cancel_event,
                 min_tasks=0,
                 exclude_task_names=excluded_task_names | existing,
+                recent_task_count=max(0, recent_task_count - len(tasks)),
             )
             for task in extra:
                 if task.task_name not in existing:
@@ -3221,6 +3287,7 @@ def _run_parallel_duel(
             on_tick=_phase1_tick,
             cancel_event=cancel_event,
             exclude_task_names=excluded_task_names,
+            recent_task_count=recent_task_count,
         )
     log.info("Duel %d: gathered %d/%d tasks", duel_id, len(tasks), n_rounds)
     if cancel_event is not None and cancel_event.is_set():
@@ -3738,9 +3805,23 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
     active_duel_info: dict[str, Any] | None = None
 
+    def _maybe_trigger_pool_epoch_refresh(current_block: int) -> None:
+        started, epoch_index = pool_refresh.trigger_epoch(
+            current_block=current_block,
+            config=config,
+        )
+        if started:
+            log.info(
+                "Pool filler[central]: starting epoch %d refresh of %d task(s) at block %d",
+                epoch_index,
+                config.validate_task_pool_refresh_count,
+                current_block,
+            )
+
     def _refresh_chain_inputs(*, subtensor, force: bool = False, reason: str = "scheduled") -> int:
         nonlocal chain_data, last_submission_refresh
         current_block = subtensor.block
+        _maybe_trigger_pool_epoch_refresh(current_block)
         now = time.monotonic()
         if not force and now - last_submission_refresh < poll_interval_seconds:
             return current_block

@@ -110,10 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--max-concurrency", type=int, default=1, help="Max parallel duels (1 = serialized).")
     validate.add_argument("--round-concurrency", type=int, default=25, help="Max parallel rounds within a single duel.")
     validate.add_argument("--candidate-timeout-streak-limit", type=int, default=5, help="Stop submitting new rounds for a challenger after this many consecutive round timeouts.")
-    validate.add_argument("--task-pool-target", type=int, default=50, help="Pre-solved tasks to keep in pool.")
+    validate.add_argument("--task-pool-target", type=int, default=1000, help="Pre-solved tasks to fill before switching to epoch refresh additions.")
     validate.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel pool-filler threads.")
-    validate.add_argument("--task-pool-refresh-count", type=int, default=5, help="Full-pool tasks to replace each refresh interval.")
-    validate.add_argument("--task-pool-refresh-interval-seconds", type=int, default=3600, help="Seconds between full-pool refresh batches.")
+    validate.add_argument("--task-pool-refresh-count", type=int, default=6, help="Fresh tasks to add each validator epoch after the pool reaches target.")
+    validate.add_argument("--task-pool-refresh-interval-seconds", type=int, default=3600, help="Seconds between refresh batches for standalone pool generation.")
     validate.add_argument(
         "--task-pool-fill-from-saved",
         action="store_true",
@@ -153,9 +153,9 @@ def build_parser() -> argparse.ArgumentParser:
     fill_pool.add_argument("--netuid", type=int, default=66, help="Subnet netuid whose validate workspace should be filled.")
     fill_pool.add_argument("--generator-model", help="Optional model override for task generation.")
     fill_pool.add_argument("--max-mining-attempts", type=int, default=50, help="How many GitHub event/commit retries to attempt while mining a task.")
-    fill_pool.add_argument("--task-pool-target", type=int, default=200, help="Pre-solved tasks to keep in the central pool.")
+    fill_pool.add_argument("--task-pool-target", type=int, default=1000, help="Pre-solved tasks to fill before switching to refresh additions.")
     fill_pool.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel central pool generator threads.")
-    fill_pool.add_argument("--task-pool-refresh-count", type=int, default=6, help="Tasks to replace each refresh interval after the pool is full.")
+    fill_pool.add_argument("--task-pool-refresh-count", type=int, default=6, help="Fresh tasks to add each refresh interval after the pool is full.")
     fill_pool.add_argument("--task-pool-refresh-interval-seconds", type=int, default=3600, help="Seconds between refresh batches after the pool is full.")
     fill_pool.add_argument(
         "--task-pool-fill-from-saved",

@@ -355,6 +355,34 @@ class TaskPoolTest(unittest.TestCase):
             ["task-01", "task-03", "task-05", "task-07", "task-09"],
         )
 
+    def test_gather_pool_tasks_reserves_newest_tasks_before_random_fill(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td) / "pool")
+            for idx in range(8):
+                pool.add(
+                    PoolTask(
+                        task_name=f"task-{idx:02d}",
+                        task_root=f"/tmp/task-{idx:02d}",
+                        creation_block=idx,
+                        cursor_elapsed=float(idx),
+                        king_lines=1,
+                        king_similarity=0.1,
+                        baseline_lines=1,
+                    )
+                )
+
+            with patch("validate.secrets.randbelow", return_value=0):
+                tasks = validate._gather_pool_tasks(
+                    pool,
+                    n=5,
+                    min_block=1,
+                    recent_task_count=3,
+                )
+
+        selected = {task.task_name for task in tasks}
+        self.assertEqual(len(selected), 5)
+        self.assertTrue({"task-05", "task-06", "task-07"}.issubset(selected))
+
     def test_legacy_pool_task_backfills_agent_timeout(self):
         loaded = PoolTask.from_dict(
             {
@@ -797,6 +825,40 @@ class TaskPoolTest(unittest.TestCase):
         claimed, started = budget.claim(config=config)
         self.assertTrue(claimed)
         self.assertFalse(started)
+
+    def test_refresh_budget_allows_bounded_epoch_batch(self):
+        config = RunConfig(
+            validate_task_pool_refresh_count=2,
+            validate_weight_interval_blocks=100,
+        )
+        budget = TaskPoolRefreshBudget()
+
+        started, epoch = budget.trigger_epoch(current_block=250, config=config)
+        self.assertTrue(started)
+        self.assertEqual(epoch, 2)
+
+        claimed, first_claim = budget.claim(config=config)
+        self.assertTrue(claimed)
+        self.assertTrue(first_claim)
+
+        claimed, first_claim = budget.claim(config=config)
+        self.assertTrue(claimed)
+        self.assertFalse(first_claim)
+
+        claimed, first_claim = budget.claim(config=config)
+        self.assertFalse(claimed)
+        self.assertFalse(first_claim)
+
+        self.assertFalse(budget.finish(config=config, success=True))
+        self.assertTrue(budget.finish(config=config, success=True))
+
+        started, epoch = budget.trigger_epoch(current_block=299, config=config)
+        self.assertFalse(started)
+        self.assertEqual(epoch, 2)
+
+        started, epoch = budget.trigger_epoch(current_block=300, config=config)
+        self.assertTrue(started)
+        self.assertEqual(epoch, 3)
 
 
 if __name__ == "__main__":

@@ -14,15 +14,14 @@ exec doppler run -p arbos -c dev -- \
   --round-concurrency 15 \
   --candidate-timeout-streak-limit 5 \
   --poll-interval-seconds 600 \
-  --task-pool-target 50 \
-  --task-pool-fill-from-saved \
-  --task-pool-refresh-count 5 \
+  --task-pool-target 1000 \
+  --task-pool-refresh-count 6 \
   --task-pool-refresh-interval-seconds 3600 \
   --duel-rounds 50 \
   --win-margin 3 \
   --min-commitment-block 7951985 \
   --hotkey-spent-since-block 8104340 \
-  --pool-filler-concurrency 0 \
+  --pool-filler-concurrency 24 \
   --watch-github-prs \
   --github-pr-only \
   --github-pr-repo unarbos/ninja \
