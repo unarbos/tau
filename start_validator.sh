@@ -24,5 +24,6 @@ exec doppler run -p arbos -c dev -- \
   --pool-filler-concurrency 24 \
   --watch-github-prs \
   --github-pr-only \
+  --github-pr-cleanup \
   --github-pr-repo unarbos/ninja \
   --github-pr-base main
