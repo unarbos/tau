@@ -10,6 +10,7 @@ from validate import (
     ValidatorState,
     ValidatorSubmission,
     _build_burn_king,
+    _build_github_pr_screening_client,
     _cleanup_stale_github_prs,
     _dashboard_submission_dict,
     _enforce_submission_mode_on_state,
@@ -34,6 +35,37 @@ MINER_HOTKEY = "5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repoTitleHkey"
 OTHER_HOTKEY = "5G3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1otherMinerHkey"
 PR_COMMITMENT = f"github-pr:unarbos/ninja#7@{SHA}"
 PR_HEAD_COMMITMENT = f"github-pr-head:unarbos/ninja@{SHA}"
+
+
+class GithubClientConfigTest(unittest.TestCase):
+    def test_pr_screening_client_prefers_read_only_token(self):
+        config = RunConfig(
+            github_token="write-token",
+            github_tokens="rotation-token",
+            github_pr_screening_token="screen-token",
+            github_pr_screening_tokens=None,
+        )
+
+        client = _build_github_pr_screening_client(config)
+        try:
+            self.assertEqual(client.headers["authorization"], "Bearer screen-token")
+            self.assertEqual(client.headers["user-agent"], "swe-eval-validate-pr-screening")
+        finally:
+            client.close()
+
+    def test_pr_screening_client_prefers_read_only_rotation_pool(self):
+        config = RunConfig(
+            github_token="write-token",
+            github_tokens="rotation-token",
+            github_pr_screening_token="screen-token",
+            github_pr_screening_tokens="screen-token-a, screen-token-b",
+        )
+
+        client = _build_github_pr_screening_client(config)
+        try:
+            self.assertEqual(client.headers["authorization"], "Bearer screen-token-a")
+        finally:
+            client.close()
 
 
 class FakeResponse:

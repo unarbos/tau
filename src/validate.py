@@ -428,6 +428,7 @@ class ActiveDuelLease:
     task_set_phase: str = "primary"
     confirmation_of_duel_id: int | None = None
     manual_retest_of_duel_id: int | None = None
+    target_round_count: int | None = None
     updated_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -442,6 +443,7 @@ class ActiveDuelLease:
             "task_set_phase": self.task_set_phase,
             "confirmation_of_duel_id": self.confirmation_of_duel_id,
             "manual_retest_of_duel_id": self.manual_retest_of_duel_id,
+            "target_round_count": self.target_round_count,
             "updated_at": self.updated_at,
         }
 
@@ -467,6 +469,9 @@ class ActiveDuelLease:
         manual_retest_of_duel_id = None
         if payload.get("manual_retest_of_duel_id") is not None:
             manual_retest_of_duel_id = int(payload["manual_retest_of_duel_id"])
+        target_round_count = None
+        if payload.get("target_round_count") is not None:
+            target_round_count = int(payload["target_round_count"])
         return cls(
             duel_id=int(payload["duel_id"]),
             started_at=str(payload["started_at"]),
@@ -478,6 +483,7 @@ class ActiveDuelLease:
             task_set_phase=str(payload.get("task_set_phase") or "primary"),
             confirmation_of_duel_id=confirmation_of_duel_id,
             manual_retest_of_duel_id=manual_retest_of_duel_id,
+            target_round_count=target_round_count,
             updated_at=(
                 str(payload["updated_at"])
                 if payload.get("updated_at") is not None
@@ -764,6 +770,7 @@ def _start_active_duel(
     task_set_phase: str = "primary",
     confirmation_of_duel_id: int | None = None,
     manual_retest_of_duel_id: int | None = None,
+    target_round_count: int | None = None,
 ) -> None:
     existing = state.active_duel
     if (
@@ -776,6 +783,7 @@ def _start_active_duel(
         existing.task_set_phase = task_set_phase
         existing.confirmation_of_duel_id = confirmation_of_duel_id
         existing.manual_retest_of_duel_id = manual_retest_of_duel_id
+        existing.target_round_count = target_round_count
         existing.updated_at = _timestamp()
         return
     state.active_duel = ActiveDuelLease(
@@ -786,6 +794,7 @@ def _start_active_duel(
         task_set_phase=task_set_phase,
         confirmation_of_duel_id=confirmation_of_duel_id,
         manual_retest_of_duel_id=manual_retest_of_duel_id,
+        target_round_count=target_round_count,
         updated_at=_timestamp(),
     )
 
@@ -800,6 +809,7 @@ def _checkpoint_active_duel(
     task_set_phase: str | None = None,
     confirmation_of_duel_id: int | None = None,
     manual_retest_of_duel_id: int | None = None,
+    target_round_count: int | None = None,
 ) -> bool:
     lease = state.active_duel
     if lease is None or lease.duel_id != duel_id:
@@ -815,6 +825,8 @@ def _checkpoint_active_duel(
         lease.confirmation_of_duel_id = confirmation_of_duel_id
     if manual_retest_of_duel_id is not None:
         lease.manual_retest_of_duel_id = manual_retest_of_duel_id
+    if target_round_count is not None:
+        lease.target_round_count = target_round_count
     lease.updated_at = _timestamp()
     return True
 
@@ -2479,11 +2491,11 @@ def _pool_filler_loop(
         finally:
             _release_saved_task_claim(saved_task_name)
             if not added_to_pool and generated_task_root is not None and generated_task_root.exists():
-                try:
-                    shutil.rmtree(generated_task_root, ignore_errors=True)
-                    log.info("Pool filler[%s]: removed unused task dir %s", pool_label, generated_task_root.name)
-                except Exception:
-                    log.exception("Pool filler[%s]: failed to remove unused task dir %s", pool_label, generated_task_root)
+                log.info(
+                    "Pool filler[%s]: leaving unused task dir %s in place",
+                    pool_label,
+                    generated_task_root.name,
+                )
             if refresh_claimed and pool_refresh is not None:
                 completed = pool_refresh.finish(config=config, success=added_to_pool)
                 if completed:
@@ -3172,16 +3184,10 @@ def _run_parallel_duel(
     pool up front and then launches all challenger solves + comparisons
     concurrently.  Wall-clock time is roughly that of a single round.
     """
-    n_rounds = config.validate_duel_rounds
     concurrency = config.validate_round_concurrency
     margin = config.validate_win_margin
     started_at = _timestamp()
     excluded_task_names = {name for name in (exclude_task_names or set()) if name}
-    recent_task_count = (
-        max(0, int(config.validate_task_pool_refresh_count))
-        if recent_task_count is None
-        else max(0, int(recent_task_count))
-    )
     resume_lease = (
         state.active_duel
         if state.active_duel is not None
@@ -3193,8 +3199,21 @@ def _run_parallel_duel(
     )
     resume_rounds = list(resume_lease.rounds) if resume_lease is not None else []
     resume_task_names = list(resume_lease.task_names) if resume_lease is not None else []
+    n_rounds = (
+        max(1, int(resume_lease.target_round_count))
+        if resume_lease is not None and resume_lease.target_round_count is not None
+        else config.validate_duel_rounds
+    )
+    recent_task_count = (
+        max(0, int(config.validate_task_pool_refresh_count))
+        if recent_task_count is None
+        else max(0, int(recent_task_count))
+    )
     if resume_lease is not None:
         started_at = resume_lease.started_at
+    completed_resume_task_names = {
+        round_result.task_name for round_result in resume_rounds if round_result.task_name
+    }
 
     log.info(
         "Parallel duel %d: king uid=%s vs challenger uid=%s (%s), "
@@ -3246,8 +3265,17 @@ def _run_parallel_duel(
 
     if resume_task_names:
         task_by_name = {task.task_name: task for task in pool.list_tasks()}
-        tasks = [task_by_name[name] for name in resume_task_names if name in task_by_name]
-        missing_task_names = [name for name in resume_task_names if name not in task_by_name]
+        selected_task_names = list(resume_task_names)
+        tasks = [
+            task_by_name[name]
+            for name in resume_task_names
+            if name in task_by_name and name not in completed_resume_task_names
+        ]
+        missing_task_names = [
+            name
+            for name in resume_task_names
+            if name not in task_by_name and name not in completed_resume_task_names
+        ]
         if missing_task_names:
             log.warning(
                 "Duel %d resume checkpoint references %d task(s) no longer in pool: %s",
@@ -3255,29 +3283,35 @@ def _run_parallel_duel(
                 len(missing_task_names),
                 ", ".join(missing_task_names[:5]),
             )
-        if len(tasks) < n_rounds:
-            existing = {task.task_name for task in tasks}
+        selected = {name for name in selected_task_names if name}
+        existing = {task.task_name for task in tasks}
+        needed_new_tasks = max(0, n_rounds - len(completed_resume_task_names) - len(tasks))
+        if needed_new_tasks > 0:
             extra = _gather_pool_tasks(
-                pool, n_rounds - len(tasks), min_block=challenger.commitment_block,
+                pool, needed_new_tasks, min_block=challenger.commitment_block,
                 timeout=config.validate_duel_timeout_seconds,
                 pool_starved=pool_starved,
                 on_tick=_phase1_tick,
                 cancel_event=cancel_event,
                 min_tasks=0,
-                exclude_task_names=excluded_task_names | existing,
+                exclude_task_names=excluded_task_names | existing | selected | completed_resume_task_names,
                 recent_task_count=max(0, recent_task_count - len(tasks)),
             )
             for task in extra:
                 if task.task_name not in existing:
                     tasks.append(task)
                     existing.add(task.task_name)
-                if len(tasks) >= n_rounds:
+                    if task.task_name not in selected:
+                        selected_task_names.append(task.task_name)
+                        selected.add(task.task_name)
+                if len(completed_resume_task_names) + len(tasks) >= n_rounds:
                     break
         log.info(
-            "Duel %d: resuming checkpoint with %d selected task(s) and %d prior round(s)",
+            "Duel %d: resuming checkpoint with %d prior round(s), %d replacement task(s), %d selected task name(s)",
             duel_id,
-            len(tasks),
             len([r for r in resume_rounds if r.scored]),
+            len(tasks),
+            len(selected_task_names),
         )
     else:
         tasks = _gather_pool_tasks(
@@ -3289,7 +3323,10 @@ def _run_parallel_duel(
             exclude_task_names=excluded_task_names,
             recent_task_count=recent_task_count,
         )
-    log.info("Duel %d: gathered %d/%d tasks", duel_id, len(tasks), n_rounds)
+        selected_task_names = [task.task_name for task in tasks]
+    selected_count = len(completed_resume_task_names) + len(tasks)
+    log.info("Duel %d: gathered %d/%d task slots (%d already complete, %d new)",
+             duel_id, selected_count, n_rounds, len(completed_resume_task_names), len(tasks))
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("duel interrupted by validator shutdown during task gathering")
     if on_round_complete is not None:
@@ -3299,19 +3336,19 @@ def _run_parallel_duel(
                 scored=0,
                 threshold=margin + 1,
                 rounds=resume_rounds,
-                task_names=[task.task_name for task in tasks],
+                task_names=selected_task_names,
                 phase="tasks_selected",
-                gathered_tasks=len(tasks),
+                gathered_tasks=selected_count,
                 needed_tasks=n_rounds,
                 pool_size=pool.size(),
             )
         except Exception:
             log.exception("task selection checkpoint callback failed (non-fatal)")
-    if not tasks:
+    if selected_count <= 0:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("duel interrupted by validator shutdown before any tasks were gathered")
         raise RetryableDuelError(f"duel {duel_id} gathered no tasks; retrying challenger instead of recording a defense")
-    _raise_if_insufficient_duel_tasks(duel_id, n_rounds, tasks)
+    _raise_if_insufficient_duel_tasks(duel_id, n_rounds, [*resume_rounds, *tasks])
 
     # Phase 2+3: solve and compare all rounds in parallel
     log.info("Duel %d phase 2: launching %d parallel solves + compares",
@@ -3353,7 +3390,7 @@ def _run_parallel_duel(
                 duel_id=duel_id, wins=wins, losses=losses, ties=ties,
                 scored=scored, threshold=dyn_threshold, rounds=rounds,
                 phase="running_rounds",
-                gathered_tasks=len(tasks),
+                gathered_tasks=len(selected_task_names),
                 needed_tasks=n_rounds,
                 pool_size=pool.size(),
             )
@@ -3669,7 +3706,7 @@ def _run_parallel_duel(
                 threshold=losses + margin + 1,
                 rounds=rounds,
                 phase="scored",
-                gathered_tasks=len(tasks),
+                gathered_tasks=len(selected_task_names),
                 needed_tasks=n_rounds,
                 pool_size=pool.size(),
                 king_replaced=king_replaced,
@@ -3778,7 +3815,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     chain_data: dict[str, Any] | None = None
     last_king_check = 0.0
 
-    github_client = _build_github_client(config)
+    github_client = _build_github_pr_screening_client(config)
     github_merge_client = _build_github_merge_client(config)
     duel_count = 0
     last_github_pr_cleanup = 0.0
@@ -4045,6 +4082,20 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         is_confirmation_retest = duel_task_set_phase == "confirmation_retest"
                         duel_pool = retest_pool if is_confirmation_retest else pool
                         duel_pool_starved = retest_pool_starved if is_confirmation_retest else pool_starved
+                        manual_retest_seed = (
+                            _manual_retest_seed_from_history(paths.duels_dir, confirmation_of_duel_id)
+                            if is_confirmation_retest and resume_lease is None
+                            else None
+                        )
+                        duel_target_round_count = (
+                            manual_retest_seed.target_round_count
+                            if manual_retest_seed is not None
+                            else (
+                                resume_lease.target_round_count
+                                if resume_lease is not None and resume_lease.target_round_count is not None
+                                else config.validate_duel_rounds
+                            )
+                        )
                         _start_active_duel(
                             state,
                             duel_id=duel_id,
@@ -4053,7 +4104,29 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             task_set_phase=duel_task_set_phase,
                             confirmation_of_duel_id=confirmation_of_duel_id,
                             manual_retest_of_duel_id=manual_retest_of_duel_id,
+                            target_round_count=duel_target_round_count,
                         )
+                        if (
+                            manual_retest_seed is not None
+                            and state.active_duel is not None
+                            and state.active_duel.duel_id == duel_id
+                            and not state.active_duel.rounds
+                        ):
+                            state.active_duel.rounds = list(manual_retest_seed.good_rounds)
+                            state.active_duel.task_names = [
+                                round_result.task_name
+                                for round_result in manual_retest_seed.good_rounds
+                                if round_result.task_name
+                            ]
+                            state.active_duel.status = "gathering_tasks"
+                            state.active_duel.updated_at = _timestamp()
+                            log.info(
+                                "Manual retest duel %d will reuse %d good round(s) from duel %s and replace %d error round(s)",
+                                duel_id,
+                                len(manual_retest_seed.good_rounds),
+                                confirmation_of_duel_id,
+                                manual_retest_seed.error_round_count,
+                            )
                         try:
                             _save_state(paths.state_path, state)
                         except Exception:
@@ -4079,11 +4152,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 confirmation_of_duel_id=confirmation_of_duel_id,
                                 manual_retest_of_duel_id=manual_retest_of_duel_id,
                                 gathered_tasks=0,
-                                needed_tasks=config.validate_duel_rounds,
+                                needed_tasks=duel_target_round_count,
                                 pool_size=duel_pool.size(),
                                 threshold=config.validate_win_margin + 1,
                                 win_margin=config.validate_win_margin,
-                                duel_rounds=config.validate_duel_rounds,
+                                duel_rounds=duel_target_round_count,
                             )
                         except Exception:
                             log.exception("R2 duel start snapshot failed (non-fatal)")
@@ -4105,14 +4178,14 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "challenger_pr_url": challenger.pr_url,
                             "threshold": config.validate_win_margin + 1,
                             "win_margin": config.validate_win_margin,
-                            "duel_rounds": config.validate_duel_rounds,
+                            "duel_rounds": duel_target_round_count,
                             "task_set_phase": duel_task_set_phase,
                             "confirmation_of_duel_id": confirmation_of_duel_id,
                             "manual_retest_of_duel_id": manual_retest_of_duel_id,
                             "phase": "gathering_tasks",
                             "status": "gathering_tasks",
                             "gathered_tasks": 0,
-                            "needed_tasks": config.validate_duel_rounds,
+                            "needed_tasks": duel_target_round_count,
                             "pool_size": duel_pool.size(),
                         }
                         try:
@@ -4164,6 +4237,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     if isinstance(task_names, list)
                                     else (lease.task_names if lease is not None else None)
                                 )
+                                duel_round_count = (
+                                    lease.target_round_count
+                                    if lease is not None and lease.target_round_count is not None
+                                    else config.validate_duel_rounds
+                                )
                                 active_task_summaries = _task_summaries_for_names(
                                     snapshot_task_names,
                                     config,
@@ -4201,7 +4279,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         pool_size=kw.get("pool_size"),
                                         threshold=threshold,
                                         win_margin=config.validate_win_margin,
-                                        duel_rounds=config.validate_duel_rounds,
+                                        duel_rounds=duel_round_count,
                                     )
                                 king_dashboard = _dashboard_submission_dict(
                                     state.current_king,
@@ -4222,7 +4300,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "challenger_repo_url": challenger.pr_url or f"https://github.com/{challenger.repo_full_name}",
                                     "challenger_pr_url": challenger.pr_url,
                                     "threshold": threshold,
-                                    "duel_rounds": config.validate_duel_rounds,
+                                    "duel_rounds": duel_round_count,
                                     "task_set_phase": task_set_phase,
                                     "confirmation_of_duel_id": confirmation_of_duel_id,
                                     "manual_retest_of_duel_id": challenger.manual_retest_of_duel_id,
@@ -4288,19 +4366,35 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             return completed_dict
 
                         duel_excluded_task_names = (
-                            _duel_task_names_from_history(paths.duels_dir, confirmation_of_duel_id)
-                            if is_confirmation_retest
-                            else set()
+                            set(manual_retest_seed.prior_task_names)
+                            if manual_retest_seed is not None
+                            else (
+                                _duel_task_names_from_history(paths.duels_dir, confirmation_of_duel_id)
+                                if is_confirmation_retest
+                                else set()
+                            )
                         )
                         if is_confirmation_retest:
-                            log.info(
-                                "Starting confirmation retest duel %d for challenger uid=%s after preliminary duel %s "
-                                "(excluding %d prior task(s))",
-                                duel_id,
-                                challenger.uid,
-                                confirmation_of_duel_id,
-                                len(duel_excluded_task_names),
-                            )
+                            if manual_retest_seed is not None:
+                                log.info(
+                                    "Starting confirmation repair duel %d for challenger uid=%s after preliminary duel %s "
+                                    "(reusing %d good round(s), replacing %d error round(s), excluding %d prior task(s))",
+                                    duel_id,
+                                    challenger.uid,
+                                    confirmation_of_duel_id,
+                                    len(manual_retest_seed.good_rounds),
+                                    manual_retest_seed.error_round_count,
+                                    len(duel_excluded_task_names),
+                                )
+                            else:
+                                log.info(
+                                    "Starting confirmation retest duel %d for challenger uid=%s after preliminary duel %s "
+                                    "(excluding %d prior task(s))",
+                                    duel_id,
+                                    challenger.uid,
+                                    confirmation_of_duel_id,
+                                    len(duel_excluded_task_names),
+                                )
                         else:
                             log.info("Starting parallel duel %d: uid=%s (%s)",
                                      duel_id, challenger.uid, challenger.repo_full_name)
@@ -4722,15 +4816,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("cleanup heartbeat r2 publish failed (non-fatal)")
 
-                if config.validate_task_pool_fill_from_saved:
-                    log.info("Task cleanup skipped: saved task pool fill is enabled")
-                else:
-                    _cleanup_old_tasks(
-                        config.tasks_root,
-                        keep_names=pool.names(),
-                        min_age_seconds=config.validate_task_cleanup_min_age_seconds,
-                        on_progress=_cleanup_heartbeat,
-                    )
+                log.info("Task cleanup disabled: preserving all validate task dirs")
                 _cleanup_orphaned_containers()
 
               except KeyboardInterrupt:
@@ -4970,6 +5056,8 @@ def _publish_dashboard(
 
 def _dashboard_links() -> dict[str, str]:
     public_base_url = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
+    if public_base_url and not public_base_url.endswith("/sn66"):
+        public_base_url = f"{public_base_url}/sn66"
     duels_html = f"{public_base_url}/duels.html" if public_base_url else "duels.html"
     return {"duels_html": duels_html}
 
@@ -5045,6 +5133,30 @@ def _build_github_client(config: RunConfig) -> httpx.Client:
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "swe-eval-validate"}
     token = None
     if config.github_tokens:
+        tokens = [t.strip() for t in config.github_tokens.split(",") if t.strip()]
+        if tokens:
+            token = tokens[0]
+    if not token:
+        token = config.github_token
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return httpx.Client(base_url="https://api.github.com", headers=headers, follow_redirects=True, timeout=config.http_timeout)
+
+
+def _build_github_pr_screening_client(config: RunConfig) -> httpx.Client:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "swe-eval-validate-pr-screening",
+    }
+    token = None
+    if config.github_pr_screening_tokens:
+        tokens = [t.strip() for t in config.github_pr_screening_tokens.split(",") if t.strip()]
+        if tokens:
+            token = tokens[0]
+    if not token:
+        token = config.github_pr_screening_token
+    if not token and config.github_tokens:
         tokens = [t.strip() for t in config.github_tokens.split(",") if t.strip()]
         if tokens:
             token = tokens[0]
@@ -7598,6 +7710,12 @@ def _github_pr_submission_is_eligible(
             registration_block,
         )
         return False
+    if submission.manual_retest_of_duel_id is not None:
+        log.info(
+            "Manual retest submission for duel %s: bypassing fresh GitHub PR eligibility checks",
+            submission.manual_retest_of_duel_id,
+        )
+        return True
 
     parsed = _parse_github_pr_commitment(submission.commitment)
     base_repo = submission.base_repo_full_name or (parsed[0] if parsed else config.validate_github_pr_repo)
@@ -8004,6 +8122,67 @@ def _save_state(path: Path, state: ValidatorState) -> None:
 
 def _write_duel(paths: ValidatePaths, duel: DuelResult) -> None:
     write_json(paths.duels_dir / f"{duel.duel_id:06d}.json", duel.to_dict())
+
+@dataclass(slots=True)
+class ManualRetestSeed:
+    good_rounds: list[ValidationRoundResult]
+    target_round_count: int
+    error_round_count: int
+    prior_task_names: set[str]
+
+
+def _manual_retest_seed_from_history(duels_dir: Path, duel_id: int | None) -> ManualRetestSeed | None:
+    if duel_id is None:
+        return None
+    path = duels_dir / f"{duel_id:06d}.json"
+    try:
+        payload = json.loads(path.read_text())
+    except FileNotFoundError:
+        log.warning("Referenced duel %d history file is missing at %s", duel_id, path)
+        return None
+    except Exception:
+        log.exception("Failed to load referenced duel %d rounds from %s", duel_id, path)
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    prior_task_names: set[str] = set()
+    task_names = payload.get("task_names")
+    if isinstance(task_names, list):
+        prior_task_names.update(str(name) for name in task_names if name)
+
+    raw_rounds = payload.get("rounds")
+    if not isinstance(raw_rounds, list):
+        return None
+
+    good_rounds: list[ValidationRoundResult] = []
+    parsed_round_count = 0
+    error_round_count = 0
+    for item in raw_rounds:
+        if not isinstance(item, dict):
+            continue
+        task_name = item.get("task_name")
+        if task_name:
+            prior_task_names.add(str(task_name))
+        try:
+            round_result = ValidationRoundResult(**item)
+        except TypeError:
+            continue
+        parsed_round_count += 1
+        if round_result.error is None:
+            good_rounds.append(round_result)
+        else:
+            error_round_count += 1
+
+    if parsed_round_count <= 0 or error_round_count <= 0:
+        return None
+    return ManualRetestSeed(
+        good_rounds=good_rounds,
+        target_round_count=parsed_round_count,
+        error_round_count=error_round_count,
+        prior_task_names=prior_task_names,
+    )
+
 
 def _duel_task_names_from_history(duels_dir: Path, duel_id: int | None) -> set[str]:
     if duel_id is None:

@@ -90,6 +90,19 @@ class RunConfig:
     github_tokens: str | None = field(
         default_factory=lambda: os.environ.get("GITHUB_TOKENS"),
     )
+    # Dedicated read-only token(s) for PR screening: fetching watched PRs,
+    # commits, branches, and required check runs. This keeps high-volume read
+    # traffic away from owner/write tokens used for cleanup or merges.
+    github_pr_screening_token: str | None = field(
+        default_factory=lambda: (
+            os.environ.get("GITHUB_PR_SCREENING_TOKEN")
+            or os.environ.get("GITHUB_TOKEN_PR_SCREENING")
+            or os.environ.get("GH_PR_SCREENING_TOKEN")
+        ),
+    )
+    github_pr_screening_tokens: str | None = field(
+        default_factory=lambda: os.environ.get("GITHUB_PR_SCREENING_TOKENS"),
+    )
     # Dedicated owner-scoped token used only for write paths (auto-merging the
     # winning challenger PR into the watched base repo). Kept separate from the
     # rotation pool in `github_tokens` so a non-owner rotation token can never
