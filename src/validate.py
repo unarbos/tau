@@ -6799,11 +6799,26 @@ def _close_github_pr_with_reason(
     try:
         resp = client.patch(f"/repos/{repo}/pulls/{pr_number}", json={"state": "closed"})
     except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub PR cleanup close failed for %s#%d: %s", repo, pr_number, exc)
-        return False
-    if resp.status_code != 200:
+        log.warning("GitHub PR cleanup pull close failed for %s#%d: %s", repo, pr_number, exc)
+    else:
+        if resp.status_code == 200:
+            return True
         log.warning(
-            "GitHub PR cleanup close failed for %s#%d: HTTP %s %s",
+            "GitHub PR cleanup pull close failed for %s#%d: HTTP %s %s; trying issue close endpoint",
+            repo,
+            pr_number,
+            resp.status_code,
+            _github_response_text(resp)[:300],
+        )
+
+    try:
+        resp = client.patch(f"/repos/{repo}/issues/{pr_number}", json={"state": "closed"})
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("GitHub PR cleanup issue close failed for %s#%d: %s", repo, pr_number, exc)
+        return False
+    if resp.status_code not in {200, 201}:
+        log.warning(
+            "GitHub PR cleanup issue close failed for %s#%d: HTTP %s %s",
             repo,
             pr_number,
             resp.status_code,
