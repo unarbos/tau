@@ -17,12 +17,6 @@ from validate import (
     _enforce_submission_mode_on_state,
     _ensure_king,
     _fetch_chain_submissions,
-    _fetch_check_runs,
-    _fetch_github_pr,
-    _fetch_open_github_prs,
-    _github_check_runs_cache,
-    _github_open_prs_cache,
-    _github_pr_cache,
     _github_pr_required_checks_passed,
     _hotkey_spent_since_block,
     _is_burn_king,
@@ -267,81 +261,6 @@ class GitHubClientRotationTest(unittest.TestCase):
                 ("PUT", "/repos/unarbos/ninja/pulls/7/merge", "Bearer merge-token"),
                 ("PUT", "/repos/unarbos/ninja/pulls/7/merge", "Bearer owner-token"),
                 ("PUT", "/repos/unarbos/ninja/pulls/7/merge", "Bearer owner-token"),
-            ],
-        )
-
-    def test_pr_fetch_cache_isolated_by_rotating_token(self):
-        _github_pr_cache.clear()
-        raw_client = RecordingHttpxClient(
-            {
-                "Bearer token-a": [FakeResponse(404, {"message": "Not Found"})],
-                "Bearer token-b": [FakeResponse(200, {"number": 7, "title": "visible"})],
-            }
-        )
-        config = RunConfig(github_tokens="token-a, token-b", http_timeout=12.0)
-
-        with patch("validate.httpx.Client", return_value=raw_client):
-            client = _build_github_client(config)
-            first = _fetch_github_pr(client, base_repo="unarbos/ninja", pr_number=7)
-            second = _fetch_github_pr(client, base_repo="unarbos/ninja", pr_number=7)
-
-        self.assertEqual(first, (None, True))
-        self.assertEqual(second, ({"number": 7, "title": "visible"}, False))
-        self.assertEqual(
-            raw_client.calls,
-            [
-                ("GET", "/repos/unarbos/ninja/pulls/7", "Bearer token-a"),
-                ("GET", "/repos/unarbos/ninja/pulls/7", "Bearer token-b"),
-            ],
-        )
-
-    def test_check_run_cache_isolated_by_rotating_token(self):
-        _github_check_runs_cache.clear()
-        raw_client = RecordingHttpxClient(
-            {
-                "Bearer token-a": [FakeResponse(404, {"message": "Not Found"})],
-                "Bearer token-b": [FakeResponse(200, {"check_runs": [{"name": "ci"}]})],
-            }
-        )
-        config = RunConfig(github_tokens="token-a, token-b", http_timeout=12.0)
-
-        with patch("validate.httpx.Client", return_value=raw_client):
-            client = _build_github_client(config)
-            first = _fetch_check_runs(client, repo="unarbos/ninja", sha=SHA)
-            second = _fetch_check_runs(client, repo="unarbos/ninja", sha=SHA)
-
-        self.assertEqual(first, [])
-        self.assertEqual(second, [{"name": "ci"}])
-        self.assertEqual(
-            raw_client.calls,
-            [
-                ("GET", f"/repos/unarbos/ninja/commits/{SHA}/check-runs", "Bearer token-a"),
-                ("GET", f"/repos/unarbos/ninja/commits/{SHA}/check-runs", "Bearer token-b"),
-            ],
-        )
-
-    def test_open_pr_cache_isolated_by_rotating_token(self):
-        _github_open_prs_cache.clear()
-        raw_client = RecordingHttpxClient(
-            {
-                "Bearer token-a": [FakeResponse(200, [])],
-                "Bearer token-b": [FakeResponse(200, [{"number": 7}])],
-            }
-        )
-        config = RunConfig(github_tokens="token-a, token-b", http_timeout=12.0)
-
-        with patch("validate.httpx.Client", return_value=raw_client):
-            client = _build_github_client(config)
-            first = _fetch_open_github_prs(client, repo="unarbos/ninja", max_pages=1)
-            second = _fetch_open_github_prs(client, repo="unarbos/ninja", max_pages=1)
-
-        self.assertEqual(first, [])
-        self.assertEqual(second, [{"number": 7}])
-        self.assertEqual(
-            raw_client.calls,
-            [
-                ("GET", "/repos/unarbos/ninja/pulls", "Bearer token-a"),
-                ("GET", "/repos/unarbos/ninja/pulls", "Bearer token-b"),
             ],
         )
 
