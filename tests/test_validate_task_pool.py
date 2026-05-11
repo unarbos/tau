@@ -115,11 +115,21 @@ class TaskPoolTest(unittest.TestCase):
 
     def test_take_returns_fastest_cached_task(self):
         with tempfile.TemporaryDirectory() as td:
-            pool = TaskPool(Path(td))
+            root = Path(td)
+            pool = TaskPool(root / "pool")
+            slow_root = root / "slow"
+            fast_root = root / "fast"
+            slow_root.mkdir()
+            fast_root.mkdir()
+            for task_root in (slow_root, fast_root):
+                baseline_dir = task_root / "solutions" / "baseline"
+                baseline_dir.mkdir(parents=True)
+                (baseline_dir / "solve.json").write_text("{}\n")
+                (baseline_dir / "solution.diff").write_text("diff\n")
             pool.add(
                 PoolTask(
                     task_name="slow",
-                    task_root="/tmp/slow",
+                    task_root=str(slow_root),
                     creation_block=20,
                     cursor_elapsed=300.0,
                     king_lines=1,
@@ -130,7 +140,7 @@ class TaskPoolTest(unittest.TestCase):
             pool.add(
                 PoolTask(
                     task_name="fast",
-                    task_root="/tmp/fast",
+                    task_root=str(fast_root),
                     creation_block=20,
                     cursor_elapsed=20.0,
                     king_lines=1,
@@ -147,11 +157,18 @@ class TaskPoolTest(unittest.TestCase):
 
     def test_take_reuses_cached_task_older_than_min_block(self):
         with tempfile.TemporaryDirectory() as td:
-            pool = TaskPool(Path(td))
+            root = Path(td)
+            pool = TaskPool(root / "pool")
+            task_root = root / "cached"
+            task_root.mkdir()
+            baseline_dir = task_root / "solutions" / "baseline"
+            baseline_dir.mkdir(parents=True)
+            (baseline_dir / "solve.json").write_text("{}\n")
+            (baseline_dir / "solution.diff").write_text("diff\n")
             pool.add(
                 PoolTask(
                     task_name="cached",
-                    task_root="/tmp/cached",
+                    task_root=str(task_root),
                     creation_block=20,
                     cursor_elapsed=20.0,
                     king_lines=1,
@@ -900,11 +917,21 @@ class TaskPoolTest(unittest.TestCase):
 
     def test_take_respects_exclude_when_sorting_by_speed(self):
         with tempfile.TemporaryDirectory() as td:
-            pool = TaskPool(Path(td))
+            root = Path(td)
+            pool = TaskPool(root / "pool")
+            fast_root = root / "fast"
+            slow_root = root / "slow"
+            fast_root.mkdir()
+            slow_root.mkdir()
+            for task_root in (fast_root, slow_root):
+                baseline_dir = task_root / "solutions" / "baseline"
+                baseline_dir.mkdir(parents=True)
+                (baseline_dir / "solve.json").write_text("{}\n")
+                (baseline_dir / "solution.diff").write_text("diff\n")
             pool.add(
                 PoolTask(
                     task_name="fast",
-                    task_root="/tmp/fast",
+                    task_root=str(fast_root),
                     creation_block=20,
                     cursor_elapsed=20.0,
                     king_lines=1,
@@ -915,7 +942,7 @@ class TaskPoolTest(unittest.TestCase):
             pool.add(
                 PoolTask(
                     task_name="slow",
-                    task_root="/tmp/slow",
+                    task_root=str(slow_root),
                     creation_block=20,
                     cursor_elapsed=300.0,
                     king_lines=1,
