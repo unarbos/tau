@@ -8,6 +8,7 @@ from r2 import (
     _is_public_task_leakage_key,
     duel_to_summary,
     publish_duel_data,
+    publish_duel_index,
     publish_round_data,
     publish_training_data,
 )
@@ -284,6 +285,80 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertEqual(summary["king_pr_url"], "https://github.com/base/repo/pull/1")
         self.assertEqual(summary["challenger_repo_url"], "https://github.com/challenger/repo")
         self.assertEqual(summary["challenger_pr_url"], "https://github.com/base/repo/pull/2")
+
+    def test_duel_summary_preserves_display_identity_metadata(self):
+        summary = duel_to_summary(
+            {
+                "duel_id": 44,
+                "king_before": {
+                    "uid": 107,
+                    "hotkey": "king-hotkey",
+                    "repo_full_name": "unarbos/ninja",
+                    "display_repo_full_name": "miner/ninja",
+                    "commit_sha": "merged-sha",
+                    "display_commit_sha": "miner-sha",
+                    "commitment_block": 123,
+                },
+                "challenger": {
+                    "uid": 197,
+                    "hotkey": "challenger-hotkey",
+                    "repo_full_name": "challenger/repo",
+                    "commit_sha": "challenger-sha",
+                    "commitment_block": 456,
+                },
+                "rounds": [],
+            }
+        )
+
+        self.assertEqual(summary["king_uid"], 107)
+        self.assertEqual(summary["king_hotkey"], "king-hotkey")
+        self.assertEqual(summary["king_display_repo_full_name"], "miner/ninja")
+        self.assertEqual(summary["king_commit_sha"], "merged-sha")
+        self.assertEqual(summary["king_display_commit_sha"], "miner-sha")
+        self.assertEqual(summary["challenger_uid"], 197)
+        self.assertEqual(summary["challenger_commit_sha"], "challenger-sha")
+
+    def test_publish_duel_index_includes_identity_metadata(self):
+        client = FakeS3Client()
+        summary = {
+            "duel_id": 44,
+            "started_at": "2026-05-01T00:00:00+00:00",
+            "finished_at": "2026-05-01T00:01:00+00:00",
+            "king_uid": 107,
+            "king_hotkey": "king-hotkey",
+            "king_repo": "unarbos/ninja",
+            "king_display_repo_full_name": "miner/ninja",
+            "king_repo_url": "https://github.com/unarbos/ninja",
+            "king_pr_url": "https://github.com/unarbos/ninja/pull/805",
+            "king_commit_sha": "merged-sha",
+            "king_display_commit_sha": "miner-sha",
+            "king_commitment_block": 123,
+            "challenger_uid": 197,
+            "challenger_hotkey": "challenger-hotkey",
+            "challenger_repo": "challenger/repo",
+            "challenger_repo_url": "https://github.com/challenger/repo",
+            "challenger_pr_url": "https://github.com/unarbos/ninja/pull/945",
+            "challenger_commit_sha": "challenger-sha",
+            "challenger_commitment_block": 456,
+            "wins": 8,
+            "losses": 24,
+            "ties": 0,
+            "rounds": [{"task_name": "validate-1"}],
+        }
+
+        with patch("r2._get_s3_client", return_value=client):
+            self.assertTrue(publish_duel_index(duel_history=[summary]))
+
+        payload = _json_body(client.puts[0])
+        entry = payload["duels"][0]
+        self.assertEqual(entry["king_uid"], 107)
+        self.assertEqual(entry["king_hotkey"], "king-hotkey")
+        self.assertEqual(entry["king_display_repo_full_name"], "miner/ninja")
+        self.assertEqual(entry["king_commit_sha"], "merged-sha")
+        self.assertEqual(entry["king_display_commit_sha"], "miner-sha")
+        self.assertEqual(entry["challenger_uid"], 197)
+        self.assertEqual(entry["challenger_hotkey"], "challenger-hotkey")
+        self.assertEqual(entry["challenger_commit_sha"], "challenger-sha")
 
     def test_publish_training_data_deletes_legacy_public_file_without_uploading(self):
         client = FakeS3Client()
