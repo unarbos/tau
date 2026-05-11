@@ -61,10 +61,12 @@ class CursorBaselineScoringTest(unittest.TestCase):
         with (
             patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
             patch("validate.compare_task_run", side_effect=fake_compare_task_run),
+            patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate.publish_round_data"),
         ):
             result = _solve_and_compare_round(
                 task=task,
+                king=challenger,
                 challenger=challenger,
                 config=RunConfig(openrouter_api_key=None),
                 duel_id=3,
@@ -166,11 +168,13 @@ class CursorBaselineScoringTest(unittest.TestCase):
         with (
             patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
             patch("validate.compare_task_run", side_effect=fake_compare_task_run),
+            patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate._judge_round_diffs", return_value=judge),
             patch("validate.publish_round_data"),
         ):
             return _solve_and_compare_round(
                 task=task,
+                king=challenger,
                 challenger=challenger,
                 config=RunConfig(openrouter_api_key="test-key"),
                 duel_id=3,

@@ -175,6 +175,18 @@ def _client_cache_nonce(client: httpx.Client) -> int:
     return nonce
 
 
+def _github_cache_namespace(client: httpx.Client) -> str:
+    namespace = getattr(client, "github_cache_namespace", None)
+    if callable(namespace):
+        try:
+            value = namespace()
+        except Exception:
+            value = None
+        if value:
+            return str(value)
+    return f"client:{_client_cache_nonce(client)}"
+
+
 class _GitHubAuthRotatingClient:
     """Small GitHub client wrapper with token rotation and 401 blacklisting."""
 
@@ -238,6 +250,13 @@ class _GitHubAuthRotatingClient:
 
     def delete(self, url: str, **kwargs) -> httpx.Response:
         return self.request("DELETE", url, **kwargs)
+
+    def github_cache_namespace(self) -> str:
+        attempts = self._token_attempts()
+        token_index, token = attempts[0]
+        if token_index is None or not token:
+            return f"{self._user_agent}:unauthenticated"
+        return f"{self._user_agent}:token:{_token_fingerprint(token)}"
 
     def _token_attempts(self) -> list[tuple[int | None, str | None]]:
         with self._lock:
@@ -3010,7 +3029,7 @@ def _gather_pool_tasks(
 def _solve_and_compare_round(
     *,
     task: PoolTask,
-    king: ValidatorSubmission | None = None,
+    king: ValidatorSubmission,
     challenger: ValidatorSubmission,
     config: RunConfig,
     duel_id: int,
@@ -3019,13 +3038,12 @@ def _solve_and_compare_round(
     """Run a single round: solve challenger, then compare. Thread-safe."""
     solution_label = f"challenger-{challenger.uid}-d{duel_id}"
     try:
-        if king is not None:
-            task = _ensure_task_ready_for_king(
-                config=config,
-                king=king,
-                task=task,
-                pool=pool,
-            )
+        task = _ensure_task_ready_for_king(
+            config=config,
+            king=king,
+            task=task,
+            pool=pool,
+        )
         _remove_solution_artifacts(
             task_name=task.task_name,
             solution_name=solution_label,
@@ -5087,10 +5105,8 @@ def _find_open_github_pr_by_committed_head(
 
 
 def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) -> tuple[dict[str, Any] | None, bool]:
-    # Include per-client nonce so cached PR payloads don't leak across
-    # different auth/visibility contexts (including unit tests with fake
-    # clients).
-    cache_key = f"{_client_cache_nonce(client)}:{base_repo}#{pr_number}"
+    # Include auth context so cached PR payloads don't leak across tokens.
+    cache_key = f"{_github_cache_namespace(client)}:{base_repo}#{pr_number}"
     now = time.monotonic()
     cached = _github_pr_cache.get(cache_key)
     if cached is not None and now - cached[0] <= _GITHUB_PR_CACHE_TTL_SECONDS:
@@ -6299,9 +6315,8 @@ def _latest_github_pr_required_checks(
 
 
 def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict[str, Any]] | None:
-    # Include client identity so cached check-run results don't leak across
-    # different auth contexts.
-    cache_key = f"{_client_cache_nonce(client)}:{repo}@{sha.lower()}"
+    # Include auth context so cached check-run results don't leak across tokens.
+    cache_key = f"{_github_cache_namespace(client)}:{repo}@{sha.lower()}"
     now = time.monotonic()
     cached = _github_check_runs_cache.get(cache_key)
     if cached is not None and now - cached[0] <= _GITHUB_CHECK_RUNS_CACHE_TTL_SECONDS:
@@ -6485,9 +6500,8 @@ def _cleanup_stale_github_prs(
 
 
 def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -> list[dict[str, Any]]:
-    # Include client identity so cached PR lists don't leak across different
-    # auth/visibility contexts (and across unit tests with different fake clients).
-    cache_key = f"{_client_cache_nonce(client)}:{repo}:{max_pages}"
+    # Include auth context so cached PR lists don't leak across tokens.
+    cache_key = f"{_github_cache_namespace(client)}:{repo}:{max_pages}"
     now = time.monotonic()
     cached = _github_open_prs_cache.get(cache_key)
     if cached is not None and now - cached[0] <= _GITHUB_OPEN_PRS_CACHE_TTL_SECONDS:
@@ -7392,6 +7406,11 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 hotkey=hotkey,
                 uid=uid,
             )
+            _clear_stale_spent_state_for_reregistered_hotkey(
+                state,
+                hotkey=hotkey,
+                registration_block=registration_block_cache[hotkey],
+            )
         return registration_block_cache[hotkey]
 
     for hotkey, entries in revealed.items():
@@ -7414,14 +7433,6 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
             normalized.append(item)
         if not normalized:
             continue
-        # Only clear "spent" state for re-registered hotkeys if we actually
-        # observed an eligible commitment at/after the registration block.
-        if state is not None and registration_block is not None:
-            _clear_stale_spent_state_for_reregistered_hotkey(
-                state,
-                hotkey=hk_str,
-                registration_block=registration_block,
-            )
         block, commitment = min(normalized, key=lambda x: x[0])
         seen.add(hk_str)
         current_commitment = current_commitments.get(hk_str)
