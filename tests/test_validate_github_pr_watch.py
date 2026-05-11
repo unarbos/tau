@@ -196,11 +196,12 @@ class EmptyPullsGithubClient(FakeGithubClient):
 
 
 class ConflictResolvingGithubClient(FakeGithubClient):
-    def __init__(self):
+    def __init__(self, *, temp_merge_failures=None):
         super().__init__()
         self.head_sha = SHA
         self.merge_attempts = 0
         self.temp_merge_attempts = 0
+        self.temp_merge_failures = list(temp_merge_failures or [])
         self.updates = []
         self.created_refs = []
         self.deleted_refs = []
@@ -283,6 +284,13 @@ class ConflictResolvingGithubClient(FakeGithubClient):
                 raise AssertionError(f"expected base main, got {json['base']}")
             if json["head"] != self.temp_branch:
                 raise AssertionError(f"expected temp branch head {self.temp_branch}, got {json['head']}")
+            if self.temp_merge_failures:
+                failure = self.temp_merge_failures.pop(0)
+                return FakeResponse(
+                    failure.get("status_code", 409),
+                    failure.get("payload", {"message": "merge failed"}),
+                    text=failure.get("text"),
+                )
             return FakeResponse(201, {"sha": MERGE_SHA})
         raise AssertionError(f"unexpected GitHub POST path: {path}")
 
@@ -1439,18 +1447,36 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertIn("close: stale-head", client.labels)
 
     def test_promoted_pr_merge_conflict_uses_llm_resolver_then_retries(self):
-        client = ConflictResolvingGithubClient()
+        client = ConflictResolvingGithubClient(
+            temp_merge_failures=[
+                {
+                    "status_code": 409,
+                    "payload": {"message": "merge conflict in agent.py near solve()"},
+                    "text": '{"message":"merge conflict in agent.py near solve()"}',
+                }
+            ]
+        )
         config = RunConfig(
             openrouter_api_key="or-key",
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
         )
-        resolved_agent = (
+        first_resolved_agent = (
             "def solve(repo_path, issue, model=None, api_base=None, api_key=None):\n"
-            "    return {'patch': 'resolved', 'logs': '', 'steps': 0, 'cost': None, 'success': True}\n"
+            "    return {'patch': 'first', 'logs': '', 'steps': 0, 'cost': None, 'success': True}\n"
+        )
+        second_resolved_agent = (
+            "def solve(repo_path, issue, model=None, api_base=None, api_key=None):\n"
+            "    return {'patch': 'second', 'logs': '', 'steps': 1, 'cost': None, 'success': True}\n"
         )
 
-        with patch("validate.complete_text", return_value=f"<resolved_agent_py>\n{resolved_agent}</resolved_agent_py>") as complete:
+        with patch(
+            "validate.complete_text",
+            side_effect=[
+                f"<resolved_agent_py>\n{first_resolved_agent}</resolved_agent_py>",
+                f"<resolved_agent_py>\n{second_resolved_agent}</resolved_agent_py>",
+            ],
+        ) as complete:
             merged = _merge_promoted_github_pr(
                 github_client=client,
                 config=config,
@@ -1461,14 +1487,15 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(merged.repo_full_name, "unarbos/ninja")
         self.assertEqual(merged.commit_sha, MERGE_SHA)
         self.assertEqual(client.merge_attempts, 1)
-        self.assertEqual(client.temp_merge_attempts, 1)
-        self.assertEqual(len(client.created_refs), 1)
-        self.assertEqual(len(client.deleted_refs), 1)
-        self.assertEqual(len(client.updates), 1)
-        self.assertEqual(client.updates[0]["content"], resolved_agent)
-        self.assertEqual(client.updates[0]["payload"]["branch"], client.temp_branch)
-        complete.assert_called_once()
-        self.assertEqual(complete.call_args.kwargs["model"], "anthropic/claude-opus-4.7")
+        self.assertEqual(client.temp_merge_attempts, 2)
+        self.assertEqual(len(client.created_refs), 2)
+        self.assertEqual(len(client.deleted_refs), 2)
+        self.assertEqual(len(client.updates), 2)
+        self.assertEqual(client.updates[0]["content"], first_resolved_agent)
+        self.assertEqual(client.updates[1]["content"], second_resolved_agent)
+        self.assertEqual(complete.call_count, 2)
+        self.assertEqual(complete.call_args_list[0].kwargs["model"], "anthropic/claude-opus-4.7")
+        self.assertIn("merge conflict in agent.py near solve()", complete.call_args_list[1].kwargs["prompt"])
 
     def test_promoted_pr_merge_conflict_rejects_invalid_llm_resolution(self):
         client = ConflictResolvingGithubClient()

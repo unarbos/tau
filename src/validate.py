@@ -102,7 +102,7 @@ _DIFF_JUDGE_ATTEMPTS = 2
 _DIFF_JUDGE_MAX_CONCURRENCY = 25
 _GITHUB_CONFLICT_RESOLVER_MODEL = "anthropic/claude-opus-4.7"
 _GITHUB_CONFLICT_RESOLVER_TIMEOUT_SECONDS = 180
-_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS = 16_000
+_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS = 32_000
 _GITHUB_CONFLICT_RESOLVER_MAX_FILE_CHARS = 180_000
 _GITHUB_CONFLICT_RESOLVER_MAX_ATTEMPTS = 5
 _MIN_PATCH_LINES = 100
@@ -5182,7 +5182,6 @@ def _resolve_and_merge_promoted_pr_conflict_with_llm(
             "substantive improvements onto the current base branch without adding "
             "unrelated behavior."
         )
-        resolved = None
         last_failure_reason: str | None = None
         last_raw_output: str | None = None
         for attempt in range(1, _GITHUB_CONFLICT_RESOLVER_MAX_ATTEMPTS + 1):
@@ -5235,71 +5234,85 @@ def _resolve_and_merge_promoted_pr_conflict_with_llm(
                 candidate = _extract_resolved_agent_py(raw)
 
             validation_error = _validate_resolved_agent_py(candidate)
-            if validation_error is None:
-                resolved = candidate
-                break
+            if validation_error is not None:
+                last_failure_reason = validation_error
+                last_raw_output = raw
+                log.warning(
+                    "Promoted PR %s#%d conflict resolver output rejected on attempt %d/%d: %s",
+                    base_repo,
+                    pr_number,
+                    attempt,
+                    _GITHUB_CONFLICT_RESOLVER_MAX_ATTEMPTS,
+                    validation_error,
+                )
+                continue
 
-            last_failure_reason = validation_error
-            last_raw_output = raw
-            log.warning(
-                "Promoted PR %s#%d conflict resolver output rejected on attempt %d/%d: %s",
-                base_repo,
-                pr_number,
-                attempt,
-                _GITHUB_CONFLICT_RESOLVER_MAX_ATTEMPTS,
-                validation_error,
-            )
-
-        if resolved is None:
-            return None
-
-    commit_message = (
-        f"Resolve promoted PR #{pr_number} conflicts\n\n"
-        f"LLM-assisted conflict resolution for winning miner hotkey {hotkey}.\n"
-        f"Winning head: {expected_head_sha}\n"
-        f"Base head: {base_head_sha}"
-    )
-    temp_branch = _github_conflict_resolution_branch_name(
-        pr_number=pr_number,
-        expected_head_sha=expected_head_sha,
-        base_head_sha=base_head_sha,
-    )
-    if not _create_github_branch_ref(
-        client,
-        repo=base_repo,
-        branch=temp_branch,
-        sha=base_head_sha,
-    ):
-        return None
-
-    resolved_commit_sha = _update_github_text_file(
-        client,
-        repo=base_repo,
-        path=_DEFAULT_GITHUB_AGENT_FILE,
-        branch=temp_branch,
-        current_blob_sha=current_base[1],
-        content=resolved,
-        message=commit_message,
-    )
-    if not resolved_commit_sha:
-        _delete_github_branch_ref(client, repo=base_repo, branch=temp_branch)
-        return None
-
-    try:
-        return _merge_github_branch_into_base(
-            client,
-            repo=base_repo,
-            base_ref=base_ref,
-            head_branch=temp_branch,
-            commit_message=(
-                f"Merge LLM-resolved promoted PR #{pr_number}\n\n"
-                f"Winning miner hotkey: {hotkey}\n"
+            commit_message = (
+                f"Resolve promoted PR #{pr_number} conflicts\n\n"
+                f"LLM-assisted conflict resolution for winning miner hotkey {hotkey}.\n"
                 f"Winning head: {expected_head_sha}\n"
-                f"Resolver commit: {resolved_commit_sha}"
-            ),
-        )
-    finally:
-        _delete_github_branch_ref(client, repo=base_repo, branch=temp_branch)
+                f"Base head: {base_head_sha}\n"
+                f"Resolver attempt: {attempt}/{_GITHUB_CONFLICT_RESOLVER_MAX_ATTEMPTS}"
+            )
+            temp_branch = _github_conflict_resolution_branch_name(
+                pr_number=pr_number,
+                expected_head_sha=expected_head_sha,
+                base_head_sha=base_head_sha,
+            )
+            created_branch, branch_error = _create_github_branch_ref_detailed(
+                client,
+                repo=base_repo,
+                branch=temp_branch,
+                sha=base_head_sha,
+            )
+            if not created_branch:
+                last_failure_reason = branch_error or "failed to create conflict-resolution branch"
+                last_raw_output = raw
+                continue
+
+            try:
+                resolved_commit_sha, update_error = _update_github_text_file_detailed(
+                    client,
+                    repo=base_repo,
+                    path=_DEFAULT_GITHUB_AGENT_FILE,
+                    branch=temp_branch,
+                    current_blob_sha=current_base[1],
+                    content=candidate,
+                    message=commit_message,
+                )
+                if not resolved_commit_sha:
+                    last_failure_reason = update_error or "failed to update resolved agent.py on temp branch"
+                    last_raw_output = raw
+                    continue
+
+                merged_sha, merge_error = _merge_github_branch_into_base_detailed(
+                    client,
+                    repo=base_repo,
+                    base_ref=base_ref,
+                    head_branch=temp_branch,
+                    commit_message=(
+                        f"Merge LLM-resolved promoted PR #{pr_number}\n\n"
+                        f"Winning miner hotkey: {hotkey}\n"
+                        f"Winning head: {expected_head_sha}\n"
+                        f"Resolver commit: {resolved_commit_sha}\n"
+                        f"Resolver attempt: {attempt}/{_GITHUB_CONFLICT_RESOLVER_MAX_ATTEMPTS}"
+                    ),
+                )
+                if merged_sha:
+                    return merged_sha
+                last_failure_reason = merge_error or "failed to merge resolved temp branch into base"
+                last_raw_output = raw
+                log.warning(
+                    "Promoted PR %s#%d conflict resolver merge rejected on attempt %d/%d: %s",
+                    base_repo,
+                    pr_number,
+                    attempt,
+                    _GITHUB_CONFLICT_RESOLVER_MAX_ATTEMPTS,
+                    last_failure_reason,
+                )
+            finally:
+                _delete_github_branch_ref(client, repo=base_repo, branch=temp_branch)
+        return None
 
 
 def _github_conflict_retry_feedback(*, prompt: str, failure_reason: str, raw_output: str) -> str:
@@ -5314,6 +5327,12 @@ def _github_conflict_retry_feedback(*, prompt: str, failure_reason: str, raw_out
         + "Rejected output snippet:\n"
         + snippet
     )
+
+
+def _format_github_error(prefix: str, *, status_code: int | None = None, detail: str = "") -> str:
+    if status_code is None:
+        return prefix if not detail else f"{prefix}: {detail[:300]}"
+    return prefix if not detail else f"{prefix}: HTTP {status_code} {detail[:300]}"
 
 
 def _build_github_conflict_resolver_prompt(
@@ -5615,13 +5634,30 @@ def _create_github_branch_ref(
     branch: str,
     sha: str,
 ) -> bool:
+    created, _ = _create_github_branch_ref_detailed(client, repo=repo, branch=branch, sha=sha)
+    return created
+
+
+def _create_github_branch_ref_detailed(
+    client: httpx.Client,
+    *,
+    repo: str,
+    branch: str,
+    sha: str,
+) -> tuple[bool, str | None]:
     payload = {"ref": f"refs/heads/{branch}", "sha": sha}
     try:
         resp = client.post(f"/repos/{repo}/git/refs", json=payload)
     except (httpx.HTTPError, OSError) as exc:
+        detail = _format_github_error("GitHub branch create failed", detail=str(exc))
         log.warning("GitHub branch create failed for %s:%s: %s", repo, branch, exc)
-        return False
+        return False, detail
     if resp.status_code not in {200, 201}:
+        detail = _format_github_error(
+            "GitHub branch create failed",
+            status_code=resp.status_code,
+            detail=_github_response_text(resp),
+        )
         log.warning(
             "GitHub branch create failed for %s:%s: HTTP %s %s",
             repo,
@@ -5629,8 +5665,8 @@ def _create_github_branch_ref(
             resp.status_code,
             _github_response_text(resp)[:300],
         )
-        return False
-    return True
+        return False, detail
+    return True, None
 
 
 def _merge_github_branch_into_base(
@@ -5641,6 +5677,24 @@ def _merge_github_branch_into_base(
     head_branch: str,
     commit_message: str,
 ) -> str | None:
+    sha, _ = _merge_github_branch_into_base_detailed(
+        client,
+        repo=repo,
+        base_ref=base_ref,
+        head_branch=head_branch,
+        commit_message=commit_message,
+    )
+    return sha
+
+
+def _merge_github_branch_into_base_detailed(
+    client: httpx.Client,
+    *,
+    repo: str,
+    base_ref: str,
+    head_branch: str,
+    commit_message: str,
+) -> tuple[str | None, str | None]:
     payload = {
         "base": base_ref,
         "head": head_branch,
@@ -5649,11 +5703,17 @@ def _merge_github_branch_into_base(
     try:
         resp = client.post(f"/repos/{repo}/merges", json=payload)
     except (httpx.HTTPError, OSError) as exc:
+        detail = _format_github_error("GitHub branch merge failed", detail=str(exc))
         log.warning("GitHub branch merge failed for %s %s <- %s: %s", repo, base_ref, head_branch, exc)
-        return None
+        return None, detail
     if resp.status_code == 204:
-        return _fetch_branch_head_sha(client, repo=repo, branch=base_ref)
+        return _fetch_branch_head_sha(client, repo=repo, branch=base_ref), None
     if resp.status_code not in {200, 201}:
+        detail = _format_github_error(
+            "GitHub branch merge failed",
+            status_code=resp.status_code,
+            detail=_github_response_text(resp),
+        )
         log.warning(
             "GitHub branch merge failed for %s %s <- %s: HTTP %s %s",
             repo,
@@ -5662,7 +5722,7 @@ def _merge_github_branch_into_base(
             resp.status_code,
             _github_response_text(resp)[:300],
         )
-        return None
+        return None, detail
     try:
         payload = resp.json()
     except ValueError:
@@ -5671,9 +5731,9 @@ def _merge_github_branch_into_base(
     if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
         sha = _fetch_branch_head_sha(client, repo=repo, branch=base_ref) or ""
     if re.fullmatch(r"[0-9a-fA-F]{40}", sha):
-        return sha.lower()
+        return sha.lower(), None
     log.warning("GitHub branch merge succeeded for %s %s <- %s but no merge SHA was returned", repo, base_ref, head_branch)
-    return None
+    return None, "GitHub branch merge failed: merge succeeded but no merge SHA was returned"
 
 
 def _delete_github_branch_ref(
@@ -5767,6 +5827,28 @@ def _update_github_text_file(
     content: str,
     message: str,
 ) -> str | None:
+    sha, _ = _update_github_text_file_detailed(
+        client,
+        repo=repo,
+        path=path,
+        branch=branch,
+        current_blob_sha=current_blob_sha,
+        content=content,
+        message=message,
+    )
+    return sha
+
+
+def _update_github_text_file_detailed(
+    client: httpx.Client,
+    *,
+    repo: str,
+    path: str,
+    branch: str,
+    current_blob_sha: str,
+    content: str,
+    message: str,
+) -> tuple[str | None, str | None]:
     payload = {
         "message": message,
         "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
@@ -5776,9 +5858,15 @@ def _update_github_text_file(
     try:
         resp = client.put(f"/repos/{repo}/contents/{quote(path, safe='/')}", json=payload)
     except (httpx.HTTPError, OSError) as exc:
+        detail = _format_github_error("GitHub content update failed", detail=str(exc))
         log.warning("GitHub content update failed for %s:%s on %s: %s", repo, path, branch, exc)
-        return None
+        return None, detail
     if resp.status_code not in {200, 201}:
+        detail = _format_github_error(
+            "GitHub content update failed",
+            status_code=resp.status_code,
+            detail=_github_response_text(resp),
+        )
         log.warning(
             "GitHub content update failed for %s:%s on %s: HTTP %s %s",
             repo,
@@ -5787,7 +5875,7 @@ def _update_github_text_file(
             resp.status_code,
             _github_response_text(resp)[:300],
         )
-        return None
+        return None, detail
     try:
         body = resp.json()
     except ValueError:
@@ -5795,9 +5883,9 @@ def _update_github_text_file(
     commit = body.get("commit") if isinstance(body, dict) else {}
     sha = str(commit.get("sha") or "") if isinstance(commit, dict) else ""
     if re.fullmatch(r"[0-9a-fA-F]{40}", sha):
-        return sha.lower()
+        return sha.lower(), None
     log.warning("GitHub content update for %s:%s succeeded but no commit SHA was returned", repo, path)
-    return None
+    return None, "GitHub content update failed: content update succeeded but no commit SHA was returned"
 
 
 def _github_response_text(resp: httpx.Response) -> str:

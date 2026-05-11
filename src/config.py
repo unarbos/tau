@@ -171,7 +171,7 @@ class RunConfig:
     validate_github_pr_include_drafts: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_INCLUDE_DRAFTS"))
     validate_github_pr_only: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_ONLY"))
     validate_github_conflict_resolver_max_tokens: int = field(
-        default_factory=lambda: _env_int_default("VALIDATE_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS", 16_000)
+        default_factory=lambda: _env_int_default("VALIDATE_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS", 32_000)
     )
     validate_github_pr_cleanup: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_CLEANUP"))
     validate_github_pr_cleanup_stale_after_hours: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_CLEANUP_STALE_AFTER_HOURS", 24))
