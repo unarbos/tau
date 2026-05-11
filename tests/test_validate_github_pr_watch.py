@@ -24,6 +24,10 @@ from validate import (
     _merge_promoted_github_pr,
     _refresh_queue,
     _submission_is_eligible,
+    _github_actions_run_cache,
+    _github_check_runs_cache,
+    _github_open_prs_cache,
+    _github_pr_cache,
 )
 
 
@@ -268,6 +272,7 @@ class GitHubClientRotationTest(unittest.TestCase):
 class HeadCommitmentGithubClient(FakeGithubClient):
     def get(self, path, params=None):
         if path == "/repos/unarbos/ninja/pulls":
+            self.open_pr_params = params
             return FakeResponse(
                 200,
                 [
@@ -553,6 +558,12 @@ class FakeWeightSubtensor:
 
 
 class GithubPrWatchTest(unittest.TestCase):
+    def setUp(self):
+        _github_actions_run_cache.clear()
+        _github_check_runs_cache.clear()
+        _github_open_prs_cache.clear()
+        _github_pr_cache.clear()
+
     def test_hotkey_spent_since_block_defaults_to_hardcoded_cutoff(self):
         config = RunConfig()
 
@@ -636,6 +647,7 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(sub.commitment, PR_HEAD_COMMITMENT)
         self.assertEqual(sub.pr_number, 7)
         self.assertEqual(sub.pr_url, "https://github.com/unarbos/ninja/pull/7")
+        self.assertEqual(client.open_pr_params["direction"], "desc")
 
     def test_pre_pr_head_commitment_waits_until_matching_pr_exists(self):
         client = EmptyPullsGithubClient()

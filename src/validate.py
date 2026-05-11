@@ -6464,7 +6464,7 @@ def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -
         try:
             resp = client.get(
                 f"/repos/{repo}/pulls",
-                params={"state": "open", "sort": "created", "direction": "asc", "per_page": 100, "page": page},
+                params={"state": "open", "sort": "created", "direction": "desc", "per_page": 100, "page": page},
             )
         except (httpx.HTTPError, OSError) as exc:
             log.warning("GitHub open PR cleanup fetch failed for %s page %d: %s", repo, page, exc)
