@@ -13,6 +13,19 @@ from validate import (
 )
 
 
+def _submission(*, hotkey: str = "hk", uid: int = 7, sha: str = "a" * 40) -> ValidatorSubmission:
+    return ValidatorSubmission(
+        hotkey=hotkey,
+        uid=uid,
+        repo_full_name="miner/ninja",
+        repo_url="https://github.com/miner/ninja.git",
+        commit_sha=sha,
+        commitment=f"github-pr:unarbos/ninja#{uid}@{sha}",
+        commitment_block=10,
+        source="github_pr",
+    )
+
+
 class CursorBaselineScoringTest(unittest.TestCase):
     def test_challenger_wins_by_beating_king_round_count(self):
         self.assertTrue(_challenger_wins(wins=3, losses=2, margin=0))
@@ -47,16 +60,8 @@ class CursorBaselineScoringTest(unittest.TestCase):
             king_similarity=0.75,
             baseline_lines=140,
         )
-        challenger = ValidatorSubmission(
-            hotkey="hk",
-            uid=7,
-            repo_full_name="miner/ninja",
-            repo_url="https://github.com/miner/ninja.git",
-            commit_sha="a" * 40,
-            commitment="github-pr:unarbos/ninja#7@" + "a" * 40,
-            commitment_block=10,
-            source="github_pr",
-        )
+        king = _submission(hotkey="king-hk", uid=6, sha="b" * 40)
+        challenger = _submission()
 
         with (
             patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
@@ -66,7 +71,7 @@ class CursorBaselineScoringTest(unittest.TestCase):
         ):
             result = _solve_and_compare_round(
                 task=task,
-                king=challenger,
+                king=king,
                 challenger=challenger,
                 config=RunConfig(openrouter_api_key=None),
                 duel_id=3,
@@ -154,16 +159,8 @@ class CursorBaselineScoringTest(unittest.TestCase):
             king_similarity=king_similarity,
             baseline_lines=10_000,
         )
-        challenger = ValidatorSubmission(
-            hotkey="hk",
-            uid=7,
-            repo_full_name="miner/ninja",
-            repo_url="https://github.com/miner/ninja.git",
-            commit_sha="a" * 40,
-            commitment="github-pr:unarbos/ninja#7@" + "a" * 40,
-            commitment_block=10,
-            source="github_pr",
-        )
+        king = _submission(hotkey="king-hk", uid=6, sha="b" * 40)
+        challenger = _submission()
 
         with (
             patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
@@ -174,7 +171,7 @@ class CursorBaselineScoringTest(unittest.TestCase):
         ):
             return _solve_and_compare_round(
                 task=task,
-                king=challenger,
+                king=king,
                 challenger=challenger,
                 config=RunConfig(openrouter_api_key="test-key"),
                 duel_id=3,
