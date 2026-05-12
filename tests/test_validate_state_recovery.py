@@ -15,6 +15,7 @@ from validate import (
     ValidatorSubmission,
     _checkpoint_active_duel,
     _build_recent_kings_for_r2_publish,
+    _publish_dashboard,
     _purge_stale_recent_kings_after_restart,
     _reconcile_dashboard_history_with_duels,
     _reconcile_state_with_duel_history,
@@ -135,6 +136,82 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual(result["current_king_uid"], 3)
         self.assertEqual([item["uid"] for item in payload["status"]["recent_kings"]], [3, 2, 1])
         self.assertEqual(payload["current_king"]["uid"], 3)
+
+    def test_dashboard_recent_kings_include_reign_timestamps(self):
+        first = _submission(
+            hotkey="5FirstKing",
+            uid=1,
+            commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+            block=101,
+        )
+        previous = _submission(
+            hotkey="5PreviousKing",
+            uid=2,
+            commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+            block=102,
+        )
+        current = _submission(
+            hotkey="5CurrentKing",
+            uid=3,
+            commitment="github-pr:unarbos/ninja#3@" + "c" * 40,
+            block=103,
+        )
+        previous_transition = {
+            "duel_id": 1,
+            "started_at": "2026-05-10T18:00:00+00:00",
+            "finished_at": "2026-05-10T18:10:00+00:00",
+            "king_uid": first.uid,
+            "king_hotkey": first.hotkey,
+            "king_commit_sha": first.commit_sha,
+            "challenger_uid": previous.uid,
+            "challenger_hotkey": previous.hotkey,
+            "challenger_commit_sha": previous.commit_sha,
+            "king_replaced": True,
+        }
+        transition = {
+            "duel_id": 3,
+            "started_at": "2026-05-10T20:00:00+00:00",
+            "finished_at": "2026-05-10T20:10:00+00:00",
+            "king_before": previous.to_dict(),
+            "challenger": current.to_dict(),
+            "king_after": current.to_dict(),
+            "king_replaced": True,
+            "confirmation_duel_id": 4,
+            "confirmation_retest_passed": True,
+        }
+        confirmation = {
+            "duel_id": 4,
+            "started_at": "2026-05-10T20:11:00+00:00",
+            "finished_at": "2026-05-10T20:20:00+00:00",
+            "king_before": previous.to_dict(),
+            "challenger": current.to_dict(),
+            "king_after": previous.to_dict(),
+            "king_replaced": False,
+            "confirmation_of_duel_id": 3,
+            "task_set_phase": "confirmation_retest",
+        }
+        state = ValidatorState(
+            current_king=current,
+            recent_kings=[current, previous],
+            king_since="2026-05-10T20:25:00+00:00",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("validate.publish_dashboard_data", return_value=True):
+            config = RunConfig(workspace_root=Path(tmp), validate_king_window_size=2)
+            config.validate_root.mkdir(parents=True)
+            _publish_dashboard(
+                state,
+                [previous_transition, transition, confirmation],
+                config,
+                validator_started_at="2026-05-10T19:00:00+00:00",
+            )
+            payload = json.loads((config.validate_root / "dashboard_data.json").read_text())
+
+        recent = payload["status"]["recent_kings"]
+        self.assertEqual(recent[0]["uid"], 3)
+        self.assertEqual(recent[0]["king_since"], "2026-05-10T20:25:00+00:00")
+        self.assertEqual(recent[1]["uid"], 2)
+        self.assertEqual(recent[1]["king_since"], "2026-05-10T18:10:00+00:00")
 
     def test_reconcile_advances_duel_id_and_removes_completed_queue_entry(self):
         completed = _submission(

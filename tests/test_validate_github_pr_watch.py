@@ -18,6 +18,7 @@ from validate import (
     _ensure_king,
     _fetch_chain_submissions,
     _github_pr_required_checks_passed,
+    _validate_resolved_agent_py,
     _hotkey_spent_since_block,
     _is_burn_king,
     _maybe_set_weights,
@@ -1683,6 +1684,31 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(len(client.updates), 1)
         self.assertEqual(client.updates[0]["content"], "def solve(repo_path, issue):\n    return {'patch': 'winner'}\n")
         complete.assert_not_called()
+
+    def test_resolved_agent_validation_allows_prompt_separator_lines(self):
+        agent = (
+            "def solve(repo_path, issue):\n"
+            "    prompt = '''\\n"
+            "====================================================================\\n"
+            "SECTION\\n"
+            "====================================================================\\n"
+            "'''\n"
+            "    return {'patch': '', 'logs': prompt}\n"
+        )
+
+        self.assertIsNone(_validate_resolved_agent_py(agent))
+
+    def test_resolved_agent_validation_rejects_real_conflict_block(self):
+        agent = (
+            "def solve(repo_path, issue):\n"
+            "<<<<<<< HEAD\n"
+            "    return {'patch': 'base'}\n"
+            "=======\n"
+            "    return {'patch': 'head'}\n"
+            ">>>>>>> branch\n"
+        )
+
+        self.assertEqual(_validate_resolved_agent_py(agent), "unresolved conflict markers")
 
 
 def _submission(*, commitment: str, sha: str, block: int) -> ValidatorSubmission:
