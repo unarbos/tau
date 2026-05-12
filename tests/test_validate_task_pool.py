@@ -3,6 +3,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import validate
@@ -55,6 +56,8 @@ class TaskPoolTest(unittest.TestCase):
     def tearDown(self):
         with validate._POOL_GENERATION_BACKOFF_LOCK:
             validate._pool_generation_backoff_until = 0.0
+        with validate._SAVED_TASK_FILL_LOCK:
+            validate._SAVED_TASK_FILL_IN_FLIGHT.clear()
 
     def test_prepare_validate_paths_creates_primary_and_retest_pools(self):
         with tempfile.TemporaryDirectory() as td:
@@ -112,6 +115,86 @@ class TaskPoolTest(unittest.TestCase):
             (partial_task / "commit.json").write_text("{}\n")
 
             self.assertIsNone(validate._claim_saved_task_for_pool(config, pool, "primary"))
+
+    def test_pool_filler_continues_while_duel_is_gathering(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_fill_from_saved=True,
+                validate_task_pool_target=1,
+            )
+            pool = TaskPool(root / "pool")
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            task_dir = task_root / "task"
+            task_dir.mkdir(parents=True)
+            for artifact in ("task.json", "task.txt", "commit.json"):
+                (task_dir / artifact).write_text("{}\n")
+            (task_dir / "reference.patch").write_text("+line\n" * (validate._MIN_PATCH_LINES + 1))
+            baseline_dir = task_root / "solutions" / "baseline"
+            baseline_dir.mkdir(parents=True)
+            (baseline_dir / "solution.diff").write_text("diff\n")
+            (baseline_dir / "solve.json").write_text(
+                json.dumps({"result": {"exit_reason": "completed", "elapsed_seconds": 1.0}})
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="github-pr:king/ninja#1@" + "a" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+            challenger = validate.ValidatorSubmission(
+                hotkey="challenger-hotkey",
+                uid=2,
+                repo_full_name="challenger/ninja",
+                repo_url="https://github.com/challenger/ninja",
+                commit_sha="b" * 40,
+                commitment="github-pr:challenger/ninja#2@" + "b" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+            state = validate.ValidatorState(
+                current_king=king,
+                active_duel=validate.ActiveDuelLease(
+                    duel_id=57,
+                    started_at="2026-01-01T00:00:00+00:00",
+                    king=king,
+                    challenger=challenger,
+                    status="gathering_tasks",
+                ),
+            )
+            stop_event = threading.Event()
+
+            def compare_once(**_kwargs):
+                stop_event.set()
+                return SimpleNamespace(
+                    matched_changed_lines=3,
+                    similarity_ratio=0.5,
+                    total_changed_lines_b=3,
+                )
+
+            with (
+                patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
+                patch("validate.compare_task_run", side_effect=compare_once),
+                patch("validate._open_subtensor", side_effect=RuntimeError("offline")),
+            ):
+                validate._pool_filler_loop(
+                    config,
+                    state,
+                    pool,
+                    stop_event,
+                    threading.Lock(),
+                    threading.Event(),
+                    pool_label="primary",
+                )
+
+            self.assertEqual(pool.size(), 1)
+            self.assertEqual(pool.list_tasks()[0].task_name, task_name)
 
     def test_take_returns_fastest_cached_task(self):
         with tempfile.TemporaryDirectory() as td:
@@ -345,6 +428,57 @@ class TaskPoolTest(unittest.TestCase):
                     "validate-20260101000000-000001",
                     "validate-20260101000000-000003",
                     "validate-20260101000000-000004",
+                },
+            )
+
+    def test_add_with_keep_preserves_active_task_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td))
+            preserved = PoolTask(
+                task_name="validate-20260101000000-000001",
+                task_root="/tmp/task-1",
+                creation_block=1,
+                cursor_elapsed=10.0,
+                king_lines=1,
+                king_similarity=0.1,
+                baseline_lines=1,
+            )
+            old = PoolTask(
+                task_name="validate-20260101000000-000002",
+                task_root="/tmp/task-2",
+                creation_block=1,
+                cursor_elapsed=20.0,
+                king_lines=1,
+                king_similarity=0.1,
+                baseline_lines=1,
+            )
+            replacement = PoolTask(
+                task_name="validate-20260101000000-000003",
+                task_root="/tmp/task-3",
+                creation_block=1,
+                cursor_elapsed=30.0,
+                king_lines=1,
+                king_similarity=0.1,
+                baseline_lines=1,
+            )
+
+            self.assertEqual(pool.add(preserved, keep=2), 0)
+            self.assertEqual(pool.add(old, keep=2), 0)
+            self.assertEqual(
+                pool.add(
+                    replacement,
+                    keep=2,
+                    prune_first={"validate-20260101000000-000001"},
+                    preserve={"validate-20260101000000-000001"},
+                ),
+                1,
+            )
+
+            self.assertEqual(
+                {task.task_name for task in pool.list_tasks()},
+                {
+                    "validate-20260101000000-000001",
+                    "validate-20260101000000-000003",
                 },
             )
 

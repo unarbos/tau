@@ -1650,6 +1650,7 @@ class TaskPool:
         *,
         keep: int | None = None,
         prune_first: set[str] | None = None,
+        preserve: set[str] | None = None,
     ) -> int:
         path = self._pool_dir / f"{task.task_name}.json"
         with self._lock:
@@ -1663,16 +1664,20 @@ class TaskPool:
                 return 0
             removed = 0
             prune_names = set(prune_first or ())
+            preserve_names = set(preserve or ())
             prune_names.discard(task.task_name)
+            preserve_names.discard(task.task_name)
             for old_path in files:
                 if len(files) - removed <= keep:
                     return removed
-                if old_path.stem not in prune_names:
+                if old_path.stem in preserve_names or old_path.stem not in prune_names:
                     continue
                 old_path.unlink(missing_ok=True)
                 removed += 1
-            for old_path in files[:-keep]:
+            for old_path in files:
                 if old_path.stem == task.task_name or not old_path.exists():
+                    continue
+                if old_path.stem in preserve_names:
                     continue
                 if len(files) - removed <= keep:
                     return removed
@@ -1997,6 +2002,13 @@ def _release_saved_task_claim(task_name: str | None) -> None:
         _SAVED_TASK_FILL_IN_FLIGHT.discard(task_name)
 
 
+def _active_duel_task_names(state: ValidatorState) -> set[str]:
+    active_duel = state.active_duel
+    if active_duel is None:
+        return set()
+    return set(active_duel.task_names)
+
+
 def _cached_solution_summary(
     *,
     task_name: str,
@@ -2056,10 +2068,6 @@ def _pool_filler_loop(
             king = state.current_king
             assert king is not None
 
-            if state.active_duel is not None:
-                stop_event.wait(2)
-                continue
-
             starved = pool_starved is not None and pool_starved.is_set()
             needs_fill, _ = _pool_needs_fill_for_king(
                 config=config,
@@ -2091,12 +2099,11 @@ def _pool_filler_loop(
                 fill_reason = "refresh"
 
             if config.validate_task_pool_fill_from_saved:
-                active_task_names = set(state.active_duel.task_names) if state.active_duel is not None else set()
                 saved_task_root = _claim_saved_task_for_pool(
                     config,
                     pool,
                     pool_label,
-                    extra_exclude=active_task_names,
+                    extra_exclude=_active_duel_task_names(state),
                 )
                 if saved_task_root is None:
                     log.info(
@@ -2123,9 +2130,6 @@ def _pool_filler_loop(
             ref_patch_path = Path(task_root) / "task" / "reference.patch"
             if _count_patch_lines(ref_patch_path) < _MIN_PATCH_LINES:
                 log.info("Pool filler[%s]: skipping %s (patch too small)", pool_label, task_name)
-                continue
-
-            if state.active_duel is not None:
                 continue
 
             if not refresh_claimed:
@@ -2168,9 +2172,6 @@ def _pool_filler_loop(
                 )
                 continue
             agent_timeout = _agent_timeout_from_cursor_elapsed(baseline_elapsed)
-
-            if state.active_duel is not None:
-                continue
 
             if not refresh_claimed:
                 still_needs_fill, _ = _pool_needs_fill_for_king(
@@ -2254,18 +2255,23 @@ def _pool_filler_loop(
                     pool=pool,
                     king=current_king,
                 )
-                pruned = pool.add(PoolTask(
-                    task_name=task_name,
-                    task_root=task_root,
-                    creation_block=creation_block,
-                    cursor_elapsed=baseline_elapsed,
-                    king_lines=king_compare.matched_changed_lines,
-                    king_similarity=king_compare.similarity_ratio,
-                    baseline_lines=king_compare.total_changed_lines_b,
-                    agent_timeout_seconds=agent_timeout,
-                    king_hotkey=current_king.hotkey,
-                    king_commit_sha=current_king.commit_sha,
-                ), keep=config.validate_task_pool_target, prune_first=prune_first)
+                pruned = pool.add(
+                    PoolTask(
+                        task_name=task_name,
+                        task_root=task_root,
+                        creation_block=creation_block,
+                        cursor_elapsed=baseline_elapsed,
+                        king_lines=king_compare.matched_changed_lines,
+                        king_similarity=king_compare.similarity_ratio,
+                        baseline_lines=king_compare.total_changed_lines_b,
+                        agent_timeout_seconds=agent_timeout,
+                        king_hotkey=current_king.hotkey,
+                        king_commit_sha=current_king.commit_sha,
+                    ),
+                    keep=config.validate_task_pool_target,
+                    prune_first=prune_first,
+                    preserve=_active_duel_task_names(state),
+                )
                 still_needs_fill, _ = _pool_needs_fill_for_king(
                     config=config,
                     pool=pool,
@@ -3159,7 +3165,7 @@ def _gather_pool_tasks(
     # `timeout` (typically 1h). Cap the bonus wait time after we already
     # have min_tasks to a small multiple of starve_grace so we still try to
     # collect more tasks but never block the validator for an entire hour.
-    max_gather_time = starve_grace * 4  # 20 min total when starve_grace=300s
+    max_gather_time = starve_grace * 8  # 40 min total when starve_grace=300s
     last_progress = started
     while len(tasks) < n:
         if cancel_event is not None and cancel_event.is_set():
@@ -4294,6 +4300,32 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         duel_pool = retest_pool if is_manual_retest else pool
                         duel_pool_starved = retest_pool_starved if is_manual_retest else pool_starved
                         duel_task_set_phase = "confirmation_retest" if is_manual_retest else "primary"
+                        duel_pool_label = "retest" if is_manual_retest else "primary"
+                        pool_ready, pool_gate_reason = _static_pool_ready_for_king(
+                            config=config,
+                            pool=duel_pool,
+                            king=state.current_king,
+                            pool_label=duel_pool_label,
+                        )
+                        if duel_id is None and not pool_ready:
+                            state.queue.insert(0, challenger)
+                            if duel_pool_starved is not None:
+                                duel_pool_starved.set()
+                            now = time.monotonic()
+                            if now - last_pool_gate_log_at >= 30.0:
+                                log.info(
+                                    "Pool gate: delaying challenger uid=%s until %s pool is ready for king %s (%s)",
+                                    challenger.uid,
+                                    duel_pool_label,
+                                    state.current_king.agent_ref if state.current_king else None,
+                                    pool_gate_reason,
+                                )
+                                last_pool_gate_log_at = now
+                            try:
+                                _save_state(paths.state_path, state)
+                            except Exception:
+                                log.exception("Pool-gated queue restore save failed (non-fatal)")
+                            break
                         if duel_id is None:
                             duel_id = state.next_duel_index
                             state.next_duel_index += 1
