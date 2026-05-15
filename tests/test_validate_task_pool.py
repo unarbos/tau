@@ -1447,7 +1447,7 @@ class TaskPoolTest(unittest.TestCase):
         self.assertIn("gathered only 5/50 tasks", str(ctx.exception))
         validate._raise_if_insufficient_duel_tasks(4190, 50, [object()] * 50)
 
-    def test_parallel_duel_scores_full_task_set_when_king_mathematically_safe(self):
+    def test_parallel_duel_stops_unstarted_rounds_when_king_mathematically_safe(self):
         with tempfile.TemporaryDirectory() as td:
             pool = TaskPool(Path(td) / "pool")
             for idx in range(8):
@@ -1520,9 +1520,9 @@ class TaskPoolTest(unittest.TestCase):
                 )
 
         self.assertFalse(result.king_replaced)
-        self.assertEqual(result.losses, 8)
-        self.assertEqual(len(result.rounds), 8)
-        self.assertEqual(solve_round.call_count, 8)
+        self.assertEqual(result.losses, 3)
+        self.assertEqual(len(result.rounds), 3)
+        self.assertEqual(solve_round.call_count, 3)
 
     def test_refresh_budget_allows_bounded_hourly_batch(self):
         config = RunConfig(

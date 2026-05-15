@@ -13,7 +13,7 @@ import subprocess
 import textwrap
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as _FuturesTimeoutError, wait as _futures_wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as _futures_wait
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -289,6 +289,24 @@ def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
     return wins > losses + margin
 
 
+def _challenger_is_unbeatable(wins: int, losses: int, remaining_rounds: int, margin: int) -> bool:
+    """Return True if the challenger wins even when every unresolved round goes to king."""
+    return _challenger_wins(wins, losses + max(0, remaining_rounds), margin)
+
+
+def _challenger_cannot_catch(wins: int, losses: int, remaining_rounds: int, margin: int) -> bool:
+    """Return True if the challenger loses even when every unresolved round goes to challenger."""
+    return not _challenger_wins(wins + max(0, remaining_rounds), losses, margin)
+
+
+def _duel_math_stop_reason(wins: int, losses: int, remaining_rounds: int, margin: int) -> str | None:
+    if _challenger_is_unbeatable(wins, losses, remaining_rounds, margin):
+        return "challenger is unbeatable"
+    if _challenger_cannot_catch(wins, losses, remaining_rounds, margin):
+        return "challenger cannot catch king"
+    return None
+
+
 def _copy_detection_reason(rounds: Sequence["ValidationRoundResult"]) -> str | None:
     scored_sim = [r.king_challenger_similarity for r in rounds if r.scored and r.king_challenger_similarity > 0]
     if not scored_sim:
@@ -428,6 +446,7 @@ class ValidatorSubmission:
     manual_retest_of_duel_id: int | None = None
     display_repo_full_name: str | None = None
     display_commit_sha: str | None = None
+    accepted_at: str | None = None
 
     @property
     def agent_ref(self) -> str:
@@ -467,6 +486,7 @@ class ValidatorSubmission:
                 if payload.get("display_commit_sha") is not None
                 else None
             ),
+            accepted_at=str(payload["accepted_at"]) if payload.get("accepted_at") is not None else None,
         )
 
 
@@ -872,6 +892,87 @@ def _queue_submission_front_once(state: ValidatorState, submission: ValidatorSub
     return True
 
 
+def _submission_queue_sort_key(submission: ValidatorSubmission) -> tuple[Any, ...]:
+    retest_priority = 0 if submission.manual_retest_of_duel_id is not None else 1
+    if submission.accepted_at:
+        queue_order = (0, str(submission.accepted_at))
+    else:
+        queue_order = (1, int(submission.commitment_block))
+    return (
+        retest_priority,
+        *queue_order,
+        int(submission.commitment_block),
+        int(submission.uid),
+        submission.hotkey,
+    )
+
+
+def _sorted_submission_queue(submissions: Sequence[ValidatorSubmission]) -> list[ValidatorSubmission]:
+    return sorted(submissions, key=_submission_queue_sort_key)
+
+
+def _queue_submission_once_sorted(state: ValidatorState, submission: ValidatorSubmission) -> bool:
+    for index, existing in enumerate(state.queue):
+        if not _same_submission(existing, submission):
+            continue
+        updated = _merge_submission_queue_metadata(existing, submission)
+        if updated == existing:
+            state.queue = _sorted_submission_queue(state.queue)
+            return False
+        state.queue[index] = updated
+        state.queue = _sorted_submission_queue(state.queue)
+        return True
+    state.queue = _sorted_submission_queue([*state.queue, submission])
+    return True
+
+
+def _merge_submission_queue_metadata(
+    existing: ValidatorSubmission,
+    incoming: ValidatorSubmission,
+) -> ValidatorSubmission:
+    if existing.accepted_at or not incoming.accepted_at:
+        return existing
+    return replace(existing, accepted_at=incoming.accepted_at)
+
+
+def _private_submission_acceptance_times_by_commitment(config: RunConfig) -> dict[str, str]:
+    root = _private_submission_root(config)
+    if root is None:
+        return {}
+    return {
+        f"private-submission:{entry['submission_id']}:{entry['agent_sha256']}": str(entry["accepted_at"])
+        for entry in accepted_private_submission_entries(root=root)
+        if entry.get("submission_id") and entry.get("agent_sha256") and entry.get("accepted_at")
+    }
+
+
+def _submission_acceptance_times_by_commitment(
+    submissions: Sequence[ValidatorSubmission],
+) -> dict[str, str]:
+    return {
+        submission.commitment: str(submission.accepted_at)
+        for submission in submissions
+        if submission.accepted_at
+    }
+
+
+def _hydrate_queue_submission_metadata(
+    queue: Sequence[ValidatorSubmission],
+    incoming: Sequence[ValidatorSubmission],
+    accepted_at_by_commitment: dict[str, str] | None = None,
+) -> list[ValidatorSubmission]:
+    acceptance_times = {
+        **(accepted_at_by_commitment or {}),
+        **_submission_acceptance_times_by_commitment(incoming),
+    }
+    return [
+        replace(submission, accepted_at=acceptance_times[submission.commitment])
+        if not submission.accepted_at and submission.commitment in acceptance_times
+        else submission
+        for submission in queue
+    ]
+
+
 def _pop_resumable_active_challenger(
     state: ValidatorState,
     *,
@@ -1076,9 +1177,9 @@ def _recover_active_duel_after_restart(
         state.active_duel = None
         return True
 
-    requeued = _queue_submission_front_once(state, lease.challenger)
+    requeued = _queue_submission_once_sorted(state, lease.challenger)
     log.warning(
-        "Recovered interrupted duel %s: %s challenger uid=%s (%s) at front; scored checkpoint=%d round(s)",
+        "Recovered interrupted duel %s: %s challenger uid=%s (%s) in FIFO queue; scored checkpoint=%d round(s)",
         lease.duel_id,
         "requeued" if requeued else "kept existing queued",
         lease.challenger.uid,
@@ -2858,250 +2959,6 @@ def _solution_has_patch(*, task_name: str, solution_name: str, config: RunConfig
 
 
 # ---------------------------------------------------------------------------
-# Duel runner (runs independently per challenger)
-# ---------------------------------------------------------------------------
-
-def _run_duel(
-    *,
-    config: RunConfig,
-    state: ValidatorState,
-    king: ValidatorSubmission,
-    challenger: ValidatorSubmission,
-    duel_id: int,
-    pool: TaskPool,
-    cancel_event: threading.Event,
-    on_round_complete: Any = None,
-    pool_starved: threading.Event | None = None,
-) -> DuelResult:
-    margin = config.validate_win_margin
-    started_at = _timestamp()
-    rounds: list[ValidationRoundResult] = []
-    wins = losses = ties = scored = 0
-    used_tasks: set[str] = set()
-    duel_start_mono = time.monotonic()
-    max_total_rounds = config.validate_duel_rounds * 3
-    _POOL_WAIT_TIMEOUT = 300
-    _MAX_POOL_TIMEOUTS = 3
-    consecutive_pool_timeouts = 0
-
-    log.info("Duel %d: king uid=%s vs challenger uid=%s (%s), %d rounds, "
-             "challenger must beat king by >%d decisive round(s), ties ignored",
-             duel_id, king.uid, challenger.uid, challenger.repo_full_name,
-             config.validate_duel_rounds, margin)
-
-    while scored < config.validate_duel_rounds and not cancel_event.is_set():
-        duel_elapsed = time.monotonic() - duel_start_mono
-        if duel_elapsed >= config.validate_duel_timeout_seconds:
-            log.warning("Duel %d: wall-clock timeout after %.0fs (scored %d/%d)",
-                        duel_id, duel_elapsed, scored, config.validate_duel_rounds)
-            break
-
-        if len(rounds) >= max_total_rounds:
-            log.warning("Duel %d: exceeded max total rounds %d (scored %d/%d, errors %d)",
-                        duel_id, max_total_rounds, scored, config.validate_duel_rounds,
-                        len(rounds) - scored)
-            break
-
-        task = pool.take(min_block=challenger.commitment_block, exclude=used_tasks)
-        if task is None:
-            if pool_starved is not None:
-                pool_starved.set()
-            pool_wait_start = time.monotonic()
-            while task is None and not cancel_event.is_set():
-                waited = time.monotonic() - pool_wait_start
-                if waited >= _POOL_WAIT_TIMEOUT:
-                    log.warning("Duel %d: pool wait timeout after %.0fs (no unused pool task available)",
-                                duel_id, waited)
-                    break
-                if time.monotonic() - duel_start_mono >= config.validate_duel_timeout_seconds:
-                    break
-                cancel_event.wait(3)
-                task = pool.take(min_block=challenger.commitment_block, exclude=used_tasks)
-            if task is None:
-                consecutive_pool_timeouts += 1
-                if consecutive_pool_timeouts >= _MAX_POOL_TIMEOUTS:
-                    log.warning("Duel %d: aborting after %d consecutive pool timeouts (scored %d/%d)",
-                                duel_id, consecutive_pool_timeouts, scored, config.validate_duel_rounds)
-                    break
-                continue
-        consecutive_pool_timeouts = 0
-        used_tasks.add(task.task_name)
-
-        solution_label = f"challenger-{challenger.uid}-d{duel_id}"
-
-        try:
-            agent_timeout = _duel_agent_timeout(task)
-            king_exit_reason, _ = _cached_solution_summary(
-                task_name=task.task_name,
-                solution_name="king",
-                config=config,
-            ) or (None, None)
-            challenger_cfg = replace(_build_agent_config(config, challenger), agent_timeout=agent_timeout)
-            solve_result = solve_task_run(task_name=task.task_name, solution_name=solution_label, config=challenger_cfg)
-            chall_timed_out = solve_result.exit_reason == "time_limit_exceeded"
-            chall_has_patch = _solution_has_patch(
-                task_name=task.task_name,
-                solution_name=solution_label,
-                config=config,
-            )
-
-            if chall_timed_out:
-                log.info(
-                    "Duel %d: challenger uid=%s timed out on %s (partial_patch=%s)",
-                    duel_id,
-                    challenger.uid,
-                    task.task_name,
-                    chall_has_patch,
-                )
-
-            with ThreadPoolExecutor(max_workers=2) as cmp_exec:
-                chall_fut = cmp_exec.submit(
-                    compare_task_run, task_name=task.task_name,
-                    solution_names=[solution_label, "baseline"], config=config,
-                )
-                kc_fut = cmp_exec.submit(
-                    compare_task_run, task_name=task.task_name,
-                    solution_names=["king", solution_label], config=config,
-                )
-                chall_compare = chall_fut.result()
-                kc_compare = kc_fut.result()
-
-            zero_challenger = chall_timed_out and not chall_has_patch
-            c_lines = 0 if zero_challenger else chall_compare.matched_changed_lines
-            k_lines = task.king_lines
-            challenger_similarity = 0.0 if zero_challenger else chall_compare.similarity_ratio
-            diff_judge = _judge_round_diffs(
-                task_name=task.task_name,
-                challenger_solution_name=solution_label,
-                config=config,
-            )
-            king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
-            challenger_score = _combined_round_score(challenger_similarity, diff_judge.challenger_score)
-
-            winner = _round_winner_from_scores(king_score, challenger_score)
-
-            result = ValidationRoundResult(
-                task_name=task.task_name, winner=winner,
-                king_lines=k_lines, challenger_lines=c_lines,
-                king_similarity_ratio=task.king_similarity,
-                challenger_similarity_ratio=challenger_similarity,
-                king_challenger_similarity=kc_compare.similarity_ratio,
-                task_root=task.task_root,
-                king_compare_root="", challenger_compare_root=chall_compare.comparison_root,
-                baseline_lines=task.baseline_lines,
-                king_score=king_score,
-                challenger_score=challenger_score,
-                king_llm_score=diff_judge.king_score,
-                challenger_llm_score=diff_judge.challenger_score,
-                llm_judge_winner=diff_judge.winner,
-                llm_judge_model=diff_judge.model,
-                llm_judge_rationale=diff_judge.rationale,
-                llm_judge_error=diff_judge.error,
-                king_exit_reason=king_exit_reason,
-                king_agent_timeout_seconds=agent_timeout,
-                challenger_exit_reason=getattr(solve_result, "exit_reason", None),
-                challenger_agent_timeout_seconds=agent_timeout,
-            )
-
-            try:
-                publish_round_data(
-                    duel_id=duel_id, task_name=task.task_name,
-                    tasks_root=config.tasks_root,
-                    solution_labels={"baseline": "baseline", "king": "king", "challenger": solution_label},
-                )
-            except Exception:
-                log.exception("R2 round publish failed (non-fatal)")
-
-        except Exception as exc:
-            result = ValidationRoundResult(
-                task_name=task.task_name, winner="error",
-                king_lines=0, challenger_lines=0,
-                king_similarity_ratio=0.0, challenger_similarity_ratio=0.0,
-                king_challenger_similarity=0.0,
-                task_root=task.task_root, king_compare_root="", challenger_compare_root="",
-                error=f"duel {duel_id} task {task.task_name} failed: {exc}",
-            )
-
-        _discard_solution_repo(
-            task_name=task.task_name,
-            solution_name=solution_label,
-            config=config,
-        )
-        rounds.append(result)
-        if result.scored:
-            if result.winner == "challenger":
-                wins += 1
-                scored += 1
-            elif result.winner == "king":
-                losses += 1
-                scored += 1
-            else:
-                ties += 1
-
-            decisive = wins + losses
-            log.info(
-                "Duel %d round=%d: %s (score K=%.3f C=%.3f, llm=%s, W=%d L=%d T=%d, decisive=%d)",
-                duel_id, len(rounds), result.winner,
-                result.king_score, result.challenger_score, result.llm_judge_winner,
-                wins, losses, ties, decisive,
-            )
-
-            remaining = config.validate_duel_rounds - scored
-            if _challenger_wins(wins, losses + remaining, margin):
-                log.info(
-                    "Duel %d: challenger uid=%s is unbeatable (%dW/%dL, %d decisive round(s) remaining)",
-                    duel_id,
-                    challenger.uid,
-                    wins,
-                    losses,
-                    remaining,
-                )
-                break
-            if not _challenger_wins(wins + remaining, losses, margin):
-                log.info(
-                    "Duel %d: challenger uid=%s cannot catch king (%dW/%dL, %d decisive round(s) remaining)",
-                    duel_id,
-                    challenger.uid,
-                    wins,
-                    losses,
-                    remaining,
-                )
-                break
-
-            if on_round_complete is not None:
-                try:
-                    dyn_threshold = losses + margin + 1
-                    on_round_complete(duel_id=duel_id, wins=wins, losses=losses, ties=ties,
-                                      scored=scored, threshold=dyn_threshold, rounds=rounds)
-                except Exception:
-                    log.exception("on_round_complete callback failed (non-fatal)")
-
-    # Determine outcome
-    king_replaced = False
-    dq_reason: str | None = None
-    king_after = king
-    decisive = wins + losses
-
-    log.info("Duel %d final: W=%d L=%d T=%d (decisive=%d, challenger_wins=%s)",
-             duel_id, wins, losses, ties, decisive, _challenger_wins(wins, losses, margin))
-
-    if _challenger_wins(wins, losses, margin):
-        dq_reason = _copy_detection_reason(rounds)
-        if dq_reason is not None:
-            log.warning("Duel %d: %s", duel_id, dq_reason)
-        else:
-            king_replaced = True
-
-    return DuelResult(
-        duel_id=duel_id, started_at=started_at, finished_at=_timestamp(),
-        king_before=king, challenger=challenger, rounds=rounds,
-        wins=wins, losses=losses, ties=ties,
-        king_after=king_after, king_replaced=king_replaced,
-        disqualification_reason=dq_reason,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Parallel duel runner (all rounds run concurrently)
 # ---------------------------------------------------------------------------
 
@@ -3508,6 +3365,7 @@ def _run_parallel_duel(
     timed_out_clean_shutdown = True
     interrupted_by_shutdown = False
     partial_shutdown_interrupt = False
+    math_stop_reason: str | None = None
 
     def _emit_progress() -> None:
         if on_round_complete is None:
@@ -3539,7 +3397,6 @@ def _run_parallel_duel(
         shutdown_deadline: float | None = None
 
         def _submit_available() -> None:
-            nonlocal stop_submitting_reason
             while task_queue and len(pending) < concurrency and stop_submitting_reason is None:
                 task = task_queue.pop(0)
                 future = executor.submit(
@@ -3568,6 +3425,37 @@ def _run_parallel_duel(
                 skipped,
             )
 
+        def _stop_for_math_if_decided() -> bool:
+            nonlocal math_stop_reason
+            if stop_submitting_reason is not None:
+                return False
+            remaining = len(pending) + len(task_queue)
+            if remaining <= 0:
+                return False
+            wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
+            losses = sum(1 for r in rounds if r.scored and r.winner == "king")
+            ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
+            reason = _duel_math_stop_reason(wins, losses, remaining, margin)
+            if reason is None:
+                return False
+            in_flight = len(pending)
+            unstarted = len(task_queue)
+            math_stop_reason = reason
+            log.info(
+                "Duel %d: %s for challenger uid=%s (%dW/%dL/%dT, %d unresolved: %d in-flight, %d unstarted)",
+                duel_id,
+                reason,
+                challenger.uid,
+                wins,
+                losses,
+                ties,
+                remaining,
+                in_flight,
+                unstarted,
+            )
+            _stop_submitting(reason)
+            return True
+
         if rounds:
             log.info(
                 "Duel %d: restored %d checkpoint round(s); %d selected task(s) remain",
@@ -3576,7 +3464,8 @@ def _run_parallel_duel(
                 len(task_queue),
             )
             _emit_progress()
-        _submit_available()
+        if not _stop_for_math_if_decided():
+            _submit_available()
         while pending:
             now = time.monotonic()
             if cancel_event is not None and cancel_event.is_set():
@@ -3714,7 +3603,8 @@ def _run_parallel_duel(
                     timeout_streak = 0
 
                 _emit_progress()
-            _submit_available()
+            if not _stop_for_math_if_decided():
+                _submit_available()
             last_heartbeat_at = time.monotonic()
     finally:
         # On the happy path all rounds finished, so wait=True is fine and
@@ -3728,7 +3618,17 @@ def _run_parallel_duel(
         raise RuntimeError("duel interrupted by validator shutdown before all rounds were started")
 
     solve_elapsed = time.monotonic() - solve_start
-    log.info("Duel %d: all %d rounds completed in %.1fs", duel_id, len(rounds), solve_elapsed)
+    if math_stop_reason:
+        log.info(
+            "Duel %d: mathematically stopped after %d/%d selected round(s) in %.1fs (%s)",
+            duel_id,
+            len(rounds),
+            len(tasks),
+            solve_elapsed,
+            math_stop_reason,
+        )
+    else:
+        log.info("Duel %d: all %d rounds completed in %.1fs", duel_id, len(rounds), solve_elapsed)
 
     # Phase 4: score
     wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
@@ -3917,6 +3817,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             last_refresh_block=last_submission_refresh_block,
             interval_blocks=config.validate_weight_interval_blocks,
         ):
+            queue_before = [submission.to_dict() for submission in state.queue]
             chain_submissions = _fetch_private_api_submissions(
                 subtensor=subtensor,
                 config=config,
@@ -3932,6 +3833,22 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             added = len(state.queue) - before
             if added:
                 log.info("Queue refresh added %d candidate(s); queue=%d", added, len(state.queue))
+            if [submission.to_dict() for submission in state.queue] != queue_before:
+                try:
+                    _save_state(paths.state_path, state)
+                except Exception:
+                    log.exception("Queue refresh state save failed (non-fatal)")
+                try:
+                    _publish_dashboard(
+                        state,
+                        dashboard_history,
+                        config,
+                        validator_started_at,
+                        active_duel_info,
+                        chain_data,
+                    )
+                except Exception:
+                    log.exception("Queue refresh dashboard publish failed (non-fatal)")
         return current_block
 
     pool_filler_executor = ThreadPoolExecutor(
@@ -4212,7 +4129,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             pool_label=duel_pool_label,
                         )
                         if duel_id is None and not pool_ready:
-                            state.queue.insert(0, challenger)
+                            _queue_submission_once_sorted(state, challenger)
                             if duel_pool_starved is not None:
                                 duel_pool_starved.set()
                             now = time.monotonic()
@@ -4426,7 +4343,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             log.exception("Parallel duel %d raised; requeueing challenger for retry", duel_id)
                             duel_count += 1
                             active_duel_info = None
-                            _queue_submission_front_once(state, challenger)
+                            _queue_submission_once_sorted(state, challenger)
                             _clear_active_duel(state, duel_id)
                             _save_state(paths.state_path, state)
                             if shutdown_requested.is_set():
@@ -4915,6 +4832,7 @@ def _publish_dashboard(
                 "repo": s.repo_full_name,
                 "hotkey": s.hotkey,
                 "commitment_block": s.commitment_block,
+                "accepted_at": s.accepted_at,
                 "source": s.source,
             }
             for s in state.queue
@@ -5845,6 +5763,11 @@ def _refresh_queue(
     subtensor=None,
 ) -> None:
     spent_since_block = _hotkey_spent_since_block(config)
+    state.queue = _hydrate_queue_submission_metadata(
+        state.queue,
+        chain_submissions,
+        accepted_at_by_commitment=_private_submission_acceptance_times_by_commitment(config),
+    )
     known: set[str] = set()
     tracked_hotkeys = _tracked_hotkeys(state)
     registration_block_cache: dict[str, int | None] = {}
@@ -5906,14 +5829,7 @@ def _refresh_queue(
         known.add(sub.hotkey)
         if sub.agent_ref:
             known_agents.add(sub.agent_ref)
-    state.queue.sort(
-        key=lambda s: (
-            s.manual_retest_of_duel_id is None,
-            s.commitment_block,
-            s.uid,
-            s.hotkey,
-        )
-    )
+    state.queue = _sorted_submission_queue(state.queue)
 
 
 def _normalize_revealed_commitment_entries(entries: Any) -> list[tuple[int, str]]:
@@ -6096,8 +6012,7 @@ def _fetch_private_api_submissions(*, subtensor, config: RunConfig, state: Valid
         for submission in [_private_api_submission_from_entry(subtensor=subtensor, config=config, state=state, entry=entry)]
         if submission is not None
     ]
-    submissions.sort(key=lambda s: (s.commitment_block, s.uid, s.hotkey))
-    return submissions
+    return _sorted_submission_queue(submissions)
 
 
 def _private_api_submission_from_entry(
@@ -6110,6 +6025,7 @@ def _private_api_submission_from_entry(
     hotkey = str(entry.get("hotkey") or "")
     submission_id = str(entry.get("submission_id") or "")
     sha256 = str(entry.get("agent_sha256") or "").lower()
+    accepted_at = str(entry.get("accepted_at") or "") or None
     accepted_registration_block = _coerce_int(entry.get("registration_block"))
     if not hotkey or not submission_id or not sha256 or accepted_registration_block is None:
         return None
@@ -6161,6 +6077,7 @@ def _private_api_submission_from_entry(
         commitment=commitment,
         commitment_block=int(accepted_registration_block),
         source=_PRIVATE_SUBMISSION_SOURCE,
+        accepted_at=accepted_at,
     )
 
 

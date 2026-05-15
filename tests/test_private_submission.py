@@ -473,6 +473,92 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
 
         self.assertEqual([item.commitment for item in state.queue], [submission.commitment])
 
+    def test_private_api_queue_is_fifo_by_acceptance_time(self):
+        older = ValidatorSubmission(
+            hotkey="5OlderPrivateSubmissionHotkey",
+            uid=22,
+            repo_full_name="private-submission/older",
+            repo_url="private-submission://older",
+            commit_sha="a" * 64,
+            commitment=f"private-submission:older:{'a' * 64}",
+            commitment_block=900,
+            source="private",
+            accepted_at="2026-05-15T01:00:00+00:00",
+        )
+        newer = ValidatorSubmission(
+            hotkey="5NewerPrivateSubmissionHotkey",
+            uid=11,
+            repo_full_name="private-submission/newer",
+            repo_url="private-submission://newer",
+            commit_sha="b" * 64,
+            commitment=f"private-submission:newer:{'b' * 64}",
+            commitment_block=100,
+            source="private",
+            accepted_at="2026-05-15T02:00:00+00:00",
+        )
+        config = RunConfig(validate_hotkey_spent_since_block=None)
+        state = ValidatorState()
+
+        _refresh_queue(chain_submissions=[newer, older], config=config, state=state, subtensor=None)
+
+        self.assertEqual([item.hotkey for item in state.queue], [older.hotkey, newer.hotkey])
+
+    def test_existing_private_queue_is_repaired_to_fifo_when_acceptance_time_arrives(self):
+        older = ValidatorSubmission(
+            hotkey="5OlderPrivateSubmissionHotkey",
+            uid=22,
+            repo_full_name="private-submission/older",
+            repo_url="private-submission://older",
+            commit_sha="a" * 64,
+            commitment=f"private-submission:older:{'a' * 64}",
+            commitment_block=900,
+            source="private",
+            accepted_at="2026-05-15T01:00:00+00:00",
+        )
+        newer = ValidatorSubmission(
+            hotkey="5NewerPrivateSubmissionHotkey",
+            uid=11,
+            repo_full_name="private-submission/newer",
+            repo_url="private-submission://newer",
+            commit_sha="b" * 64,
+            commitment=f"private-submission:newer:{'b' * 64}",
+            commitment_block=100,
+            source="private",
+            accepted_at="2026-05-15T02:00:00+00:00",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "_accepted_submissions.json").write_text(json.dumps({
+                "version": 1,
+                "hotkeys": {
+                    older.hotkey: {
+                        "registration_block": older.commitment_block,
+                        "submission_id": "older",
+                        "agent_sha256": older.commit_sha,
+                        "accepted_at": older.accepted_at,
+                    },
+                    newer.hotkey: {
+                        "registration_block": newer.commitment_block,
+                        "submission_id": "newer",
+                        "agent_sha256": newer.commit_sha,
+                        "accepted_at": newer.accepted_at,
+                    },
+                },
+            }))
+            config = RunConfig(
+                validate_hotkey_spent_since_block=None,
+                validate_private_submission_root=root,
+            )
+            state = ValidatorState(queue=[
+                ValidatorSubmission.from_dict({**newer.to_dict(), "accepted_at": None}),
+                ValidatorSubmission.from_dict({**older.to_dict(), "accepted_at": None}),
+            ])
+
+            _refresh_queue(chain_submissions=[], config=config, state=state, subtensor=None)
+
+        self.assertEqual([item.hotkey for item in state.queue], [older.hotkey, newer.hotkey])
+        self.assertEqual([item.accepted_at for item in state.queue], [older.accepted_at, newer.accepted_at])
+
     def test_published_private_submission_is_no_longer_runtime_private(self):
         submission = ValidatorSubmission(
             hotkey=HOTKEY,
