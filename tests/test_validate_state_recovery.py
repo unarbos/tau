@@ -215,6 +215,142 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual(recent[1]["uid"], 2)
         self.assertEqual(recent[1]["king_since"], "2026-05-10T18:10:00+00:00")
 
+    def test_dashboard_uses_private_submission_repo_label(self):
+        private = ValidatorSubmission(
+            hotkey="5PrivateHotkey",
+            uid=7,
+            repo_full_name="private-submission/5PrivateHotkey-deadbeef",
+            repo_url="private-submission://5PrivateHotkey-deadbeef",
+            commit_sha="d" * 64,
+            commitment="private-submission:5PrivateHotkey-deadbeef:" + "d" * 64,
+            commitment_block=123,
+            source="private",
+        )
+        state = ValidatorState(
+            current_king=private,
+            queue=[private],
+            active_duel=ActiveDuelLease(
+                duel_id=10,
+                started_at="2026-05-10T18:00:00+00:00",
+                king=private,
+                challenger=private,
+                task_names=["validate-000001"],
+            ),
+            retired_hotkeys=[private.hotkey],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("validate.publish_dashboard_data", return_value=True):
+            config = RunConfig(workspace_root=Path(tmp), validate_netuid=66)
+            _publish_dashboard(
+                state,
+                [],
+                config,
+                "2026-05-10T18:00:00+00:00",
+            )
+            payload = json.loads((config.validate_root / "dashboard_data.json").read_text())
+
+        self.assertEqual(payload["current_king"]["repo_full_name"], "private-submission")
+        self.assertIsNone(payload["current_king"]["repo_url"])
+        self.assertEqual(payload["current_king"]["runtime_repo_full_name"], "private-submission")
+        self.assertIsNone(payload["current_king"]["runtime_repo_url"])
+        self.assertEqual(payload["status"]["queue"][0]["repo"], private.hotkey)
+        self.assertEqual(payload["status"]["active_duel"]["king_repo"], private.hotkey)
+        self.assertIsNone(payload["status"]["active_duel"]["king_repo_url"])
+        self.assertEqual(payload["status"]["active_duel"]["challenger_repo"], private.hotkey)
+        self.assertIsNone(payload["status"]["active_duel"]["challenger_repo_url"])
+        self.assertEqual(payload["status"]["retired"][0]["repo"], "private-submission")
+
+    def test_dashboard_recomputes_current_king_defenses_from_history_hotkey(self):
+        current = _submission(
+            hotkey="5CurrentKing",
+            uid=3,
+            commitment="unarbos/ninja@" + "c" * 40,
+            block=103,
+        )
+        other = _submission(
+            hotkey="5OtherKing",
+            uid=4,
+            commitment="unarbos/ninja@" + "d" * 40,
+            block=104,
+        )
+        history = [
+            {
+                "duel_id": 1,
+                "king_hotkey": other.hotkey,
+                "challenger_hotkey": current.hotkey,
+                "king_replaced": True,
+            },
+            {
+                "duel_id": 2,
+                "king_hotkey": current.hotkey,
+                "challenger_hotkey": "5LoserA",
+                "king_replaced": False,
+            },
+            {
+                "duel_id": 3,
+                "king_hotkey": current.hotkey,
+                "challenger_hotkey": "5Retest",
+                "king_replaced": False,
+                "task_set_phase": "confirmation_retest",
+                "confirmation_of_duel_id": 2,
+            },
+            {
+                "duel_id": 4,
+                "king_hotkey": other.hotkey,
+                "challenger_hotkey": "5LoserB",
+                "king_replaced": False,
+            },
+            {
+                "duel_id": 5,
+                "king_hotkey": current.hotkey,
+                "challenger_hotkey": "5LoserC",
+                "king_replaced": False,
+            },
+        ]
+        state = ValidatorState(current_king=current, king_duels_defended=99)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("validate.publish_dashboard_data", return_value=True):
+            config = RunConfig(workspace_root=Path(tmp), validate_netuid=66)
+            _publish_dashboard(
+                state,
+                history,
+                config,
+                "2026-05-10T18:00:00+00:00",
+            )
+            payload = json.loads((config.validate_root / "dashboard_data.json").read_text())
+
+        self.assertEqual(payload["status"]["king_duels_defended"], 2)
+
+    def test_dashboard_private_published_king_repo_label_stays_private_submission(self):
+        king = ValidatorSubmission(
+            hotkey="5PrivatePublished",
+            uid=163,
+            repo_full_name="unarbos/ninja",
+            repo_url="https://github.com/unarbos/ninja.git",
+            commit_sha="5" * 40,
+            commitment="private-submission:5PrivatePublished-deadbeef:" + "d" * 64,
+            commitment_block=123,
+            source="private_published",
+            display_repo_full_name="unarbos/ninja",
+            display_commit_sha="5" * 40,
+        )
+        state = ValidatorState(current_king=king, recent_kings=[king])
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("validate.publish_dashboard_data", return_value=True):
+            config = RunConfig(workspace_root=Path(tmp), validate_netuid=66)
+            _publish_dashboard(
+                state,
+                [],
+                config,
+                "2026-05-10T18:00:00+00:00",
+            )
+            payload = json.loads((config.validate_root / "dashboard_data.json").read_text())
+
+        self.assertEqual(payload["current_king"]["repo_full_name"], "private-submission")
+        self.assertEqual(payload["current_king"]["runtime_repo_full_name"], "unarbos/ninja")
+        self.assertEqual(payload["status"]["recent_kings"][0]["repo_full_name"], "private-submission")
+        self.assertEqual(payload["status"]["recent_kings"][0]["runtime_repo_full_name"], "unarbos/ninja")
+
     def test_reconcile_advances_duel_id_and_removes_completed_queue_entry(self):
         completed = _submission(
             hotkey="5CompletedHotkey",

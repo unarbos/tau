@@ -1010,7 +1010,6 @@ def _active_duel_dashboard_info_from_state(
     if lease is None:
         return None
 
-    king_dashboard = _dashboard_submission_dict(lease.king, history=history)
     wins = sum(1 for r in lease.rounds if r.scored and r.winner == "challenger")
     losses = sum(1 for r in lease.rounds if r.scored and r.winner == "king")
     ties = sum(1 for r in lease.rounds if r.scored and r.winner == "tie")
@@ -1019,13 +1018,13 @@ def _active_duel_dashboard_info_from_state(
         "duel_id": lease.duel_id,
         "king_uid": lease.king.uid,
         "king_hotkey": lease.king.hotkey,
-        "king_repo": king_dashboard["repo_full_name"],
-        "king_repo_url": king_dashboard.get("repo_url"),
-        "king_runtime_repo": lease.king.repo_full_name,
+        "king_repo": lease.king.hotkey,
+        "king_repo_url": None,
+        "king_runtime_repo": _dashboard_display_repo_name(lease.king.repo_full_name),
         "challenger_uid": lease.challenger.uid,
         "challenger_hotkey": lease.challenger.hotkey,
-        "challenger_repo": lease.challenger.repo_full_name,
-        "challenger_repo_url": f"https://github.com/{lease.challenger.repo_full_name}",
+        "challenger_repo": lease.challenger.hotkey,
+        "challenger_repo_url": None,
         "threshold": losses + config.validate_win_margin + 1,
         "win_margin": config.validate_win_margin,
         "duel_rounds": config.validate_duel_rounds,
@@ -3512,35 +3511,15 @@ def _run_parallel_duel(
             done, pending = _futures_wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
             now = time.monotonic()
 
-            # Hard-deadline / stuck-progress check fires regardless of whether
-            # any future completed in this slice. Previously this was nested
-            # under `if not done`, so a duel where rounds slowly dribbled in
-            # could run forever past the deadline.
-            hard_timed_out = now >= duel_deadline
-            shutdown_timed_out = (
-                hard_timed_out
-                and cancel_event is not None
-                and cancel_event.is_set()
-                and shutdown_deadline is not None
-                and now >= shutdown_deadline
-            )
-            stuck = (now - last_progress_at) >= _PARALLEL_DUEL_PER_ROUND_TIMEOUT
-            if hard_timed_out or stuck:
-                if shutdown_timed_out:
-                    reason = "validator shutdown grace deadline"
-                else:
-                    reason = "hard duel deadline" if hard_timed_out else f"no round progress in {_PARALLEL_DUEL_PER_ROUND_TIMEOUT:.0f}s"
-                log.error(
-                    "Duel %d: %s with %d rounds still pending (%d done); cancelling and recording as errors",
-                    duel_id, reason, len(pending), len(rounds),
-                )
-                # Drain anything that completed in the final slice before
-                # cancelling so we don't lose work.
+            completed_this_slice = bool(done)
+            if done:
+                last_progress_at = now
                 for future in done:
                     try:
                         result = future.result()
                     except Exception as exc:
                         task = futures[future]
+                        log.exception("Duel %d: round %s raised", duel_id, task.task_name)
                         result = ValidationRoundResult(
                             task_name=task.task_name, winner="error",
                             king_lines=0, challenger_lines=0,
@@ -3552,6 +3531,38 @@ def _run_parallel_duel(
                             error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
                         )
                     rounds.append(result)
+                    if result.challenger_exit_reason == "time_limit_exceeded":
+                        timeout_streak += 1
+                        if timeout_limit > 0 and timeout_streak >= timeout_limit:
+                            _stop_submitting(f"{timeout_streak} consecutive challenger timeouts")
+                    else:
+                        timeout_streak = 0
+
+                    _emit_progress()
+
+            # Hard-deadline / stuck-progress check fires regardless of whether
+            # a future completed in this slice. Completed futures are handled
+            # first above so result-drain progress is preserved, but the hard
+            # deadline still stops new work from being submitted indefinitely.
+            hard_timed_out = now >= duel_deadline
+            shutdown_timed_out = (
+                hard_timed_out
+                and cancel_event is not None
+                and cancel_event.is_set()
+                and shutdown_deadline is not None
+                and now >= shutdown_deadline
+            )
+            stuck = (now - last_progress_at) >= _PARALLEL_DUEL_PER_ROUND_TIMEOUT
+            has_unresolved_work = bool(pending or task_queue)
+            if has_unresolved_work and (hard_timed_out or stuck):
+                if shutdown_timed_out:
+                    reason = "validator shutdown grace deadline"
+                else:
+                    reason = "hard duel deadline" if hard_timed_out else f"no round progress in {_PARALLEL_DUEL_PER_ROUND_TIMEOUT:.0f}s"
+                log.error(
+                    "Duel %d: %s with %d rounds still pending (%d done); cancelling and recording as errors",
+                    duel_id, reason, len(pending), len(rounds),
+                )
                 for fut in list(pending):
                     fut.cancel()
                     task = futures[fut]
@@ -3590,43 +3601,18 @@ def _run_parallel_duel(
                     log.exception("docker cleanup after duel timeout failed (non-fatal)")
                 break
 
-            if not done:
-                # No completion this slice; emit a heartbeat publish so the
-                # public dashboard stays fresh even when rounds are slow.
-                if (now - last_heartbeat_at) >= _DASHBOARD_HEARTBEAT_INTERVAL:
-                    _emit_progress()
-                    last_heartbeat_at = now
+            if completed_this_slice:
+                if not _stop_for_math_if_decided():
+                    _submit_available()
+                last_heartbeat_at = time.monotonic()
                 continue
 
-            last_progress_at = now
-            for future in done:
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    task = futures[future]
-                    log.exception("Duel %d: round %s raised", duel_id, task.task_name)
-                    result = ValidationRoundResult(
-                        task_name=task.task_name, winner="error",
-                        king_lines=0, challenger_lines=0,
-                        king_similarity_ratio=0.0,
-                        challenger_similarity_ratio=0.0,
-                        king_challenger_similarity=0.0,
-                        task_root=task.task_root, king_compare_root="",
-                        challenger_compare_root="",
-                        error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
-                    )
-                rounds.append(result)
-                if result.challenger_exit_reason == "time_limit_exceeded":
-                    timeout_streak += 1
-                    if timeout_limit > 0 and timeout_streak >= timeout_limit:
-                        _stop_submitting(f"{timeout_streak} consecutive challenger timeouts")
-                else:
-                    timeout_streak = 0
-
+            # No completion this slice; emit a heartbeat publish so the
+            # public dashboard stays fresh even when rounds are slow.
+            if (now - last_heartbeat_at) >= _DASHBOARD_HEARTBEAT_INTERVAL:
                 _emit_progress()
-            if not _stop_for_math_if_decided():
-                _submit_available()
-            last_heartbeat_at = time.monotonic()
+                last_heartbeat_at = now
+            continue
     finally:
         # On the happy path all rounds finished, so wait=True is fine and
         # cheap. On timeout, never wait -- hung threads would deadlock
@@ -4182,21 +4168,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("Pre-duel state save failed (non-fatal)")
 
-                        king_dashboard = _dashboard_submission_dict(
-                            state.current_king,
-                            history=dashboard_history,
-                        )
                         active_duel_info = {
                             "duel_id": duel_id,
                             "king_uid": state.current_king.uid,
                             "king_hotkey": state.current_king.hotkey,
-                            "king_repo": king_dashboard["repo_full_name"],
-                            "king_repo_url": king_dashboard.get("repo_url"),
-                                                "king_runtime_repo": state.current_king.repo_full_name,
+                            "king_repo": state.current_king.hotkey,
+                            "king_repo_url": None,
+                            "king_runtime_repo": _dashboard_display_repo_name(state.current_king.repo_full_name),
                             "challenger_uid": challenger.uid,
                             "challenger_hotkey": challenger.hotkey,
-                            "challenger_repo": challenger.repo_full_name,
-                            "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
+                            "challenger_repo": challenger.hotkey,
+                            "challenger_repo_url": None,
                             "threshold": config.validate_win_margin + 1,
                             "win_margin": config.validate_win_margin,
                             "duel_rounds": config.validate_duel_rounds,
@@ -4243,24 +4225,20 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         _save_state(paths.state_path, state)
                                 except Exception:
                                     log.exception("Active duel checkpoint save failed (non-fatal)")
-                                king_dashboard = _dashboard_submission_dict(
-                                    state.current_king,
-                                    history=dashboard_history,
-                                ) if state.current_king else None
                                 active_duel_info = {
                                     "duel_id": duel_id,
                                     "king_uid": state.current_king.uid if state.current_king else None,
                                     "king_hotkey": state.current_king.hotkey if state.current_king else None,
-                                    "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
-                                    "king_repo_url": king_dashboard.get("repo_url") if king_dashboard else None,
+                                    "king_repo": state.current_king.hotkey if state.current_king else None,
+                                    "king_repo_url": None,
                                     "king_runtime_repo": (
-                                        state.current_king.repo_full_name
+                                        _dashboard_display_repo_name(state.current_king.repo_full_name)
                                         if state.current_king else None
                                     ),
                                     "challenger_uid": challenger.uid,
                                     "challenger_hotkey": challenger.hotkey,
-                                    "challenger_repo": challenger.repo_full_name,
-                                    "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
+                                    "challenger_repo": challenger.hotkey,
+                                    "challenger_repo_url": None,
                                             "threshold": threshold,
                                     "duel_rounds": config.validate_duel_rounds,
                                     "task_set_phase": task_set_phase,
@@ -4421,24 +4399,20 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             except Exception:
                                 log.exception("Pre-retest state save failed (non-fatal)")
 
-                            king_dashboard = _dashboard_submission_dict(
-                                state.current_king,
-                                history=dashboard_history,
-                            ) if state.current_king else None
                             active_duel_info = {
                                 "duel_id": retest_duel_id,
                                 "king_uid": state.current_king.uid if state.current_king else None,
                                 "king_hotkey": state.current_king.hotkey if state.current_king else None,
-                                "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
-                                "king_repo_url": king_dashboard.get("repo_url") if king_dashboard else None,
+                                "king_repo": state.current_king.hotkey if state.current_king else None,
+                                "king_repo_url": None,
                                 "king_runtime_repo": (
-                                    state.current_king.repo_full_name
+                                    _dashboard_display_repo_name(state.current_king.repo_full_name)
                                     if state.current_king else None
                                 ),
                                 "challenger_uid": challenger.uid,
                                 "challenger_hotkey": challenger.hotkey,
-                                "challenger_repo": challenger.repo_full_name,
-                                "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
+                                "challenger_repo": challenger.hotkey,
+                                "challenger_repo_url": None,
                                     "threshold": config.validate_win_margin + 1,
                                 "win_margin": config.validate_win_margin,
                                 "duel_rounds": config.validate_duel_rounds,
@@ -4821,14 +4795,25 @@ def _publish_dashboard(
         for role in ("king", "challenger"):
             hk = d.get(f"{role}_hotkey")
             if hk and hk not in commitment_map:
-                commitment_map[hk] = {"uid": d.get(f"{role}_uid"), "hotkey": hk, "repo": d.get(f"{role}_repo")}
+                commitment_map[hk] = {
+                    "uid": d.get(f"{role}_uid"),
+                    "hotkey": hk,
+                    "repo": _dashboard_display_repo_name(d.get(f"{role}_repo")),
+                }
 
     def _resolve_hk(hk: str) -> dict[str, Any]:
         if hk in commitment_map:
             return commitment_map[hk]
+        for submission in _dashboard_known_submissions(state):
+            if submission.hotkey == hk:
+                return {
+                    "uid": submission.uid,
+                    "hotkey": hk,
+                    "repo": _dashboard_display_repo_name(submission.repo_full_name),
+                }
         c = state.locked_commitments.get(hk, "")
         repo = c.split("@")[0] if "@" in c else c
-        return {"uid": None, "hotkey": hk, "repo": repo or "unknown"}
+        return {"uid": None, "hotkey": hk, "repo": _dashboard_display_repo_name(repo) or "unknown"}
 
     total_rounds = sum(
         1 for d in history for r in d.get("rounds", [])
@@ -4850,7 +4835,7 @@ def _publish_dashboard(
         "queue": [
             {
                 "uid": s.uid,
-                "repo": s.repo_full_name,
+                "repo": s.hotkey,
                 "hotkey": s.hotkey,
                 "commitment_block": s.commitment_block,
                 "accepted_at": s.accepted_at,
@@ -4864,7 +4849,10 @@ def _publish_dashboard(
         "total_rounds": total_rounds,
         "miners_seen": len(state.seen_hotkeys),
         "king_since": state.king_since,
-        "king_duels_defended": state.king_duels_defended,
+        "king_duels_defended": _current_king_defense_count(
+            king_hotkey=king.hotkey if king else None,
+            history=history,
+        ),
         "king_window_size": config.validate_king_window_size,
         "recent_kings": [
             _dashboard_submission_dict(
@@ -4896,17 +4884,28 @@ def _dashboard_submission_dict(
     share: float | None = None,
     king_since: str | None = None,
 ) -> dict[str, Any]:
-    display_repo = submission.display_repo_full_name or submission.repo_full_name
+    display_repo = _dashboard_display_submission_repo_name(submission)
     display_commit = submission.display_commit_sha or submission.commit_sha
-    display_repo_url = f"https://github.com/{display_repo}"
+    display_repo_url = _dashboard_display_repo_url(
+        display_repo,
+        fallback=submission.repo_url,
+    )
     winning_summary = None
-    if submission.display_repo_full_name is None or submission.display_commit_sha is None:
+    if (
+        not _submission_has_private_submission_lineage(submission)
+        and (submission.display_repo_full_name is None or submission.display_commit_sha is None)
+    ):
         winning_summary = _find_winning_challenger_summary(submission, history or [])
 
     if winning_summary is not None:
-        display_repo = str(winning_summary.get("challenger_repo") or display_repo)
+        display_repo = _dashboard_display_repo_name(
+            winning_summary.get("challenger_repo") or display_repo
+        )
         display_commit = str(winning_summary.get("challenger_commit_sha") or display_commit)
-        display_repo_url = f"https://github.com/{display_repo}"
+        display_repo_url = _dashboard_display_repo_url(display_repo)
+
+    runtime_repo = _dashboard_display_repo_name(submission.repo_full_name)
+    runtime_repo_url = _dashboard_display_repo_url(runtime_repo, fallback=submission.repo_url)
 
     payload = {
         "uid": submission.uid,
@@ -4918,8 +4917,8 @@ def _dashboard_submission_dict(
         "display_repo_full_name": display_repo,
         "display_repo_url": display_repo_url,
         "display_commit_sha": display_commit,
-        "runtime_repo_full_name": submission.repo_full_name,
-        "runtime_repo_url": f"https://github.com/{submission.repo_full_name}",
+        "runtime_repo_full_name": runtime_repo,
+        "runtime_repo_url": runtime_repo_url,
         "runtime_commit_sha": submission.commit_sha,
         "source": submission.source,
     }
@@ -4928,6 +4927,86 @@ def _dashboard_submission_dict(
     if king_since is not None:
         payload["king_since"] = king_since
     return payload
+
+
+def _dashboard_display_submission_repo_name(submission: ValidatorSubmission) -> str:
+    if _submission_has_private_submission_lineage(submission):
+        return "private-submission"
+    return _dashboard_display_repo_name(
+        submission.display_repo_full_name or submission.repo_full_name
+    )
+
+
+def _submission_has_private_submission_lineage(submission: ValidatorSubmission) -> bool:
+    return (
+        str(submission.commitment).startswith("private-submission:")
+        or str(submission.repo_full_name).startswith("private-submission/")
+        or str(submission.repo_url).startswith("private-submission://")
+        or str(submission.source).startswith("private")
+    )
+
+
+def _dashboard_display_repo_name(raw_repo: Any) -> str:
+    repo = str(raw_repo or "").strip()
+    if repo.startswith("private-submission/") or repo.startswith("private-submission:"):
+        return "private-submission"
+    return repo
+
+
+def _dashboard_display_repo_url(repo: str, *, fallback: str | None = None) -> str | None:
+    if repo == "private-submission":
+        return None
+    if fallback and str(fallback).startswith("private-submission://"):
+        return None
+    return f"https://github.com/{repo}" if repo else None
+
+
+def _dashboard_known_submissions(state: ValidatorState) -> list[ValidatorSubmission]:
+    submissions: list[ValidatorSubmission] = []
+    if state.current_king is not None:
+        submissions.append(state.current_king)
+    submissions.extend(state.recent_kings)
+    submissions.extend(state.queue)
+    if state.active_duel is not None:
+        submissions.extend([state.active_duel.king, state.active_duel.challenger])
+    return submissions
+
+
+def _current_king_defense_count(
+    *,
+    king_hotkey: str | None,
+    history: list[dict[str, Any]],
+) -> int:
+    if not king_hotkey:
+        return 0
+
+    ordered_duels = sorted(
+        (duel for duel in history if isinstance(duel, dict)),
+        key=lambda duel: _coerce_int(duel.get("duel_id")) or 0,
+    )
+    latest_transition_id = 0
+    for duel in ordered_duels:
+        if (
+            duel.get("king_replaced") is True
+            and str(duel.get("challenger_hotkey") or "") == king_hotkey
+        ):
+            latest_transition_id = _coerce_int(duel.get("duel_id")) or latest_transition_id
+
+    defenses = 0
+    for duel in ordered_duels:
+        duel_id = _coerce_int(duel.get("duel_id")) or 0
+        if duel_id <= latest_transition_id:
+            continue
+        if str(duel.get("king_hotkey") or "") != king_hotkey:
+            continue
+        if duel.get("task_set_phase") == "confirmation_retest" or duel.get("confirmation_of_duel_id") is not None:
+            continue
+        if duel.get("king_replaced") is True:
+            continue
+        if duel.get("disqualification_reason"):
+            continue
+        defenses += 1
+    return defenses
 
 
 def _find_winning_challenger_summary(

@@ -343,6 +343,8 @@ class R2PublicSanitizationTest(unittest.TestCase):
             "wins": 8,
             "losses": 24,
             "ties": 0,
+            "disqualification_reason": "copy detected (3 near-exact rounds >= 0.98)",
+            "confirmation_of_duel_id": 43,
             "rounds": [{"task_name": "validate-1"}],
         }
 
@@ -359,6 +361,8 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertEqual(entry["challenger_uid"], 197)
         self.assertEqual(entry["challenger_hotkey"], "challenger-hotkey")
         self.assertEqual(entry["challenger_commit_sha"], "challenger-sha")
+        self.assertEqual(entry["disqualification_reason"], "copy detected (3 near-exact rounds >= 0.98)")
+        self.assertEqual(entry["confirmation_of_duel_id"], 43)
 
     def test_publish_training_data_deletes_legacy_public_file_without_uploading(self):
         client = FakeS3Client()

@@ -3,6 +3,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import wait as futures_wait
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1605,6 +1606,181 @@ class TaskPoolTest(unittest.TestCase):
         self.assertEqual(len(result.rounds), 3)
         self.assertGreaterEqual(solve_round.call_count, 3)
         kill_containers.assert_called_once()
+
+    def test_parallel_duel_preserves_done_round_at_hard_deadline_without_submitting_more(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td) / "pool")
+            for idx in range(3):
+                task_root = Path(td) / f"task-{idx:02d}"
+                self._write_minimal_task_metadata(task_root)
+                baseline_dir = task_root / "solutions" / "baseline"
+                baseline_dir.mkdir(parents=True, exist_ok=True)
+                (baseline_dir / "solve.json").write_text("{}\n")
+                (baseline_dir / "solution.diff").write_text("diff\n")
+                pool.add(
+                    PoolTask(
+                        task_name=f"task-{idx:02d}",
+                        task_root=str(task_root),
+                        creation_block=1,
+                        cursor_elapsed=float(idx + 1),
+                        king_lines=1,
+                        king_similarity=0.1,
+                        baseline_lines=1,
+                    )
+                )
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_duel_rounds=3,
+                validate_round_concurrency=1,
+                validate_win_margin=0,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="unarbos/ninja@" + "a" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+            challenger = validate.ValidatorSubmission(
+                hotkey="challenger-hotkey",
+                uid=2,
+                repo_full_name="challenger/ninja",
+                repo_url="https://github.com/challenger/ninja",
+                commit_sha="b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+
+            def challenger_round(*, task, king, challenger, config, duel_id, pool=None):
+                return validate.ValidationRoundResult(
+                    task_name=task.task_name,
+                    winner="challenger",
+                    king_lines=1,
+                    challenger_lines=1,
+                    king_similarity_ratio=0.0,
+                    challenger_similarity_ratio=1.0,
+                    king_challenger_similarity=0.0,
+                    task_root=task.task_root,
+                    king_compare_root="",
+                    challenger_compare_root="",
+                )
+
+            def wait_for_submitted_round(pending, timeout=None, return_when=None):
+                done, _ = futures_wait(pending)
+                return done, set()
+
+            with (
+                patch("validate._solve_and_compare_round", side_effect=challenger_round) as solve_round,
+                patch("validate._futures_wait", side_effect=wait_for_submitted_round),
+                patch("validate._PARALLEL_DUEL_HARD_TIMEOUT", 0.0),
+                patch("validate._kill_stale_containers") as kill_containers,
+            ):
+                result = validate._run_parallel_duel(
+                    config=config,
+                    state=validate.ValidatorState(current_king=king),
+                    king=king,
+                    challenger=challenger,
+                    duel_id=99,
+                    pool=pool,
+                )
+
+        self.assertEqual(solve_round.call_count, 1)
+        self.assertEqual(result.wins, 1)
+        self.assertEqual(len(result.rounds), 3)
+        self.assertEqual(result.rounds[0].winner, "challenger")
+        self.assertEqual([round_result.winner for round_result in result.rounds[1:]], ["error", "error"])
+        self.assertTrue(all("not started (hard duel deadline)" in r.error for r in result.rounds[1:]))
+        kill_containers.assert_called_once()
+
+    def test_parallel_duel_does_not_timeout_when_last_round_finishes_at_deadline(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td) / "pool")
+            task_root = Path(td) / "task-00"
+            self._write_minimal_task_metadata(task_root)
+            baseline_dir = task_root / "solutions" / "baseline"
+            baseline_dir.mkdir(parents=True, exist_ok=True)
+            (baseline_dir / "solve.json").write_text("{}\n")
+            (baseline_dir / "solution.diff").write_text("diff\n")
+            pool.add(
+                PoolTask(
+                    task_name="task-00",
+                    task_root=str(task_root),
+                    creation_block=1,
+                    cursor_elapsed=1.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                )
+            )
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_duel_rounds=1,
+                validate_round_concurrency=1,
+                validate_win_margin=0,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="unarbos/ninja@" + "a" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+            challenger = validate.ValidatorSubmission(
+                hotkey="challenger-hotkey",
+                uid=2,
+                repo_full_name="challenger/ninja",
+                repo_url="https://github.com/challenger/ninja",
+                commit_sha="b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+
+            def challenger_round(*, task, king, challenger, config, duel_id, pool=None):
+                return validate.ValidationRoundResult(
+                    task_name=task.task_name,
+                    winner="challenger",
+                    king_lines=1,
+                    challenger_lines=1,
+                    king_similarity_ratio=0.0,
+                    challenger_similarity_ratio=1.0,
+                    king_challenger_similarity=0.0,
+                    task_root=task.task_root,
+                    king_compare_root="",
+                    challenger_compare_root="",
+                )
+
+            def wait_for_submitted_round(pending, timeout=None, return_when=None):
+                done, _ = futures_wait(pending)
+                return done, set()
+
+            with (
+                patch("validate._solve_and_compare_round", side_effect=challenger_round) as solve_round,
+                patch("validate._futures_wait", side_effect=wait_for_submitted_round),
+                patch("validate._PARALLEL_DUEL_HARD_TIMEOUT", 0.0),
+                patch("validate._kill_stale_containers") as kill_containers,
+            ):
+                result = validate._run_parallel_duel(
+                    config=config,
+                    state=validate.ValidatorState(current_king=king),
+                    king=king,
+                    challenger=challenger,
+                    duel_id=100,
+                    pool=pool,
+                )
+
+        self.assertEqual(solve_round.call_count, 1)
+        self.assertEqual(result.wins, 1)
+        self.assertEqual(len(result.rounds), 1)
+        self.assertEqual(result.rounds[0].winner, "challenger")
+        kill_containers.assert_not_called()
 
     def test_refresh_budget_allows_bounded_hourly_batch(self):
         config = RunConfig(
