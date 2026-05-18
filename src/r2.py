@@ -18,6 +18,7 @@ log = logging.getLogger("swe-eval.r2")
 
 _R2_KEY_PREFIX = "sn66/"
 _DASHBOARD_KEY = f"{_R2_KEY_PREFIX}dashboard.json"
+_DASHBOARD_HOME_KEY = f"{_R2_KEY_PREFIX}dashboard-home.json"
 _SUBMISSIONS_API_KEY = f"{_R2_KEY_PREFIX}api/submissions"
 _DUELS_PREFIX = f"{_R2_KEY_PREFIX}duels/"
 _INDEX_KEY = f"{_DUELS_PREFIX}index.json"
@@ -241,10 +242,12 @@ def publish_dashboard_data(
         "duels": duel_history,
         "status": status,
     }
+    home_payload = _dashboard_home_payload(payload)
     try:
         # Short max-age so Hippius's edge cache doesn't make the dashboard
         # look frozen to viewers. We publish every few seconds anyway.
         _upload_json(_DASHBOARD_KEY, payload, cache_control="public, max-age=10")
+        _upload_json(_DASHBOARD_HOME_KEY, home_payload, cache_control="public, max-age=10")
         log.info("Published dashboard data to r2://%s/%s (%d duels)", _get_bucket(), _DASHBOARD_KEY, len(duel_history))
         return True
     except Exception as exc:
@@ -253,6 +256,72 @@ def publish_dashboard_data(
             return False
         log.exception("Failed to publish dashboard data to R2")
         return False
+
+
+def _dashboard_home_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build the small first-paint dashboard payload.
+
+    Full history stays in dashboard.json and duels/index.json. The home payload
+    keeps only the most recent duel window so the landing page can update often
+    without downloading megabytes of old rounds on every poll.
+    """
+    duels = payload.get("duels")
+    recent_duels = [_dashboard_home_duel(item) for item in duels[-40:]] if isinstance(duels, list) else []
+    links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+    return {
+        "updated_at": payload.get("updated_at"),
+        "current_king": payload.get("current_king"),
+        "duels": recent_duels,
+        "duels_total": len(duels) if isinstance(duels, list) else 0,
+        "status": payload.get("status"),
+        "links": {
+            **links,
+            "dashboard_full": "./dashboard.json",
+            "duels_index": "./duels/index.json",
+        },
+    }
+
+
+def _dashboard_home_duel(duel: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "duel_id",
+        "started_at",
+        "finished_at",
+        "king_replaced",
+        "disqualification_reason",
+        "confirmation_duel_id",
+        "confirmation_retest_passed",
+        "confirmation_failure_reason",
+        "confirmation_of_duel_id",
+        "manual_retest_of_duel_id",
+        "wins",
+        "losses",
+        "ties",
+        "errors",
+        "threshold",
+        "duel_rounds",
+        "task_set_phase",
+        "king_uid",
+        "king_hotkey",
+        "king_agent_username",
+        "king_repo",
+        "king_repo_url",
+        "king_pr_url",
+        "king_commit_sha",
+        "king_commitment_block",
+        "challenger_uid",
+        "challenger_hotkey",
+        "challenger_agent_username",
+        "challenger_repo",
+        "challenger_repo_url",
+        "challenger_pr_url",
+        "challenger_commit_sha",
+        "challenger_commitment_block",
+    )
+    summary = {field: duel.get(field) for field in fields if field in duel}
+    rounds = duel.get("rounds")
+    summary["round_count"] = len(rounds) if isinstance(rounds, list) else int(duel.get("round_count") or 0)
+    return summary
 
 
 def publish_submissions_api_data(payload: dict[str, Any]) -> bool:

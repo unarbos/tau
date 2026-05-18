@@ -212,8 +212,84 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         recent = payload["status"]["recent_kings"]
         self.assertEqual(recent[0]["uid"], 3)
         self.assertEqual(recent[0]["king_since"], "2026-05-10T20:25:00+00:00")
+        self.assertIn("hold_seconds", recent[0])
         self.assertEqual(recent[1]["uid"], 2)
         self.assertEqual(recent[1]["king_since"], "2026-05-10T18:10:00+00:00")
+        self.assertEqual(recent[1]["hold_seconds"], 7800)
+
+    def test_dashboard_recent_kings_include_defense_counts(self):
+        previous = _submission(
+            hotkey="5PreviousKing",
+            uid=2,
+            commitment="unarbos/ninja@" + "b" * 40,
+            block=102,
+        )
+        current = _submission(
+            hotkey="5CurrentKing",
+            uid=3,
+            commitment="unarbos/ninja@" + "c" * 40,
+            block=103,
+        )
+        history = [
+            {
+                "duel_id": 1,
+                "king_hotkey": "5FirstKing",
+                "challenger_hotkey": previous.hotkey,
+                "king_replaced": True,
+                "finished_at": "2026-05-10T18:00:00+00:00",
+            },
+            {
+                "duel_id": 2,
+                "king_hotkey": previous.hotkey,
+                "challenger_hotkey": "5LoserA",
+                "king_replaced": False,
+            },
+            {
+                "duel_id": 3,
+                "king_hotkey": previous.hotkey,
+                "challenger_hotkey": "5Retest",
+                "king_replaced": False,
+                "task_set_phase": "confirmation_retest",
+                "confirmation_of_duel_id": 2,
+            },
+            {
+                "duel_id": 4,
+                "king_hotkey": previous.hotkey,
+                "challenger_hotkey": "5LoserB",
+                "king_replaced": False,
+            },
+            {
+                "duel_id": 5,
+                "king_hotkey": previous.hotkey,
+                "challenger_hotkey": current.hotkey,
+                "king_replaced": True,
+                "finished_at": "2026-05-10T20:00:00+00:00",
+            },
+            {
+                "duel_id": 6,
+                "king_hotkey": current.hotkey,
+                "challenger_hotkey": "5LoserC",
+                "king_replaced": False,
+            },
+        ]
+        state = ValidatorState(current_king=current, recent_kings=[current, previous])
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("validate.publish_dashboard_data", return_value=True):
+            config = RunConfig(workspace_root=Path(tmp), validate_king_window_size=2)
+            config.validate_root.mkdir(parents=True)
+            _publish_dashboard(
+                state,
+                history,
+                config,
+                validator_started_at="2026-05-10T19:00:00+00:00",
+            )
+            payload = json.loads((config.validate_root / "dashboard_data.json").read_text())
+
+        recent = payload["status"]["recent_kings"]
+        self.assertEqual(recent[0]["uid"], 3)
+        self.assertEqual(recent[0]["king_duels_defended"], 1)
+        self.assertEqual(recent[1]["uid"], 2)
+        self.assertEqual(recent[1]["king_duels_defended"], 2)
 
     def test_dashboard_uses_private_submission_repo_label(self):
         private = ValidatorSubmission(
