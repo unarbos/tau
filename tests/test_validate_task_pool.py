@@ -175,16 +175,29 @@ class TaskPoolTest(unittest.TestCase):
             )
             stop_event = threading.Event()
 
-            def compare_once(**_kwargs):
-                stop_event.set()
-                return SimpleNamespace(
-                    matched_changed_lines=3,
-                    similarity_ratio=0.5,
-                    total_changed_lines_b=3,
+            def solve_once(*, task_name: str, solution_name: str, config: RunConfig):
+                solution_dir = config.tasks_root / task_name / "solutions" / solution_name
+                solution_dir.mkdir(parents=True, exist_ok=True)
+                (solution_dir / "solve.json").write_text(
+                    json.dumps({"agent_timeout_seconds": config.agent_timeout}) + "\n"
                 )
+                (solution_dir / "solution.diff").write_text("king diff\n")
+                return SimpleNamespace(exit_reason="completed")
+
+            def compare_once(*, task_name: str, solution_names: list[str], config: RunConfig):
+                compare_dir = config.tasks_root / task_name / "comparisons" / "king--vs--baseline"
+                compare_dir.mkdir(parents=True, exist_ok=True)
+                result = {
+                    "matched_changed_lines": 3,
+                    "similarity_ratio": 0.5,
+                    "total_changed_lines_b": 3,
+                }
+                (compare_dir / "compare.json").write_text(json.dumps({"result": result}) + "\n")
+                stop_event.set()
+                return SimpleNamespace(**result)
 
             with (
-                patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
+                patch("validate.solve_task_run", side_effect=solve_once),
                 patch("validate.compare_task_run", side_effect=compare_once),
                 patch("validate._open_subtensor", side_effect=RuntimeError("offline")),
             ):
@@ -200,6 +213,79 @@ class TaskPoolTest(unittest.TestCase):
 
             self.assertEqual(pool.size(), 1)
             self.assertEqual(pool.list_tasks()[0].task_name, task_name)
+
+    def test_pool_filler_rejects_unhealthy_king_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_fill_from_saved=True,
+                validate_task_pool_target=1,
+            )
+            pool = TaskPool(root / "pool")
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            task_dir = task_root / "task"
+            task_dir.mkdir(parents=True)
+            for artifact in ("task.json", "task.txt", "commit.json"):
+                (task_dir / artifact).write_text("{}\n")
+            (task_dir / "reference.patch").write_text("+line\n" * (validate._MIN_PATCH_LINES + 1))
+            baseline_dir = task_root / "solutions" / "baseline"
+            baseline_dir.mkdir(parents=True)
+            (baseline_dir / "solution.diff").write_text("diff\n")
+            (baseline_dir / "solve.json").write_text(
+                json.dumps({"result": {"exit_reason": "completed", "elapsed_seconds": 1.0}})
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="king/ninja@" + "a" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+            state = validate.ValidatorState(current_king=king)
+            stop_event = threading.Event()
+
+            def solve_once(*, task_name: str, solution_name: str, config: RunConfig):
+                solution_dir = config.tasks_root / task_name / "solutions" / solution_name
+                solution_dir.mkdir(parents=True, exist_ok=True)
+                (solution_dir / "solve.json").write_text(
+                    json.dumps({"agent_timeout_seconds": config.agent_timeout}) + "\n"
+                )
+                (solution_dir / "solution.diff").write_text("king diff\n")
+                return SimpleNamespace(exit_reason="completed")
+
+            def compare_once(*, task_name: str, solution_names: list[str], config: RunConfig):
+                compare_dir = config.tasks_root / task_name / "comparisons" / "king--vs--baseline"
+                compare_dir.mkdir(parents=True, exist_ok=True)
+                result = {
+                    "matched_changed_lines": 0,
+                    "similarity_ratio": 0.0,
+                    "total_changed_lines_b": 3,
+                }
+                (compare_dir / "compare.json").write_text(json.dumps({"result": result}) + "\n")
+                stop_event.set()
+                return SimpleNamespace(**result)
+
+            with (
+                patch("validate.solve_task_run", side_effect=solve_once),
+                patch("validate.compare_task_run", side_effect=compare_once),
+                patch("validate._open_subtensor", side_effect=RuntimeError("offline")),
+            ):
+                validate._pool_filler_loop(
+                    config,
+                    state,
+                    pool,
+                    stop_event,
+                    threading.Lock(),
+                    threading.Event(),
+                    pool_label="primary",
+                )
+
+            self.assertEqual(pool.size(), 0)
 
     def test_take_returns_fastest_cached_task(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1042,7 +1128,7 @@ class TaskPoolTest(unittest.TestCase):
             self.assertFalse(healthy)
             self.assertEqual(reason, "king produced no matched changed lines")
 
-    def test_pool_refresh_fallback_records_attempted_king_timeout(self):
+    def test_pool_refresh_fallback_drops_unhealthy_king_cache_after_recording_timeout(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = RunConfig(
@@ -1099,8 +1185,7 @@ class TaskPoolTest(unittest.TestCase):
             payload = json.loads((task_root / "solutions" / "king" / "solve.json").read_text())
             self.assertNotEqual(config.agent_timeout, 222)
             self.assertEqual(payload["agent_timeout_seconds"], 222)
-            assert refreshed is not None
-            self.assertEqual(refreshed.agent_timeout_seconds, 222)
+            self.assertIsNone(refreshed)
 
     def test_static_pool_ready_rejects_inconsistent_king_cache(self):
         with tempfile.TemporaryDirectory() as td:

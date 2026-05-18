@@ -2336,19 +2336,24 @@ def _pool_filler_loop(
                     pool=pool,
                     king=current_king,
                 )
+                candidate = PoolTask(
+                    task_name=task_name,
+                    task_root=task_root,
+                    creation_block=creation_block,
+                    cursor_elapsed=baseline_elapsed,
+                    king_lines=king_compare.matched_changed_lines,
+                    king_similarity=king_compare.similarity_ratio,
+                    baseline_lines=king_compare.total_changed_lines_b,
+                    agent_timeout_seconds=agent_timeout,
+                    king_hotkey=current_king.hotkey,
+                    king_commit_sha=current_king.commit_sha,
+                )
+                healthy, reason = _pool_task_has_healthy_king_cache(config=config, task=candidate)
+                if not healthy:
+                    log.info("Pool filler[%s]: skipping %s (%s)", pool_label, task_name, reason)
+                    continue
                 pruned = pool.add(
-                    PoolTask(
-                        task_name=task_name,
-                        task_root=task_root,
-                        creation_block=creation_block,
-                        cursor_elapsed=baseline_elapsed,
-                        king_lines=king_compare.matched_changed_lines,
-                        king_similarity=king_compare.similarity_ratio,
-                        baseline_lines=king_compare.total_changed_lines_b,
-                        agent_timeout_seconds=agent_timeout,
-                        king_hotkey=current_king.hotkey,
-                        king_commit_sha=current_king.commit_sha,
-                    ),
+                    candidate,
                     keep=config.validate_task_pool_target,
                     prune_first=prune_first,
                     preserve=_active_duel_task_names(state),
@@ -2834,7 +2839,7 @@ def _refresh_pool_task_for_king(
         log.info("Pool refresh[%s]: dropping %s (baseline produced no patch)", pool_label, task_name)
         return None
 
-    return PoolTask(
+    refreshed = PoolTask(
         task_name=task.task_name,
         task_root=task.task_root,
         creation_block=task.creation_block,
@@ -2846,6 +2851,11 @@ def _refresh_pool_task_for_king(
         king_hotkey=king.hotkey,
         king_commit_sha=king.commit_sha,
     )
+    healthy, reason = _pool_task_has_healthy_king_cache(config=config, task=refreshed)
+    if not healthy:
+        log.info("Pool refresh[%s]: dropping %s (%s)", pool_label, task_name, reason)
+        return None
+    return refreshed
 
 
 def _refresh_pool_for_king(
