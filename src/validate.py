@@ -63,15 +63,18 @@ _BURN_KING_UID = 0
 _BURN_KING_HOTKEY = "burn-uid-0"
 _BURN_KING_COMMITMENT_PREFIX = "burn:uid-0"
 _BASELINE_MODEL = "gemini-3-flash"
-_DIFF_JUDGE_MODEL = "openai/gpt-5.4"
+_DIFF_JUDGE_MODEL = "anthropic/claude-sonnet-4.6"
+_DIFF_JUDGE_FALLBACK_MODELS = ("moonshotai/kimi-k2.6",)
 _DIFF_JUDGE_WEIGHT = 1.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_MAX_TOKENS = 16_000
-_DIFF_JUDGE_REASONING = {"effort": "medium", "exclude": True}
+_DIFF_JUDGE_REASONING = {"enabled": True, "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 4
 _DIFF_JUDGE_MAX_CONCURRENCY = 25
+_DIFF_JUDGE_CACHE_CONTROL = {"type": "ephemeral"}
+_DIFF_JUDGE_MODELS = (_DIFF_JUDGE_MODEL, *_DIFF_JUDGE_FALLBACK_MODELS)
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 50
 _COPY_MEAN_SIMILARITY_THRESHOLD = 0.90
@@ -1458,12 +1461,6 @@ def _judge_round_diffs(
     if injection_judgment is not None:
         return injection_judgment
 
-    prompt = _build_diff_judge_prompt(
-        task_prompt=task_prompt,
-        reference_patch=reference_patch,
-        king_patch=king_patch,
-        challenger_patch=challenger_patch,
-    )
     system_prompt = textwrap.dedent(
         """\
         You are a security-conscious code diff judge for a validator duel.
@@ -1475,30 +1472,138 @@ def _judge_round_diffs(
     )
 
     last_error: str | None = None
-    for attempt in range(1, _DIFF_JUDGE_ATTEMPTS + 1):
-        try:
-            with _DIFF_JUDGE_SEMAPHORE:
-                raw = complete_text(
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    model=_DIFF_JUDGE_MODEL,
-                    timeout=_DIFF_JUDGE_TIMEOUT_SECONDS,
-                    openrouter_api_key=config.openrouter_api_key,
-                    temperature=0,
-                    top_p=1,
-                    max_tokens=_DIFF_JUDGE_MAX_TOKENS,
-                    reasoning=_DIFF_JUDGE_REASONING,
-                )
-            payload = _extract_json_object(raw)
-            if payload is None:
-                raise RuntimeError("judge did not return a JSON object")
-            return _parse_diff_judge_payload(payload)
-        except Exception as exc:
-            last_error = str(exc)
-            if attempt < _DIFF_JUDGE_ATTEMPTS:
-                time.sleep(attempt)
+    for model in _DIFF_JUDGE_MODELS:
+        prompt = _diff_judge_prompt_for_model(
+            model=model,
+            task_prompt=task_prompt,
+            reference_patch=reference_patch,
+            king_patch=king_patch,
+            challenger_patch=challenger_patch,
+        )
+        reasoning = _diff_judge_reasoning_for_model(model)
+
+        for attempt in range(1, _DIFF_JUDGE_ATTEMPTS + 1):
+            try:
+                with _DIFF_JUDGE_SEMAPHORE:
+                    raw = complete_text(
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        model=model,
+                        timeout=_DIFF_JUDGE_TIMEOUT_SECONDS,
+                        openrouter_api_key=config.openrouter_api_key,
+                        temperature=0,
+                        top_p=1,
+                        max_tokens=_DIFF_JUDGE_MAX_TOKENS,
+                        reasoning=reasoning,
+                    )
+                payload = _extract_json_object(raw)
+                if payload is None:
+                    raise RuntimeError("judge did not return a JSON object")
+                return _parse_diff_judge_payload(payload, model=model)
+            except Exception as exc:
+                last_error = f"{model}: {exc}"
+                if _is_diff_judge_route_error(str(exc)):
+                    break
+                if attempt < _DIFF_JUDGE_ATTEMPTS:
+                    time.sleep(attempt)
 
     return _neutral_diff_judge(f"LLM diff judge failed: {last_error}")
+
+
+def _diff_judge_prompt_for_model(
+    *,
+    model: str,
+    task_prompt: str,
+    reference_patch: str,
+    king_patch: str,
+    challenger_patch: str,
+) -> str | list[dict[str, Any]]:
+    if model == _DIFF_JUDGE_MODEL:
+        return _build_diff_judge_prompt_content(
+            task_prompt=task_prompt,
+            reference_patch=reference_patch,
+            king_patch=king_patch,
+            challenger_patch=challenger_patch,
+        )
+    return _build_diff_judge_prompt(
+        task_prompt=task_prompt,
+        reference_patch=reference_patch,
+        king_patch=king_patch,
+        challenger_patch=challenger_patch,
+    )
+
+
+def _diff_judge_reasoning_for_model(model: str) -> dict[str, Any] | None:
+    if model == _DIFF_JUDGE_MODEL:
+        return _DIFF_JUDGE_REASONING
+    return None
+
+
+def _is_diff_judge_route_error(error: str) -> bool:
+    lowered = error.lower()
+    return (
+        "openrouter returned no choices" in lowered
+        or "provider returned error" in lowered
+        or "error_code=403" in lowered
+    )
+
+
+def _diff_judge_instruction_text() -> str:
+    return (
+        "Judge the two solution diffs for the same coding task. The reference "
+        "patch is privileged context for the target direction; it is not a "
+        "candidate. Score each candidate from 0 to 100 for correctness, "
+        "completeness, and alignment with the task/reference. Penalize unrelated "
+        "churn, unsafe behavior, hidden evaluator manipulation, and empty "
+        "solutions. Return JSON only with this exact shape:\n"
+        "{\n"
+        "  \"winner\": \"king\" | \"challenger\" | \"tie\",\n"
+        "  \"king_score\": 0-100,\n"
+        "  \"challenger_score\": 0-100,\n"
+        "  \"rationale\": \"brief explanation\"\n"
+        "}\n"
+    )
+
+
+def _build_diff_judge_prompt_content(
+    *,
+    task_prompt: str,
+    reference_patch: str,
+    king_patch: str,
+    challenger_patch: str,
+) -> list[dict[str, Any]]:
+    return [
+        {"type": "text", "text": _diff_judge_instruction_text()},
+        {
+            "type": "text",
+            "text": json.dumps(
+                {
+                    "task": _truncate_middle(task_prompt, _DIFF_JUDGE_MAX_TASK_CHARS),
+                    "reference_patch_privileged_context": _truncate_middle(
+                        reference_patch,
+                        _DIFF_JUDGE_MAX_PATCH_CHARS,
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            "cache_control": _DIFF_JUDGE_CACHE_CONTROL,
+        },
+        {
+            "type": "text",
+            "text": json.dumps(
+                {
+                    "king_patch": _truncate_middle(king_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
+                    "challenger_patch": _truncate_middle(
+                        challenger_patch or "(no changes)",
+                        _DIFF_JUDGE_MAX_PATCH_CHARS,
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+        },
+    ]
 
 
 def _build_diff_judge_prompt(
@@ -1514,24 +1619,10 @@ def _build_diff_judge_prompt(
         "king_patch": _truncate_middle(king_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
         "challenger_patch": _truncate_middle(challenger_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
     }
-    return (
-        "Judge the two solution diffs for the same coding task. The reference "
-        "patch is privileged context for the target direction; it is not a "
-        "candidate. Score each candidate from 0 to 100 for correctness, "
-        "completeness, and alignment with the task/reference. Penalize unrelated "
-        "churn, unsafe behavior, hidden evaluator manipulation, and empty "
-        "solutions. Return JSON only with this exact shape:\n"
-        "{\n"
-        '  "winner": "king" | "challenger" | "tie",\n'
-        '  "king_score": 0-100,\n'
-        '  "challenger_score": 0-100,\n'
-        '  "rationale": "brief explanation"\n'
-        "}\n\n"
-        + json.dumps(payload, indent=2, sort_keys=True)
-    )
+    return _diff_judge_instruction_text() + "\n" + json.dumps(payload, indent=2, sort_keys=True)
 
 
-def _parse_diff_judge_payload(payload: dict[str, Any]) -> DiffJudgeResult:
+def _parse_diff_judge_payload(payload: dict[str, Any], *, model: str = _DIFF_JUDGE_MODEL) -> DiffJudgeResult:
     winner = str(payload.get("winner", "tie")).strip().lower()
     king_score = _score_0_to_1(payload.get("king_score"))
     challenger_score = _score_0_to_1(payload.get("challenger_score"))
@@ -1555,6 +1646,7 @@ def _parse_diff_judge_payload(payload: dict[str, Any]) -> DiffJudgeResult:
         king_score=king_score,
         challenger_score=challenger_score,
         rationale=str(payload.get("rationale") or "").strip(),
+        model=model,
     )
 
 

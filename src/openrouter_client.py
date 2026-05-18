@@ -28,7 +28,7 @@ def _openrouter_url() -> str:
 
 def complete_text(
     *,
-    prompt: str,
+    prompt: str | list[dict[str, Any]],
     model: str | None,
     timeout: int,
     openrouter_api_key: str,
@@ -37,6 +37,7 @@ def complete_text(
     top_p: float | None = None,
     max_tokens: int | None = None,
     reasoning: dict[str, Any] | None = None,
+    cache_control: dict[str, Any] | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "model": _resolve_model(model),
@@ -50,6 +51,8 @@ def complete_text(
         payload["max_tokens"] = max_tokens
     if reasoning is not None:
         payload["reasoning"] = reasoning
+    if cache_control is not None:
+        payload["cache_control"] = cache_control
     headers = {
         "Authorization": f"Bearer {openrouter_api_key}",
         "Content-Type": "application/json",
@@ -79,8 +82,12 @@ def _resolve_model(model: str | None) -> str:
     return model
 
 
-def _build_messages(*, system_prompt: str | None, prompt: str) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
+def _build_messages(
+    *,
+    system_prompt: str | None,
+    prompt: str | list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})

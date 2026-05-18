@@ -55,6 +55,51 @@ class OpenRouterClientTest(unittest.TestCase):
         self.assertEqual(text, "ok")
         self.assertEqual(client.request_json["reasoning"], {"effort": "medium", "exclude": True})
 
+    def test_complete_text_passes_cache_control_config(self):
+        client = _FakeClient(
+            {
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"},
+                ],
+            },
+        )
+
+        with patch("openrouter_client.httpx.Client", return_value=client):
+            text = complete_text(
+                prompt="judge",
+                model="anthropic/claude-sonnet-4.6",
+                timeout=10,
+                openrouter_api_key="key",
+                cache_control={"type": "ephemeral"},
+            )
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(client.request_json["cache_control"], {"type": "ephemeral"})
+
+    def test_complete_text_passes_structured_content_blocks(self):
+        client = _FakeClient(
+            {
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"},
+                ],
+            },
+        )
+        content = [
+            {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "dynamic"},
+        ]
+
+        with patch("openrouter_client.httpx.Client", return_value=client):
+            text = complete_text(
+                prompt=content,
+                model="anthropic/claude-sonnet-4.6",
+                timeout=10,
+                openrouter_api_key="key",
+            )
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(client.request_json["messages"][0]["content"], content)
+
     def test_empty_content_error_includes_reasoning_metadata(self):
         client = _FakeClient(
             {
