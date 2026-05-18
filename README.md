@@ -298,9 +298,9 @@ challenger becomes king.
 
 Each validation task still starts from a mined GitHub commit: `task/original` is the repo before the commit, `task/reference` is the repo after it, and `task/reference.patch` is used to filter out tiny tasks.
 
-For duels, the score comes from the LLM diff judge. The pool filler still creates a Cursor baseline solution at `solutions/baseline` so the validator can keep compatibility telemetry, copy checks, and timeout calibration data, but Cursor-baseline similarity no longer contributes to the winner.
+For duels, the score comes solely from the LLM diff judge. The pool filler still creates a Cursor baseline solution at `solutions/baseline` so the validator can keep compatibility telemetry, copy checks, and timeout calibration data, but Cursor-baseline similarity no longer contributes to the winner.
 
-Round score is now based only on the LLM diff judgment. The diff judge uses `openai/gpt-5.4` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap, then scores the king and challenger patches against the task/reference context.
+Round score is based only on the LLM diff judgment. The diff judge uses `openai/gpt-5.4` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap, then scores the king and challenger patches against the task/reference context.
 
 Cursor is telemetry only for round scoring. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king plus the configured margin. `start_validator.sh` currently uses `--win-margin 3`.
 
