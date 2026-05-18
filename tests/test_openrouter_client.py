@@ -81,6 +81,34 @@ class OpenRouterClientTest(unittest.TestCase):
                     openrouter_api_key="key",
                 )
 
+    def test_no_choices_error_includes_openrouter_error_payload(self):
+        client = _FakeClient(
+            {
+                "error": {
+                    "code": 429,
+                    "message": "rate limited by upstream provider",
+                },
+            },
+        )
+
+        with patch("openrouter_client.httpx.Client", return_value=client):
+            with self.assertRaisesRegex(RuntimeError, "error_code=429"):
+                complete_text(
+                    prompt="judge",
+                    model="deepseek/deepseek-v4-flash",
+                    timeout=10,
+                    openrouter_api_key="key",
+                )
+
+        with self.assertRaisesRegex(RuntimeError, "rate limited by upstream provider"):
+            with patch("openrouter_client.httpx.Client", return_value=client):
+                complete_text(
+                    prompt="judge",
+                    model="deepseek/deepseek-v4-flash",
+                    timeout=10,
+                    openrouter_api_key="key",
+                )
+
     def test_complete_text_reads_base_url_from_env_at_call_time(self):
         client = _FakeClient(
             {

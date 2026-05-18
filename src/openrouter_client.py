@@ -62,7 +62,7 @@ def complete_text(
     data = response.json()
     choices = data.get("choices") or []
     if not choices:
-        raise RuntimeError("OpenRouter returned no choices")
+        raise RuntimeError(_no_choices_error(data))
     message = choices[0].get("message") or {}
     content = message.get("content")
     text = _extract_text(content)
@@ -99,6 +99,25 @@ def _extract_text(content: Any) -> str:
                 parts.append(str(item["text"]))
         return "".join(parts)
     return ""
+
+
+def _no_choices_error(data: dict[str, Any]) -> str:
+    error = data.get("error") if isinstance(data.get("error"), dict) else {}
+    return (
+        "OpenRouter returned no choices "
+        f"(error_code={error.get('code')!r}, "
+        f"error_message={_truncate_error_text(error.get('message'))!r}, "
+        f"response_keys={sorted(data.keys())})"
+    )
+
+
+def _truncate_error_text(raw: Any, limit: int = 240) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 def _empty_content_error(data: dict[str, Any]) -> str:
