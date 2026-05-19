@@ -1012,7 +1012,7 @@ def _pop_resumable_active_challenger(
     if (
         lease is None
         or king is None
-        or not (lease.task_names or lease.rounds)
+        or not (lease.task_names or lease.rounds or lease.status == "resume_pending")
         or not _same_submission(lease.king, king)
     ):
         return None

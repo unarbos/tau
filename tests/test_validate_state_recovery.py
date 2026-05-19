@@ -809,6 +809,49 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual(state.next_duel_index, 91)
         self.assertEqual(state.queue, [])
 
+    def test_resumable_active_duel_accepts_zero_zero_resume_pending_checkpoint(self):
+        king = _submission(
+            hotkey="5KingHotkey",
+            uid=11,
+            commitment="unarbos/ninja@" + "a" * 40,
+            block=111,
+        )
+        challenger = _submission(
+            hotkey="5ChallengerHotkey",
+            uid=12,
+            commitment="unarbos/ninja@" + "b" * 40,
+            block=112,
+        )
+        state = ValidatorState(
+            current_king=king,
+            next_duel_index=91,
+            queue=[challenger],
+            active_duel=ActiveDuelLease(
+                duel_id=90,
+                started_at="2026-05-06T00:00:00+00:00",
+                king=king,
+                challenger=challenger,
+                task_names=[],
+                rounds=[],
+                status="resume_pending",
+                task_set_phase="confirmation_retest",
+                confirmation_of_duel_id=89,
+            ),
+        )
+
+        resumed = _pop_resumable_active_challenger(state, king=king)
+
+        self.assertIsNotNone(resumed)
+        assert resumed is not None
+        duel_id, resumed_challenger = resumed
+        self.assertEqual(duel_id, 90)
+        self.assertEqual(resumed_challenger.hotkey, challenger.hotkey)
+        self.assertEqual(state.next_duel_index, 91)
+        self.assertEqual(state.queue, [])
+        self.assertIsNotNone(state.active_duel)
+        assert state.active_duel is not None
+        self.assertEqual(state.active_duel.task_set_phase, "confirmation_retest")
+
     def test_dashboard_reconstructs_active_duel_from_state_after_restart(self):
         king = _submission(
             hotkey="5KingHotkey",
