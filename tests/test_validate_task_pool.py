@@ -1915,15 +1915,21 @@ class TaskPoolTest(unittest.TestCase):
         self.assertTrue(claimed)
         self.assertFalse(started)
 
-    def test_diff_judge_prompt_does_not_include_timeout_flags(self):
+    def test_diff_judge_prompt_blinds_candidate_roles(self):
         prompt = validate._build_diff_judge_prompt(
             task_prompt="fix the bug",
             reference_patch="diff --git a/ref b/ref",
-            king_patch="diff --git a/king b/king",
-            challenger_patch="diff --git a/challenger b/challenger",
+            candidate_a_patch="diff --git a/role-a b/role-a",
+            candidate_b_patch="diff --git a/role-b b/role-b",
         )
 
-        payload = json.loads(prompt[prompt.index("{\n  \"challenger_patch\"") :])
+        payload = json.loads(prompt[prompt.index("{\n  \"candidate_a_patch\"") :])
+        self.assertIn("candidate_a_patch", payload)
+        self.assertIn("candidate_b_patch", payload)
+        self.assertNotIn("king_patch", payload)
+        self.assertNotIn("challenger_patch", payload)
+        self.assertNotIn("king_score", prompt)
+        self.assertNotIn("challenger_score", prompt)
         self.assertNotIn("king_timed_out", payload)
         self.assertNotIn("challenger_timed_out", payload)
         self.assertNotIn("timeout", prompt.lower())
