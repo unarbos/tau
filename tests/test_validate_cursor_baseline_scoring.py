@@ -180,6 +180,40 @@ class CursorBaselineScoringTest(unittest.TestCase):
         self.assertIsInstance(calls[1]["prompt"], str)
         self.assertIsNone(calls[1]["reasoning"])
 
+    def test_diff_judge_total_timeout_returns_neutral_score(self):
+        task_paths = SimpleNamespace(
+            task_txt_path=SimpleNamespace(read_text=lambda: "fix the bug"),
+            reference_patch_path=SimpleNamespace(read_text=lambda: "diff --git a/ref b/ref"),
+        )
+
+        def fake_solution_paths(_task_paths, solution_name):
+            return SimpleNamespace(
+                solution_diff_path=SimpleNamespace(
+                    read_text=lambda: f"diff --git a/{solution_name} b/{solution_name}",
+                ),
+            )
+
+        def fake_complete_text(**_kwargs):
+            validate.time.sleep(1.0)
+            return "{\"winner\":\"king\",\"king_score\":90,\"challenger_score\":10}"
+
+        with (
+            patch("validate.resolve_task_paths", return_value=task_paths),
+            patch("validate.resolve_solution_paths", side_effect=fake_solution_paths),
+            patch("validate.complete_text", side_effect=fake_complete_text),
+            patch("validate._DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS", 0.01),
+        ):
+            result = validate._judge_round_diffs(
+                task_name="task-judge-timeout",
+                challenger_solution_name="challenger-7-d3",
+                config=RunConfig(openrouter_api_key="test-key"),
+            )
+
+        self.assertEqual(result.winner, "tie")
+        self.assertEqual(result.king_score, 0.5)
+        self.assertEqual(result.challenger_score, 0.5)
+        self.assertIn("total timeout", result.error or "")
+
     def _run_round_with_judge(
         self,
         *,

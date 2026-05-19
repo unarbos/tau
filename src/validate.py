@@ -6,6 +6,7 @@ import json
 import hashlib
 import logging
 import os
+import queue
 import re
 import shutil
 import signal
@@ -67,6 +68,7 @@ _DIFF_JUDGE_MODEL = "anthropic/claude-sonnet-4.6"
 _DIFF_JUDGE_FALLBACK_MODELS = ("moonshotai/kimi-k2.6",)
 _DIFF_JUDGE_WEIGHT = 1.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
+_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 180
 _DIFF_JUDGE_MAX_TOKENS = 16_000
 _DIFF_JUDGE_REASONING = {"enabled": True, "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
@@ -84,7 +86,7 @@ _COPY_NEAR_EXACT_MIN_ROUNDS = 3
 _COPY_SUSPICIOUS_FRACTION_THRESHOLD = 0.60
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
-_PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
+_PARALLEL_DUEL_PER_ROUND_TIMEOUT = 300.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _GRACEFUL_DUEL_SHUTDOWN_SECONDS = 300.0
 _MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
@@ -608,6 +610,8 @@ class ActiveDuelLease:
     rounds: list[ValidationRoundResult] = field(default_factory=list)
     status: str = "running"
     updated_at: str | None = None
+    task_set_phase: str = "primary"
+    confirmation_of_duel_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -619,6 +623,8 @@ class ActiveDuelLease:
             "rounds": [r.to_dict() for r in self.rounds],
             "status": self.status,
             "updated_at": self.updated_at,
+            "task_set_phase": self.task_set_phase,
+            "confirmation_of_duel_id": self.confirmation_of_duel_id,
         }
 
     @classmethod
@@ -648,6 +654,12 @@ class ActiveDuelLease:
             updated_at=(
                 str(payload["updated_at"])
                 if payload.get("updated_at") is not None
+                else None
+            ),
+            task_set_phase=str(payload.get("task_set_phase") or "primary"),
+            confirmation_of_duel_id=(
+                int(payload["confirmation_of_duel_id"])
+                if payload.get("confirmation_of_duel_id") is not None
                 else None
             ),
         )
@@ -1046,13 +1058,9 @@ def _active_duel_dashboard_info_from_state(
         "threshold": losses + config.validate_win_margin + 1,
         "win_margin": config.validate_win_margin,
         "duel_rounds": config.validate_duel_rounds,
-        "task_set_phase": (
-            "confirmation_retest"
-            if lease.challenger.manual_retest_of_duel_id is not None
-            else "primary"
-        ),
-        "confirmation_of_duel_id": lease.challenger.manual_retest_of_duel_id,
-        "manual_retest_of_duel_id": lease.challenger.manual_retest_of_duel_id,
+        "task_set_phase": lease.task_set_phase,
+        "confirmation_of_duel_id": lease.confirmation_of_duel_id,
+        "manual_retest_of_duel_id": lease.confirmation_of_duel_id,
         "phase": phase,
         "status": phase,
         "wins": wins,
@@ -1089,6 +1097,8 @@ def _start_active_duel(
     duel_id: int,
     king: ValidatorSubmission,
     challenger: ValidatorSubmission,
+    task_set_phase: str = "primary",
+    confirmation_of_duel_id: int | None = None,
 ) -> None:
     existing = state.active_duel
     if (
@@ -1099,6 +1109,8 @@ def _start_active_duel(
     ):
         existing.status = "running"
         existing.updated_at = _timestamp()
+        existing.task_set_phase = task_set_phase
+        existing.confirmation_of_duel_id = confirmation_of_duel_id
         return
     state.active_duel = ActiveDuelLease(
         duel_id=duel_id,
@@ -1106,6 +1118,8 @@ def _start_active_duel(
         king=king,
         challenger=challenger,
         updated_at=_timestamp(),
+        task_set_phase=task_set_phase,
+        confirmation_of_duel_id=confirmation_of_duel_id,
     )
 
 
@@ -1431,6 +1445,49 @@ def _round_winner_from_scores(king_score: float, challenger_score: float) -> str
 
 
 def _judge_round_diffs(
+    *,
+    task_name: str,
+    challenger_solution_name: str,
+    config: RunConfig,
+) -> DiffJudgeResult:
+    result_queue: queue.Queue[DiffJudgeResult | BaseException] = queue.Queue(maxsize=1)
+
+    def _run() -> None:
+        try:
+            result_queue.put_nowait(
+                _judge_round_diffs_uncapped(
+                    task_name=task_name,
+                    challenger_solution_name=challenger_solution_name,
+                    config=config,
+                )
+            )
+        except BaseException as exc:
+            result_queue.put_nowait(exc)
+
+    thread = threading.Thread(
+        target=_run,
+        name=f"diff-judge-{task_name}-{challenger_solution_name}",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS)
+    if thread.is_alive():
+        log.error(
+            "Diff judge timed out after %ss for task %s solution %s; using neutral score",
+            _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS,
+            task_name,
+            challenger_solution_name,
+        )
+        return _neutral_diff_judge(
+            f"LLM diff judge exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s total timeout"
+        )
+    result = result_queue.get_nowait()
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def _judge_round_diffs_uncapped(
     *,
     task_name: str,
     challenger_solution_name: str,
@@ -4238,12 +4295,29 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     if challenger is None:
                         break
                     if challenger is not None:
-                        manual_retest_of_duel_id = challenger.manual_retest_of_duel_id
-                        is_manual_retest = manual_retest_of_duel_id is not None
-                        duel_pool = retest_pool if is_manual_retest else pool
-                        duel_pool_starved = retest_pool_starved if is_manual_retest else pool_starved
-                        duel_task_set_phase = "confirmation_retest" if is_manual_retest else "primary"
-                        duel_pool_label = "retest" if is_manual_retest else "primary"
+                        resume_lease = (
+                            state.active_duel
+                            if duel_id is not None
+                            and state.active_duel is not None
+                            and state.active_duel.duel_id == duel_id
+                            else None
+                        )
+                        confirmation_of_duel_id = (
+                            resume_lease.confirmation_of_duel_id
+                            if resume_lease is not None
+                            else challenger.manual_retest_of_duel_id
+                        )
+                        duel_task_set_phase = (
+                            resume_lease.task_set_phase
+                            if resume_lease is not None
+                            else ("confirmation_retest" if confirmation_of_duel_id is not None else "primary")
+                        )
+                        is_confirmation_retest = duel_task_set_phase == "confirmation_retest"
+                        is_manual_retest = challenger.manual_retest_of_duel_id is not None
+                        manual_retest_of_duel_id = confirmation_of_duel_id
+                        duel_pool = retest_pool if is_confirmation_retest else pool
+                        duel_pool_starved = retest_pool_starved if is_confirmation_retest else pool_starved
+                        duel_pool_label = "retest" if is_confirmation_retest else "primary"
                         pool_ready, pool_gate_reason = _static_pool_ready_for_king(
                             config=config,
                             pool=duel_pool,
@@ -4277,6 +4351,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             duel_id=duel_id,
                             king=state.current_king,
                             challenger=challenger,
+                            task_set_phase=duel_task_set_phase,
+                            confirmation_of_duel_id=confirmation_of_duel_id,
                         )
                         try:
                             _save_state(paths.state_path, state)
@@ -4358,7 +4434,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "duel_rounds": config.validate_duel_rounds,
                                     "task_set_phase": task_set_phase,
                                     "confirmation_of_duel_id": confirmation_of_duel_id,
-                                    "manual_retest_of_duel_id": challenger.manual_retest_of_duel_id,
+                                    "manual_retest_of_duel_id": confirmation_of_duel_id,
                                     "phase": phase,
                                     "status": phase,
                                     "wins": wins, "losses": losses, "ties": ties,
@@ -4475,13 +4551,13 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                         active_duel_info = None
                         duel_count += 1
-                        if is_manual_retest:
+                        if is_confirmation_retest:
                             duel_result.task_set_phase = "confirmation_retest"
-                            duel_result.confirmation_of_duel_id = manual_retest_of_duel_id
+                            duel_result.confirmation_of_duel_id = confirmation_of_duel_id
                             duel_result.confirmation_retest_passed = duel_result.king_replaced
                             if not duel_result.king_replaced:
                                 duel_result.confirmation_failure_reason = (
-                                    f"manual confirmation retest duel {duel_id} failed "
+                                    f"confirmation retest duel {duel_id} failed "
                                     f"(W={duel_result.wins} L={duel_result.losses} T={duel_result.ties})"
                                 )
 
@@ -4492,7 +4568,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                         confirmation_result: DuelResult | None = None
                         aborted_confirmation_summary: dict[str, Any] | None = None
-                        if duel_result.king_replaced and not is_manual_retest:
+                        if duel_result.king_replaced and not is_confirmation_retest:
                             _clear_active_duel(state, duel_result.duel_id)
                             try:
                                 _save_state(paths.state_path, state)
@@ -4508,6 +4584,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 duel_id=retest_duel_id,
                                 king=state.current_king,
                                 challenger=challenger,
+                                task_set_phase="confirmation_retest",
+                                confirmation_of_duel_id=duel_result.duel_id,
                             )
                             try:
                                 _save_state(paths.state_path, state)

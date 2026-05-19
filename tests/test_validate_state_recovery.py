@@ -579,6 +579,8 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
                 rounds=[round_result],
                 status="running",
                 updated_at="2026-05-06T00:01:00+00:00",
+                task_set_phase="confirmation_retest",
+                confirmation_of_duel_id=76,
             ),
         )
 
@@ -590,6 +592,8 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual(restored.active_duel.challenger.hotkey, challenger.hotkey)
         self.assertEqual(restored.active_duel.task_names, ["validate-000001", "validate-000002"])
         self.assertEqual(restored.active_duel.rounds[0].winner, "challenger")
+        self.assertEqual(restored.active_duel.task_set_phase, "confirmation_retest")
+        self.assertEqual(restored.active_duel.confirmation_of_duel_id, 76)
         self.assertIn(challenger.hotkey, restored.seen_hotkeys)
 
     def test_checkpoint_active_duel_updates_tasks_rounds_and_status(self):
@@ -606,7 +610,18 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
             block=112,
         )
         state = ValidatorState()
-        _start_active_duel(state, duel_id=81, king=king, challenger=challenger)
+        _start_active_duel(
+            state,
+            duel_id=81,
+            king=king,
+            challenger=challenger,
+            task_set_phase="confirmation_retest",
+            confirmation_of_duel_id=80,
+        )
+        self.assertIsNotNone(state.active_duel)
+        assert state.active_duel is not None
+        self.assertEqual(state.active_duel.task_set_phase, "confirmation_retest")
+        self.assertEqual(state.active_duel.confirmation_of_duel_id, 80)
         round_result = _round(task_name="validate-000003", winner="king")
 
         changed = _checkpoint_active_duel(
@@ -817,6 +832,8 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
                 task_names=["validate-000001", "validate-000002"],
                 rounds=[],
                 status="running_rounds",
+                task_set_phase="confirmation_retest",
+                confirmation_of_duel_id=89,
             ),
         )
 
@@ -831,6 +848,9 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual(active["duel_id"], 90)
         self.assertEqual(active["challenger_uid"], 12)
         self.assertEqual(active["phase"], "running_rounds")
+        self.assertEqual(active["task_set_phase"], "confirmation_retest")
+        self.assertEqual(active["confirmation_of_duel_id"], 89)
+        self.assertEqual(active["manual_retest_of_duel_id"], 89)
         self.assertEqual(active["scored"], 0)
         self.assertEqual(active["gathered_tasks"], 2)
         self.assertEqual(active["needed_tasks"], 50)
