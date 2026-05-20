@@ -2218,6 +2218,24 @@ def _is_complete_saved_task_dir(task_dir: Path) -> bool:
     )
 
 
+def _saved_task_baseline_can_fill_pool(task_dir: Path) -> bool:
+    """Return False only for saved tasks with a known-bad cached baseline."""
+    task_paths = resolve_task_paths(task_dir.parent, task_dir.name)
+    baseline_paths = build_solution_paths(task_paths, "baseline")
+    if not baseline_paths.solve_json_path.is_file():
+        return True
+    if not baseline_paths.solution_diff_path.is_file():
+        return False
+    try:
+        payload = json.loads(baseline_paths.solve_json_path.read_text())
+    except Exception:
+        return False
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        return False
+    return str(result.get("exit_reason") or "") == "completed"
+
+
 def _pool_task_names_from_disk(validate_root: Path) -> set[str]:
     names: set[str] = set()
     for path in validate_root.glob("task-pool*/*.json"):
@@ -2251,6 +2269,7 @@ def _claim_saved_task_for_pool(
             for task_dir in sorted(config.tasks_root.glob("validate-*"), key=lambda p: p.name)
             if (
                 _is_complete_saved_task_dir(task_dir)
+                and _saved_task_baseline_can_fill_pool(task_dir)
                 and task_dir.name not in existing
                 and task_dir.name not in _SAVED_TASK_FILL_IN_FLIGHT
             )

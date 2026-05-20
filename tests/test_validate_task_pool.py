@@ -121,6 +121,36 @@ class TaskPoolTest(unittest.TestCase):
 
             self.assertIsNone(validate._claim_saved_task_for_pool(config, pool, "primary"))
 
+    def test_claim_saved_task_for_pool_skips_known_bad_cached_baseline(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            pool = TaskPool(root / "pool")
+
+            for name, exit_reason in (
+                ("validate-20260101000000-000001", "time_limit_exceeded"),
+                ("validate-20260101000000-000002", "completed"),
+            ):
+                task_root = config.tasks_root / name
+                task_dir = task_root / "task"
+                task_dir.mkdir(parents=True)
+                for artifact in ("task.json", "task.txt", "commit.json", "reference.patch"):
+                    (task_dir / artifact).write_text("{}\n")
+                baseline_dir = task_root / "solutions" / "baseline"
+                baseline_dir.mkdir(parents=True)
+                (baseline_dir / "solution.diff").write_text("diff\n")
+                (baseline_dir / "solve.json").write_text(
+                    json.dumps({"result": {"exit_reason": exit_reason, "elapsed_seconds": 1.0}}) + "\n"
+                )
+
+            claimed = validate._claim_saved_task_for_pool(config, pool, "primary")
+            try:
+                self.assertIsNotNone(claimed)
+                assert claimed is not None
+                self.assertEqual(claimed.name, "validate-20260101000000-000002")
+            finally:
+                validate._release_saved_task_claim(claimed.name if claimed else None)
+
     def test_pool_filler_continues_while_duel_is_gathering(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
