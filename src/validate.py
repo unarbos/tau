@@ -313,13 +313,18 @@ def _duel_math_stop_reason(wins: int, losses: int, remaining_rounds: int, margin
     return None
 
 
-def _copy_detection_reason(rounds: Sequence["ValidationRoundResult"]) -> str | None:
+def _copy_detection_reason(
+    rounds: Sequence["ValidationRoundResult"],
+    *,
+    include_mean_similarity: bool = True,
+    include_suspicious_fraction: bool = True,
+) -> str | None:
     scored_sim = [r.king_challenger_similarity for r in rounds if r.scored and r.king_challenger_similarity > 0]
     if not scored_sim:
         return None
 
     mean_sim = sum(scored_sim) / len(scored_sim)
-    if mean_sim >= _COPY_MEAN_SIMILARITY_THRESHOLD:
+    if include_mean_similarity and mean_sim >= _COPY_MEAN_SIMILARITY_THRESHOLD:
         return (
             "copy detected "
             f"(mean similarity {mean_sim:.3f} >= {_COPY_MEAN_SIMILARITY_THRESHOLD:.2f})"
@@ -334,7 +339,7 @@ def _copy_detection_reason(rounds: Sequence["ValidationRoundResult"]) -> str | N
 
     suspicious = [sim for sim in scored_sim if sim >= _COPY_SUSPICIOUS_SIMILARITY_THRESHOLD]
     suspicious_fraction = len(suspicious) / len(scored_sim)
-    if suspicious_fraction >= _COPY_SUSPICIOUS_FRACTION_THRESHOLD:
+    if include_suspicious_fraction and suspicious_fraction >= _COPY_SUSPICIOUS_FRACTION_THRESHOLD:
         return (
             "copy detected "
             f"({len(suspicious)}/{len(scored_sim)} rounds >= {_COPY_SUSPICIOUS_SIMILARITY_THRESHOLD:.2f})"
@@ -3638,6 +3643,7 @@ def _run_parallel_duel(
     interrupted_by_shutdown = False
     partial_shutdown_interrupt = False
     math_stop_reason: str | None = None
+    dq_stop_reason: str | None = None
 
     def _emit_progress() -> None:
         if on_round_complete is None:
@@ -3717,6 +3723,28 @@ def _run_parallel_duel(
                 reason,
             )
 
+        def _stop_for_dq_if_detected() -> bool:
+            nonlocal dq_stop_reason
+            if stop_submitting_reason is not None:
+                return False
+            reason = _copy_detection_reason(
+                rounds,
+                include_mean_similarity=False,
+                include_suspicious_fraction=False,
+            )
+            if reason is None:
+                return False
+            dq_stop_reason = reason
+            log.warning(
+                "Duel %d: challenger uid=%s disqualified early: %s",
+                duel_id,
+                challenger.uid,
+                reason,
+            )
+            _stop_submitting(reason)
+            _cancel_pending_rounds(reason)
+            return True
+
         def _stop_for_math_if_decided() -> bool:
             nonlocal math_stop_reason
             if stop_submitting_reason is not None:
@@ -3757,7 +3785,7 @@ def _run_parallel_duel(
                 len(task_queue),
             )
             _emit_progress()
-        if not _stop_for_math_if_decided():
+        if not _stop_for_dq_if_detected() and not _stop_for_math_if_decided():
             _submit_available()
         while pending:
             now = time.monotonic()
@@ -3812,6 +3840,7 @@ def _run_parallel_duel(
                         timeout_streak = 0
 
                     _emit_progress()
+                    _stop_for_dq_if_detected()
 
             # Hard-deadline / stuck-progress check fires regardless of whether
             # a future completed in this slice. Completed futures are handled
@@ -3875,7 +3904,7 @@ def _run_parallel_duel(
                 break
 
             if completed_this_slice:
-                if not _stop_for_math_if_decided():
+                if stop_submitting_reason is None and not _stop_for_math_if_decided():
                     _submit_available()
                 last_heartbeat_at = time.monotonic()
                 continue
@@ -3898,7 +3927,16 @@ def _run_parallel_duel(
         raise RuntimeError("duel interrupted by validator shutdown before all rounds were started")
 
     solve_elapsed = time.monotonic() - solve_start
-    if math_stop_reason:
+    if dq_stop_reason:
+        log.info(
+            "Duel %d: stopped after %d/%d selected round(s) in %.1fs due to challenger DQ (%s)",
+            duel_id,
+            len(rounds),
+            len(tasks),
+            solve_elapsed,
+            dq_stop_reason,
+        )
+    elif math_stop_reason:
         log.info(
             "Duel %d: mathematically stopped after %d/%d selected round(s) in %.1fs (%s)",
             duel_id,
@@ -3924,10 +3962,12 @@ def _run_parallel_duel(
              duel_id, wins, losses, ties, decisive, challenger_won)
 
     king_replaced = False
-    dq_reason: str | None = None
+    dq_reason = dq_stop_reason
     king_after = king
 
-    if challenger_won:
+    if dq_reason is not None:
+        log.warning("Duel %d: %s", duel_id, dq_reason)
+    elif challenger_won:
         dq_reason = _copy_detection_reason(rounds)
         if dq_reason is not None:
             log.warning("Duel %d: %s", duel_id, dq_reason)
