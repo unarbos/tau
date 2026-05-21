@@ -225,6 +225,231 @@ def _delete_keys_batch(keys: list[str]) -> int:
     return deleted
 
 
+def build_dashboard_payload(*, current_king: dict[str, Any] | None, duel_history: list[dict[str, Any]], status: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "updated_at": datetime.now(tz=UTC).isoformat(),
+        "current_king": current_king,
+        "duels": duel_history,
+        "status": status,
+    }
+
+
+def build_dashboard_home_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return _dashboard_home_payload(payload)
+
+
+def _copy_fields(source: dict[str, Any] | None, fields: tuple[str, ...]) -> dict[str, Any] | None:
+    if not isinstance(source, dict):
+        return None
+    return {field: source.get(field) for field in fields if field in source}
+
+
+def _round_count(source: dict[str, Any] | None) -> int:
+    if not isinstance(source, dict):
+        return 0
+    count = source.get("round_count")
+    if isinstance(count, int) and count >= 0:
+        return count
+    rounds = source.get("rounds")
+    return len(rounds) if isinstance(rounds, list) else 0
+
+
+def _dashboard_submission_summary(source: dict[str, Any] | None) -> dict[str, Any] | None:
+    return _copy_fields(source, (
+        "uid", "hotkey", "agent_username", "coldkey", "repo", "repo_full_name",
+        "repo_url", "pr_url", "pr_number", "commit_sha", "display_repo_full_name",
+        "display_repo_url", "display_commit_sha", "runtime_commit_sha",
+        "runtime_repo_full_name", "runtime_repo_url", "source", "share", "king_since",
+        "king_duels_defended", "hold_seconds", "accepted_at", "commitment",
+        "accepted_at", "base_repo_full_name",
+    ))
+
+
+def _dashboard_round_summary(source: dict[str, Any] | None) -> dict[str, Any]:
+    return _copy_fields(source, ("task_name", "winner", "llm_judge_winner", "error")) or {}
+
+
+def _dashboard_duel_summary(source: dict[str, Any]) -> dict[str, Any]:
+    summary = _copy_fields(source, (
+        "duel_id", "started_at", "finished_at", "king_replaced", "disqualification_reason",
+        "confirmation_duel_id", "confirmation_retest_passed", "confirmation_failure_reason",
+        "confirmation_of_duel_id", "manual_retest_of_duel_id", "wins", "losses", "ties",
+        "errors", "threshold", "duel_rounds", "task_set_phase", "king_uid", "king_hotkey",
+        "king_agent_username", "king_repo", "king_repo_url", "king_pr_url", "king_commit_sha",
+        "king_commitment_block", "challenger_uid", "challenger_hotkey",
+        "challenger_agent_username", "hotkey", "challenger_repo", "challenger_repo_url",
+        "challenger_pr_url", "challenger_commit_sha", "challenger_commitment_block",
+    )) or {}
+    summary["round_count"] = _round_count(source)
+    return summary
+
+
+def _dashboard_active_duel_summary(source: dict[str, Any] | None) -> dict[str, Any] | None:
+    summary = _copy_fields(source, (
+        "duel_id", "phase", "status", "challenger_uid", "challenger_hotkey",
+        "challenger_agent_username", "challenger_repo", "challenger_repo_url", "challenger_pr_url",
+        "king_uid", "king_hotkey", "king_agent_username", "king_repo", "king_repo_url",
+        "king_pr_url", "duel_rounds", "target_round_count", "gathered_tasks", "needed_tasks",
+        "wins", "losses", "ties", "threshold", "task_set_phase", "confirmation_of_duel_id",
+        "confirmation_duel_id", "manual_retest_of_duel_id", "pool_size",
+    ))
+    if summary is None:
+        return None
+    rounds = source.get("rounds") if isinstance(source, dict) else None
+    summary["rounds"] = [_dashboard_round_summary(item) for item in rounds] if isinstance(rounds, list) else []
+    return summary
+
+
+def _dashboard_status_summary(source: dict[str, Any] | None, duels: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    source = _status_with_corrected_recent_king_counts(source, duels or [])
+    if not isinstance(source, dict):
+        return {}
+    summary = _copy_fields(source, (
+        "netuid", "total_rounds", "miners_seen", "king_duels_defended", "king_since",
+        "validator_started_at", "scoring", "links",
+    )) or {}
+    for key in ("recent_kings", "queue", "disqualified", "retired"):
+        summary[key] = [_dashboard_submission_summary(item) for item in source.get(key, []) if isinstance(item, dict)]
+    summary["active_duel"] = _dashboard_active_duel_summary(source.get("active_duel"))
+    return summary
+
+
+def build_dashboard_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    duels = payload.get("duels")
+    links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+    return {
+        "updated_at": payload.get("updated_at"),
+        "current_king": _dashboard_submission_summary(payload.get("current_king")),
+        "duels": [_dashboard_duel_summary(item) for item in duels if isinstance(item, dict)] if isinstance(duels, list) else [],
+        "duels_total": len(duels) if isinstance(duels, list) else 0,
+        "status": _dashboard_status_summary(payload.get("status"), duels if isinstance(duels, list) else []),
+        "links": {**links, "duels_html": "./duels.html", "dashboard_full": "./dashboard.json"},
+    }
+
+
+
+def _same_dashboard_participant(left: dict[str, Any] | None, right: dict[str, Any] | None, prefix: str = "") -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    uid = left.get(f"{prefix}_uid") if prefix else left.get("uid")
+    hotkey = left.get(f"{prefix}_hotkey") if prefix else left.get("hotkey")
+    commit = (
+        left.get(f"{prefix}_display_commit_sha")
+        or left.get(f"{prefix}_commit_sha")
+        if prefix
+        else left.get("display_commit_sha") or left.get("commit_sha")
+    )
+    right_uid = right.get("uid") or right.get("king_uid") or right.get("challenger_uid")
+    right_hotkey = right.get("hotkey") or right.get("king_hotkey") or right.get("challenger_hotkey")
+    right_commits = [
+        str(value).lower()
+        for value in (right.get("display_commit_sha"), right.get("commit_sha"))
+        if value
+    ]
+    if uid is not None and right_uid is not None and str(uid) != str(right_uid):
+        return False
+    if hotkey and right_hotkey and str(hotkey) != str(right_hotkey):
+        return False
+    if commit and right_commits and not any(value.startswith(str(commit).lower()) or str(commit).lower().startswith(value) for value in right_commits):
+        return False
+    return any(value is not None and value != "" for value in (uid, hotkey, commit))
+
+
+def _duel_id(source: dict[str, Any]) -> int:
+    try:
+        return int(source.get("duel_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _linked_confirmation_failed(duel: dict[str, Any], duels_by_id: dict[int, dict[str, Any]]) -> bool:
+    if duel.get("confirmation_retest_passed") is False:
+        return True
+    try:
+        confirmation_id = int(duel.get("confirmation_duel_id") or 0)
+    except (TypeError, ValueError):
+        confirmation_id = 0
+    linked = duels_by_id.get(confirmation_id) if confirmation_id else None
+    return isinstance(linked, dict) and linked.get("confirmation_retest_passed") is False
+
+
+def _real_king_transition(duel: dict[str, Any], duels_by_id: dict[int, dict[str, Any]]) -> bool:
+    if duel.get("king_replaced") is not True:
+        return False
+    if duel.get("task_set_phase") == "confirmation_retest" or duel.get("confirmation_of_duel_id") is not None:
+        return False
+    if duel.get("disqualification_reason"):
+        return False
+    return not _linked_confirmation_failed(duel, duels_by_id)
+
+
+def _transition_matches(duel: dict[str, Any], participant: dict[str, Any], prefix: str, duels_by_id: dict[int, dict[str, Any]]) -> bool:
+    return _real_king_transition(duel, duels_by_id) and _same_dashboard_participant(duel, participant, prefix)
+
+
+def _dashboard_defense_count(participant: dict[str, Any], duels: list[dict[str, Any]]) -> int:
+    ordered = sorted((duel for duel in duels if isinstance(duel, dict)), key=_duel_id)
+    duels_by_id = {_duel_id(duel): duel for duel in ordered if _duel_id(duel)}
+    start_id = 0
+    for duel in ordered:
+        if _transition_matches(duel, participant, "challenger", duels_by_id):
+            start_id = _duel_id(duel)
+    end_id = None
+    for duel in ordered:
+        duel_id = _duel_id(duel)
+        if duel_id <= start_id:
+            continue
+        if _transition_matches(duel, participant, "king", duels_by_id):
+            end_id = duel_id
+            break
+
+    count = 0
+    for duel in ordered:
+        duel_id = _duel_id(duel)
+        if duel_id <= start_id:
+            continue
+        if end_id is not None and duel_id >= end_id:
+            continue
+        if not _same_dashboard_participant(duel, participant, "king"):
+            continue
+        if duel.get("task_set_phase") == "confirmation_retest" or duel.get("confirmation_of_duel_id") is not None:
+            continue
+        if duel.get("disqualification_reason"):
+            continue
+        if _real_king_transition(duel, duels_by_id):
+            continue
+        count += 1
+    return count
+
+
+def _dashboard_queue_item(source: Any) -> Any:
+    if not isinstance(source, dict):
+        return source
+    if not str(source.get("source") or "").startswith("private"):
+        return source
+    return {
+        key: value
+        for key, value in source.items()
+        if key not in {"submission_block", "registration_block", "commitment_block"}
+    }
+
+
+def _status_with_corrected_recent_king_counts(status: Any, duels: list[dict[str, Any]]) -> Any:
+    if not isinstance(status, dict):
+        return status
+    recent = status.get("recent_kings")
+    corrected_recent = recent
+    if isinstance(recent, list):
+        corrected_recent = []
+        for item in recent:
+            if not isinstance(item, dict):
+                corrected_recent.append(item)
+                continue
+            corrected_recent.append({**item, "king_duels_defended": _dashboard_defense_count(item, duels)})
+    queue = status.get("queue")
+    corrected_queue = [_dashboard_queue_item(item) for item in queue] if isinstance(queue, list) else queue
+    return {**status, "recent_kings": corrected_recent, "queue": corrected_queue}
+
 def publish_dashboard_data(
     *,
     current_king: dict[str, Any] | None,
@@ -236,13 +461,8 @@ def publish_dashboard_data(
         log.warning("R2 credentials not configured; skipping dashboard publish")
         return False
 
-    payload = {
-        "updated_at": datetime.now(tz=UTC).isoformat(),
-        "current_king": current_king,
-        "duels": duel_history,
-        "status": status,
-    }
-    home_payload = _dashboard_home_payload(payload)
+    payload = build_dashboard_payload(current_king=current_king, duel_history=duel_history, status=status)
+    home_payload = build_dashboard_home_payload(payload)
     try:
         # Short max-age so Hippius's edge cache doesn't make the dashboard
         # look frozen to viewers. We publish every few seconds anyway.
@@ -273,7 +493,7 @@ def _dashboard_home_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "current_king": payload.get("current_king"),
         "duels": recent_duels,
         "duels_total": len(duels) if isinstance(duels, list) else 0,
-        "status": payload.get("status"),
+        "status": _status_with_corrected_recent_king_counts(payload.get("status"), duels if isinstance(duels, list) else []),
         "links": {
             **links,
             "dashboard_full": "./dashboard.json",

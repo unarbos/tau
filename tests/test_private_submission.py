@@ -3,6 +3,7 @@ import io
 import json
 import os
 import tempfile
+from datetime import UTC, datetime
 import unittest
 from email.message import Message
 from pathlib import Path
@@ -12,6 +13,7 @@ from unittest.mock import patch
 from config import RunConfig
 from private_submission import (
     build_public_submissions_api_payload,
+    check_and_record_private_submission_attempt,
     private_submission_check_passed,
     private_submission_signature_payload,
     private_submission_registration_check,
@@ -244,6 +246,42 @@ class PrivateSubmissionChecksTest(unittest.TestCase):
 
         self.assertEqual(result.status, "failed")
         self.assertTrue(any("Registration block is required" in item for item in result.findings))
+
+    def test_hotkey_submission_attempt_limit_prunes_old_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_attempt = check_and_record_private_submission_attempt(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="old",
+                agent_sha256="a" * 64,
+                max_attempts=1,
+                window_seconds=60,
+                now=datetime.fromtimestamp(0, UTC),
+            )
+            fresh_attempt = check_and_record_private_submission_attempt(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="fresh",
+                agent_sha256="b" * 64,
+                max_attempts=1,
+                window_seconds=60,
+                now=datetime.fromtimestamp(61, UTC),
+            )
+            blocked = check_and_record_private_submission_attempt(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="blocked",
+                agent_sha256="c" * 64,
+                max_attempts=1,
+                window_seconds=60,
+                now=datetime.fromtimestamp(62, UTC),
+            )
+
+        self.assertTrue(old_attempt["allowed"])
+        self.assertTrue(fresh_attempt["allowed"])
+        self.assertFalse(blocked["allowed"])
+        self.assertEqual(blocked["attempts"], 1)
 
     def test_public_submissions_api_payload_excludes_private_code_and_signature(self):
         result = run_private_submission_checks(
@@ -946,6 +984,78 @@ class PrivateSubmissionApiTest(unittest.TestCase):
             second_payload["ci_checks"]["registration_gate"]["summary"],
             "This exact private submission is already accepted for the current registration.",
         )
+
+    def test_hotkey_rate_limit_blocks_before_ci_checks(self):
+        from submission_api import SubmissionApiConfig, handle_submission_request
+
+        boundary = "----test-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="hotkey"\r\n\r\n'
+            f"{HOTKEY}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="submission_id"\r\n\r\n'
+            "sub-1\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="signature"\r\n\r\n'
+            f"{SIGNATURE}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="agent"; filename="agent.py"\r\n'
+            "Content-Type: text/x-python\r\n\r\n"
+            f"{GOOD_AGENT}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        headers = Message()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        headers["Content-Length"] = str(len(body))
+        judge_calls = 0
+
+        def judge(payload):
+            nonlocal judge_calls
+            judge_calls += 1
+            return {"verdict": "fail", "overall_score": 10}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "private-submissions"
+            base_agent = Path(tmp) / "base_agent.py"
+            base_agent.write_text(BASE_AGENT, encoding="utf-8")
+            config = SubmissionApiConfig(
+                private_submission_root=root,
+                base_agent=base_agent,
+                run_config=RunConfig(validate_netuid=66),
+                judge=judge,
+                judge_min_score=70,
+                hotkey_rate_limit_max_attempts=2,
+                hotkey_rate_limit_window_seconds=86_400,
+            )
+
+            with patch("submission_api._verify_hotkey_signature", return_value=True):
+                with patch("submission_api.registration_context", return_value=(100, 42, None)):
+                    first_status, first_payload = handle_submission_request(
+                        headers=headers,
+                        rfile=io.BytesIO(body),
+                        config=config,
+                    )
+                    second_status, second_payload = handle_submission_request(
+                        headers=headers,
+                        rfile=io.BytesIO(body),
+                        config=config,
+                    )
+                    third_status, third_payload = handle_submission_request(
+                        headers=headers,
+                        rfile=io.BytesIO(body),
+                        config=config,
+                    )
+
+        self.assertEqual(first_status, 422)
+        self.assertEqual(second_status, 422)
+        self.assertEqual(third_status, 429)
+        self.assertFalse(first_payload["accepted"])
+        self.assertFalse(second_payload["accepted"])
+        self.assertEqual(third_payload["error"], "hotkey_rate_limited")
+        self.assertEqual(third_payload["rate_limit"]["attempts"], 2)
+        self.assertEqual(list(third_payload["ci_checks"].keys()), ["hotkey_rate_limit"])
+        self.assertEqual(judge_calls, 2)
 
     def test_exact_resubmission_does_not_fall_through_when_bundle_is_missing(self):
         from submission_api import SubmissionApiConfig, handle_submission_request

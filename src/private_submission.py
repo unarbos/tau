@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 DEFAULT_OPENROUTER_MIN_SCORE = 70
 PRIVATE_SUBMISSION_ACCEPTANCE_LEDGER = "_accepted_submissions.json"
+PRIVATE_SUBMISSION_ATTEMPT_LEDGER = "_submission_attempts.json"
 MINER_HOTKEY_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}$")
 REQUIRED_SOLVE_ARGS = ("repo_path", "issue", "model", "api_base", "api_key")
 ALLOWED_ENV_NAMES = {
@@ -462,6 +463,81 @@ def record_private_submission_acceptance(
     _write_acceptance_ledger(root, ledger)
 
 
+def check_and_record_private_submission_attempt(
+    *,
+    root: Path,
+    hotkey: str,
+    submission_id: str,
+    agent_sha256: str,
+    window_seconds: int = 86_400,
+    max_attempts: int = 4,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current_time = now or datetime.now(UTC)
+    ledger = _read_attempt_ledger(root)
+    ledger.setdefault("version", 1)
+    hotkeys = ledger.setdefault("hotkeys", {})
+    if not isinstance(hotkeys, dict):
+        raise ValueError("private submission attempt ledger has invalid `hotkeys`")
+
+    recent_attempts = recent_private_submission_attempts(
+        hotkeys.get(hotkey, []),
+        now=current_time,
+        window_seconds=window_seconds,
+    )
+    if len(recent_attempts) >= max_attempts:
+        hotkeys[hotkey] = recent_attempts
+        _write_attempt_ledger(root, ledger)
+        oldest_attempted_at = _parse_attempted_at(recent_attempts[0])
+        retry_after_seconds = (
+            max(0, int(window_seconds - (current_time - oldest_attempted_at).total_seconds()))
+            if oldest_attempted_at is not None
+            else int(window_seconds)
+        )
+        return {
+            "allowed": False,
+            "attempts": len(recent_attempts),
+            "max_attempts": int(max_attempts),
+            "window_seconds": int(window_seconds),
+            "retry_after_seconds": retry_after_seconds,
+        }
+
+    hotkeys[hotkey] = [
+        *recent_attempts,
+        {
+            "submission_id": submission_id,
+            "agent_sha256": agent_sha256.lower(),
+            "attempted_at": current_time.isoformat(),
+        },
+    ]
+    _write_attempt_ledger(root, ledger)
+    return {
+        "allowed": True,
+        "attempts": len(hotkeys[hotkey]),
+        "max_attempts": int(max_attempts),
+        "window_seconds": int(window_seconds),
+        "retry_after_seconds": 0,
+    }
+
+
+def recent_private_submission_attempts(
+    attempts: Any,
+    *,
+    now: datetime,
+    window_seconds: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(attempts, list):
+        return []
+    cutoff = now.timestamp() - int(window_seconds)
+    return [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, dict)
+        for attempted_at in [_parse_attempted_at(attempt)]
+        if attempted_at is not None and attempted_at.timestamp() >= cutoff
+    ]
+
+
 def build_public_submissions_api_payload(*, root: Path) -> dict[str, Any]:
     ledger = _read_acceptance_ledger(root)
     hotkeys = ledger.get("hotkeys", {})
@@ -818,6 +894,46 @@ def _write_acceptance_ledger(root: Path, payload: dict[str, Any]) -> None:
         tmp.write("\n")
         tmp_path = Path(tmp.name)
     tmp_path.replace(path)
+
+
+def _read_attempt_ledger(root: Path) -> dict[str, Any]:
+    path = root / PRIVATE_SUBMISSION_ATTEMPT_LEDGER
+    if not path.is_file():
+        return {"version": 1, "hotkeys": {}}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"private submission attempt ledger is unreadable: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"private submission attempt ledger is invalid: {path}")
+    hotkeys = payload.setdefault("hotkeys", {})
+    if not isinstance(hotkeys, dict):
+        raise ValueError(f"private submission attempt ledger has invalid `hotkeys`: {path}")
+    payload.setdefault("version", 1)
+    return payload
+
+
+def _write_attempt_ledger(root: Path, payload: dict[str, Any]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / PRIVATE_SUBMISSION_ATTEMPT_LEDGER
+    with tempfile.NamedTemporaryFile("w", dir=root, encoding="utf-8", delete=False) as tmp:
+        json.dump(payload, tmp, indent=2, sort_keys=True)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+def _parse_attempted_at(attempt: dict[str, Any]) -> datetime | None:
+    value = str(attempt.get("attempted_at") or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _optional_int(value: Any) -> int | None:

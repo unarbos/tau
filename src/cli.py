@@ -393,6 +393,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve_submissions_api.add_argument("--rate-limit-window-seconds", type=int, default=60, help="Per-IP rate-limit window.")
     serve_submissions_api.add_argument("--rate-limit-max-requests", type=int, default=6, help="Maximum submissions per IP per window.")
     serve_submissions_api.add_argument("--rate-limit-max-failures", type=int, default=3, help="Maximum failed submissions per IP per window.")
+    serve_submissions_api.add_argument("--hotkey-rate-limit-window-seconds", type=int, default=86_400, help="Per-hotkey submission attempt window.")
+    serve_submissions_api.add_argument("--hotkey-rate-limit-max-attempts", type=int, default=4, help="Maximum judged submission attempts per hotkey per window.")
 
     validate = subparsers.add_parser(
         "validate",
@@ -975,6 +977,8 @@ def _run_serve_submissions_api(args: argparse.Namespace) -> None:
         rate_limit_window_seconds=args.rate_limit_window_seconds,
         rate_limit_max_requests=args.rate_limit_max_requests,
         rate_limit_max_failures=args.rate_limit_max_failures,
+        hotkey_rate_limit_window_seconds=args.hotkey_rate_limit_window_seconds,
+        hotkey_rate_limit_max_attempts=args.hotkey_rate_limit_max_attempts,
     )
     serve_submissions_api(host=args.host, port=args.port, config=config)
 

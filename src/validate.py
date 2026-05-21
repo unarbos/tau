@@ -31,6 +31,8 @@ from private_submission import accepted_private_submission_entries, private_subm
 from r2 import (
     duel_to_summary,
     fetch_chain_data,
+    build_dashboard_home_payload,
+    build_dashboard_summary_payload,
     publish_dashboard_data,
     publish_duel_data,
     publish_duel_index,
@@ -5115,7 +5117,21 @@ def _publish_dashboard(
     chain_data: dict[str, Any] | None = None,
 ) -> None:
     king = state.current_king
-    king_dict = _dashboard_submission_dict(king, history=history) if king else None
+    current_king_defenses = _current_king_defense_count(
+        king_hotkey=king.hotkey if king else None,
+        history=history,
+    )
+    king_dict = (
+        _dashboard_submission_dict(
+            king,
+            history=history,
+            king_since=state.king_since,
+            king_duels_defended=current_king_defenses,
+            hold_seconds=_recent_king_hold_seconds(king, state=state, history=history),
+        )
+        if king
+        else None
+    )
 
     active_duel_info = active_duel or _active_duel_dashboard_info_from_state(
         state,
@@ -5170,8 +5186,8 @@ def _publish_dashboard(
                 "uid": s.uid,
                 "repo": s.hotkey,
                 "hotkey": s.hotkey,
-                "commitment_block": s.commitment_block,
                 "accepted_at": s.accepted_at,
+                **({} if str(s.source).startswith("private") else {"commitment_block": s.commitment_block}),
                 "source": s.source,
             }
             for s in state.queue
@@ -5182,10 +5198,7 @@ def _publish_dashboard(
         "total_rounds": total_rounds,
         "miners_seen": len(state.seen_hotkeys),
         "king_since": state.king_since,
-        "king_duels_defended": _current_king_defense_count(
-            king_hotkey=king.hotkey if king else None,
-            history=history,
-        ),
+        "king_duels_defended": current_king_defenses,
         "king_window_size": config.validate_king_window_size,
         "recent_kings": [
             _dashboard_submission_dict(
@@ -5204,6 +5217,8 @@ def _publish_dashboard(
     payload = {"updated_at": _timestamp(), "current_king": king_dict, "duels": history, "status": status}
     try:
         write_json(config.validate_root / "dashboard_data.json", payload)
+        write_json(config.validate_root / "dashboard-home.json", build_dashboard_home_payload(payload))
+        write_json(config.validate_root / "dashboard-summary.json", build_dashboard_summary_payload(payload))
     except Exception:
         log.exception("Local dashboard write failed (non-fatal)")
     try:

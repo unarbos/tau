@@ -16,6 +16,7 @@ from private_submission import (
     SubmissionCheck,
     accepted_private_submission_identity,
     build_public_submissions_api_payload,
+    check_and_record_private_submission_attempt,
     derive_submission_id,
     private_submission_check_passed,
     private_submission_registration_check,
@@ -40,9 +41,12 @@ MAX_CONCURRENT_SUBMISSIONS = 2
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_MAX_REQUESTS = 6
 RATE_LIMIT_MAX_FAILURES = 3
+HOTKEY_RATE_LIMIT_WINDOW_SECONDS = 86_400
+HOTKEY_RATE_LIMIT_MAX_ATTEMPTS = 4
 
 _submission_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SUBMISSIONS)
 _rate_lock = threading.Lock()
+_hotkey_rate_lock = threading.Lock()
 _rate_buckets: dict[str, list[tuple[float, bool]]] = {}
 
 
@@ -62,6 +66,8 @@ class SubmissionApiConfig:
     rate_limit_window_seconds: int = RATE_LIMIT_WINDOW_SECONDS
     rate_limit_max_requests: int = RATE_LIMIT_MAX_REQUESTS
     rate_limit_max_failures: int = RATE_LIMIT_MAX_FAILURES
+    hotkey_rate_limit_window_seconds: int = HOTKEY_RATE_LIMIT_WINDOW_SECONDS
+    hotkey_rate_limit_max_attempts: int = HOTKEY_RATE_LIMIT_MAX_ATTEMPTS
 
 
 def serve_submissions_api(*, host: str, port: int, config: SubmissionApiConfig) -> None:
@@ -200,6 +206,25 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 registration_check=registration_check,
                 agent_username=existing_identity["agent_username"] if existing_identity else None,
                 coldkey=existing_identity["coldkey"] if existing_identity else None,
+            )
+        with _hotkey_rate_lock:
+            hotkey_rate = check_and_record_private_submission_attempt(
+                root=config.private_submission_root,
+                hotkey=hotkey,
+                submission_id=submission_id,
+                agent_sha256=agent_sha256,
+                window_seconds=config.hotkey_rate_limit_window_seconds,
+                max_attempts=config.hotkey_rate_limit_max_attempts,
+            )
+        if not bool(hotkey_rate.get("allowed")):
+            return 429, hotkey_rate_limit_payload(
+                hotkey=hotkey,
+                submission_id=submission_id,
+                agent_sha256=agent_sha256,
+                signature_payload=signature_payload,
+                uid=uid,
+                registration_block=registration_block,
+                hotkey_rate=hotkey_rate,
             )
         base_agent_py = read_base_agent_py(config=config)
         result = run_private_submission_checks(
@@ -420,6 +445,50 @@ def already_accepted_response_payload(
         "signature_payload": signature_payload.decode("utf-8"),
         "bundle_path": str(bundle_path),
         "registration": {"uid": uid, "registration_block": registration_block},
+        "ci_checks": ci_checks,
+        "llm_judge": None,
+        "checks": ci_checks,
+    }
+
+
+def hotkey_rate_limit_payload(
+    *,
+    hotkey: str,
+    submission_id: str,
+    agent_sha256: str,
+    signature_payload: bytes,
+    uid: int | None,
+    registration_block: int | None,
+    hotkey_rate: dict[str, Any],
+) -> dict[str, Any]:
+    check = SubmissionCheck(
+        name="Hotkey Submission Rate Limit",
+        status="failed",
+        summary=(
+            f"Hotkey has reached {hotkey_rate.get('max_attempts')} private submission attempts "
+            f"in {hotkey_rate.get('window_seconds')} seconds."
+        ),
+        findings=["Wait for the 24-hour hotkey submission window to roll forward before retrying."],
+        metadata={
+            "hotkey": hotkey,
+            "attempts": hotkey_rate.get("attempts"),
+            "max_attempts": hotkey_rate.get("max_attempts"),
+            "window_seconds": hotkey_rate.get("window_seconds"),
+            "retry_after_seconds": hotkey_rate.get("retry_after_seconds"),
+        },
+    )
+    ci_checks = {"hotkey_rate_limit": check.to_dict()}
+    return {
+        "accepted": False,
+        "error": "hotkey_rate_limited",
+        "signature_valid": True,
+        "submission_id": submission_id,
+        "agent_sha256": agent_sha256,
+        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+        "signature_payload": signature_payload.decode("utf-8"),
+        "bundle_path": None,
+        "registration": {"uid": uid, "registration_block": registration_block},
+        "rate_limit": hotkey_rate,
         "ci_checks": ci_checks,
         "llm_judge": None,
         "checks": ci_checks,

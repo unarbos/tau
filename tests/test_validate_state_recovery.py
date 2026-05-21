@@ -209,6 +209,11 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
             )
             payload = json.loads((config.validate_root / "dashboard_data.json").read_text())
 
+        current_payload = payload["current_king"]
+        self.assertEqual(current_payload["uid"], 3)
+        self.assertEqual(current_payload["king_since"], "2026-05-10T20:25:00+00:00")
+        self.assertIn("hold_seconds", current_payload)
+
         recent = payload["status"]["recent_kings"]
         self.assertEqual(recent[0]["uid"], 3)
         self.assertEqual(recent[0]["king_since"], "2026-05-10T20:25:00+00:00")
