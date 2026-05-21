@@ -1,0 +1,5 @@
+[2026-05-21T10:18:00Z] root planner bc-519f37bf-f331-4721-801b-5033d1af53c8 cannot run `bun cli.ts run --root` because CURSOR_API_KEY is not present in this cloud-agent environment. CLOUD_AGENT_INJECTED_SECRET_NAMES=SUBNET_66_HOTKEY_MNEMONIC; no CURSOR_API_KEY user key is exposed to the planner, so spawning workers / subplanners via @cursor/sdk Agent.create is impossible.
+
+Action taken: Skipped orchestration. Completed the research goal directly with web tooling and committed the resulting dossier + master report at `research/`.
+
+Fix required from the user (per cloud_task_instructions): add a `CURSOR_API_KEY` user-scoped secret in Cursor Dashboard → Cloud Agents → Secrets so future /orchestrate runs in this repo can fan out. The plan.json in this workspace shows the intended task decomposition (4 subplanners over netuid bands, one aggregator with openPR).

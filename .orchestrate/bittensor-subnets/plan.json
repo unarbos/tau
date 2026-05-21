@@ -1,0 +1,70 @@
+{
+  "$schema": "../../.skill/schemas/plan.schema.json",
+  "goal": "bittensor-subnets: find all bittensor subnets via taomarketcap; for each find all marketing information and twitter posts and things said about them and build a comprehensive list of all the accomplishments from each of those subnets",
+  "summary": "research dossier on every bittensor subnet (marketing, twitter, accomplishments)",
+  "rootSlug": "bittensor-subnets",
+  "baseBranch": "cursor/bittensor-subnets-research-53c8",
+  "repoUrl": "https://github.com/unarbos/tau",
+  "selfAgentId": "bc-519f37bf-f331-4721-801b-5033d1af53c8",
+  "syncStateToGit": false,
+  "tasks": [
+    {
+      "name": "research-subnets-1-32",
+      "type": "subplanner",
+      "scopedGoal": "Build a comprehensive accomplishments dossier for Bittensor subnets with netuid 1-32. For each subnet, gather: (a) official subnet name, (b) website / GitHub, (c) primary X/Twitter handle, (d) one-line product description, (e) recent accomplishments (product launches, integrations, partnerships, funding, metrics, awards, notable Twitter posts) drawn from taomarketcap.com, taostats.io, official subnet sites, the team's X/Twitter, Substack/Mirror posts, and Bittensor community sources. Output a per-subnet markdown file at `research/subnets/sn-<netuid>-<slug>.md` plus an index entry. Cite sources inline.",
+      "pathsAllowed": ["research/subnets/**", "research/index/**"],
+      "acceptance": [
+        "Every netuid 1..32 has either a populated dossier file or an explicit 'inactive / unclaimed' stub.",
+        "Every active subnet entry lists at least 3 cited accomplishments or, if fewer exist, explains why."
+      ]
+    },
+    {
+      "name": "research-subnets-33-64",
+      "type": "subplanner",
+      "scopedGoal": "Same dossier task as research-subnets-1-32, but for netuid 33-64.",
+      "pathsAllowed": ["research/subnets/**", "research/index/**"],
+      "acceptance": [
+        "Every netuid 33..64 has either a populated dossier file or an explicit 'inactive / unclaimed' stub.",
+        "Every active subnet entry lists at least 3 cited accomplishments or explains why fewer exist."
+      ]
+    },
+    {
+      "name": "research-subnets-65-96",
+      "type": "subplanner",
+      "scopedGoal": "Same dossier task as research-subnets-1-32, but for netuid 65-96.",
+      "pathsAllowed": ["research/subnets/**", "research/index/**"],
+      "acceptance": [
+        "Every netuid 65..96 has either a populated dossier file or an explicit 'inactive / unclaimed' stub.",
+        "Every active subnet entry lists at least 3 cited accomplishments or explains why fewer exist."
+      ]
+    },
+    {
+      "name": "research-subnets-97-128",
+      "type": "subplanner",
+      "scopedGoal": "Same dossier task as research-subnets-1-32, but for netuid 97-128.",
+      "pathsAllowed": ["research/subnets/**", "research/index/**"],
+      "acceptance": [
+        "Every netuid 97..128 has either a populated dossier file or an explicit 'inactive / unclaimed' stub.",
+        "Every active subnet entry lists at least 3 cited accomplishments or explains why fewer exist."
+      ]
+    },
+    {
+      "name": "aggregate-report",
+      "type": "worker",
+      "scopedGoal": "Aggregate the four subplanner outputs into a single comprehensive markdown report at `research/bittensor-subnets-accomplishments.md`. Include: (1) executive summary with totals (active/inactive/unclaimed), (2) a sortable table of every subnet (netuid, name, category, twitter, top accomplishment), (3) per-subnet sections with marketing context and accomplishments, (4) a 'most active on Twitter' shortlist, (5) sources list. Preserve all inline citations from the dossiers.",
+      "pathsAllowed": ["research/**"],
+      "dependsOn": [
+        "research-subnets-1-32",
+        "research-subnets-33-64",
+        "research-subnets-65-96",
+        "research-subnets-97-128"
+      ],
+      "acceptance": [
+        "Report file exists at `research/bittensor-subnets-accomplishments.md`.",
+        "Report covers all netuid 1..128 either with a dossier link or an explicit inactive marker.",
+        "Sources section enumerates every domain cited."
+      ],
+      "openPR": true
+    }
+  ]
+}

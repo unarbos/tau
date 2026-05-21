@@ -2,6 +2,11 @@
 src/workspace/
 benchmark_results/
 
+# Orchestrate skill cache (copied locally for tool access)
+.skill/
+# Raw research scratch (HTML scrapes, intermediate JSON)
+.research/
+
 # Local environment
 .env
 .venv/
