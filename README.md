@@ -233,8 +233,10 @@ the hotkey re-registers.
   solve contract or attempt forbidden provider/sampling control.
 - `OpenRouter Submission Judge` reviews the diff with the private submission
   gatekeeping prompt through OpenRouter using `anthropic/claude-opus-4.7`,
-  temperature 0, medium reasoning effort, and a required score above
-  `JUDGE_MIN_SCORE`.
+  temperature 0, medium reasoning effort, and required overall/component score
+  floors. Reorder-only or gate-order-only submissions must show concrete
+  evidence that they improve broad task behavior, not just that they change
+  control flow.
 
 The validator keeps two independent 50-task pools: a primary pool for the
 first challenger-vs-king duel, and a retest pool used only when the challenger

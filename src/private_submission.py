@@ -248,7 +248,9 @@ def run_openrouter_judge_gate(
     verdict = str(judgment.get("verdict", "fail")).lower()
     score = _coerce_score(judgment.get("overall_score"))
     findings = [str(item) for item in judgment.get("reasons") or []]
-    if verdict == "fail" or score < min_score:
+    score_failures = judge_score_failures(judgment, min_score=min_score)
+    if verdict == "fail" or score_failures:
+        findings.extend(score_failures)
         findings.append(f"Judge verdict={verdict}, score={score}, threshold={min_score}.")
         return SubmissionCheck(
             name="OpenRouter Submission Judge",
@@ -267,6 +269,29 @@ def run_openrouter_judge_gate(
         score=score,
         metadata={"judgment": judgment},
     )
+
+
+def judge_score_failures(judgment: dict[str, Any], *, min_score: int) -> list[str]:
+    failures: list[str] = []
+    overall = _coerce_score(judgment.get("overall_score"))
+    if overall < min_score:
+        failures.append(f"overall_score={overall} is below required minimum {min_score}.")
+
+    component_floor = max(0, min(100, int(min_score) - 5))
+    for name in ("real_edit_score", "safety_score", "scope_score", "contract_score"):
+        if name not in judgment:
+            continue
+        score = _coerce_score(judgment.get(name))
+        if score < component_floor:
+            failures.append(f"{name}={score} is below component minimum {component_floor}.")
+
+    if "real_edit_score" in judgment:
+        real_edit = _coerce_score(judgment.get("real_edit_score"))
+        if overall > real_edit + 10:
+            failures.append(
+                f"overall_score={overall} exceeds real_edit_score={real_edit} by more than 10 points."
+            )
+    return failures
 
 
 def write_private_submission_bundle(

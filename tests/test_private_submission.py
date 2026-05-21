@@ -1172,6 +1172,30 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertNotIn("agent_username", public_payload["submissions"][0])
         self.assertNotIn("coldkey", public_payload["submissions"][0])
 
+    def test_private_submission_judge_rejects_weak_component_scores(self):
+        result = run_private_submission_checks(
+            hotkey=HOTKEY,
+            submitted_agent_py=GOOD_AGENT,
+            base_agent_py=BASE_AGENT,
+            min_score=70,
+            openrouter_judge=lambda payload: {
+                "verdict": "pass",
+                "overall_score": 72,
+                "real_edit_score": 55,
+                "safety_score": 95,
+                "scope_score": 90,
+                "contract_score": 95,
+                "summary": "Mostly reorders existing gates.",
+                "reasons": ["moves syntax fix before hail mary"],
+            },
+        )
+
+        self.assertFalse(result.accepted)
+        check = result.checks["openrouter_judge"]
+        self.assertEqual(check.status, "failed")
+        self.assertTrue(any("real_edit_score=55" in item for item in check.findings))
+
+
     def test_private_submission_judge_uses_private_claude_prompt(self):
         from cli import _build_private_submission_openrouter_judge
 
@@ -1214,6 +1238,9 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertEqual(call["reasoning"], {"effort": "medium", "exclude": True})
         self.assertIn("CI gatekeeping judge", call["system_prompt"])
         self.assertIn("private Subnet 66 ninja submission API", call["system_prompt"])
+        self.assertIn("Reorder-only / gate-order changes", call["system_prompt"])
+        self.assertIn("hail-mary", call["system_prompt"])
+        self.assertIn("real_edit_score", call["system_prompt"])
         self.assertIn("<submission_data>", call["prompt"])
         self.assertNotIn("<pr_data>", call["prompt"])
 
