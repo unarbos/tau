@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from private_submission import (
     SubmissionCheck,
@@ -27,6 +28,7 @@ from private_submission import (
     write_private_submission_bundle,
 )
 from r2 import publish_submissions_api_data
+from solve_spend import build_solve_spend_payload
 from validate import (
     _current_registration_block,
     _open_subtensor,
@@ -80,10 +82,15 @@ def serve_submissions_api(*, host: str, port: int, config: SubmissionApiConfig) 
 def build_handler(config: SubmissionApiConfig):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path.rstrip("/") != "/api/submissions":
-                send_json(self, 404, {"error": "not_found"})
+            parsed = urlparse(self.path)
+            normalized_path = parsed.path.rstrip("/")
+            if normalized_path == "/api/submissions":
+                send_json(self, 200, build_public_submissions_api_payload(root=config.private_submission_root))
                 return
-            send_json(self, 200, build_public_submissions_api_payload(root=config.private_submission_root))
+            if normalized_path == "/api/solve-spend":
+                send_json(self, 200, solve_spend_payload_for_query(config=config, query=parsed.query))
+                return
+            send_json(self, 404, {"error": "not_found"})
 
         def do_POST(self) -> None:
             if self.path.rstrip("/") != "/api/submissions":
@@ -111,6 +118,28 @@ def build_handler(config: SubmissionApiConfig):
             log.info("%s - %s", self.address_string(), fmt % args)
 
     return Handler
+
+
+def solve_spend_payload_for_query(*, config: SubmissionApiConfig, query: str) -> dict[str, Any]:
+    values = parse_qs(query, keep_blank_values=False)
+    window_seconds = _query_int(values, "window_seconds", default=86_400, minimum=1, maximum=31_536_000)
+    return build_solve_spend_payload(tasks_root=config.run_config.tasks_root, window_seconds=window_seconds)
+
+
+def _query_int(
+    values: dict[str, list[str]],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = values.get(name, [str(default)])[0]
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(max(parsed, minimum), maximum)
 
 
 def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApiConfig) -> tuple[int, dict[str, Any]]:

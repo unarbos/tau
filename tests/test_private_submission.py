@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from config import RunConfig
+from solve_spend import build_solve_spend_payload
+from submission_api import solve_spend_payload_for_query
 from private_submission import (
     build_public_submissions_api_payload,
     check_and_record_private_submission_attempt,
@@ -1353,6 +1355,50 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertIn("real_edit_score", call["system_prompt"])
         self.assertIn("<submission_data>", call["prompt"])
         self.assertNotIn("<pr_data>", call["prompt"])
+
+    def test_solve_spend_payload_sums_recent_solve_costs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_root = Path(tmp) / "tasks"
+            recent = tasks_root / "task-a" / "solutions" / "challenger-1" / "solve.json"
+            old = tasks_root / "task-a" / "solutions" / "king-1" / "solve.json"
+            recent.parent.mkdir(parents=True)
+            old.parent.mkdir(parents=True)
+            recent.write_text(
+                json.dumps(
+                    {
+                        "solution_name": "challenger-1",
+                        "result": {"model": "minimax/minimax-m2.7", "cost": 1.25},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old.write_text(
+                json.dumps(
+                    {
+                        "solution_name": "king-1",
+                        "result": {"model": "minimax/minimax-m2.7", "cost": 9.0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(recent, (1_000, 1_000))
+            os.utime(old, (100, 100))
+
+            payload = build_solve_spend_payload(tasks_root=tasks_root, now=1_000, window_seconds=60)
+
+        self.assertEqual(payload["solve_count"], 1)
+        self.assertEqual(payload["total_cost_usd"], 1.25)
+        self.assertEqual(payload["by_solution_prefix_usd"], {"challenger": 1.25})
+
+    def test_solve_spend_endpoint_query_clamps_window(self):
+        config = SimpleNamespace(
+            run_config=SimpleNamespace(tasks_root=Path("/tmp/does-not-exist")),
+        )
+
+        payload = solve_spend_payload_for_query(config=config, query="window_seconds=0")
+
+        self.assertEqual(payload["window_seconds"], 1)
+
 
 
 if __name__ == "__main__":
