@@ -274,6 +274,7 @@ def _dashboard_duel_summary(source: dict[str, Any]) -> dict[str, Any]:
         "duel_id", "started_at", "finished_at", "king_replaced", "disqualification_reason",
         "confirmation_duel_id", "confirmation_retest_passed", "confirmation_failure_reason",
         "confirmation_of_duel_id", "manual_retest_of_duel_id", "wins", "losses", "ties",
+        "pause_reason", "status_message",
         "errors", "threshold", "duel_rounds", "task_set_phase", "king_uid", "king_hotkey",
         "king_agent_username", "king_repo", "king_repo_url", "king_pr_url", "king_commit_sha",
         "king_commitment_block", "challenger_uid", "challenger_hotkey",
@@ -291,7 +292,7 @@ def _dashboard_active_duel_summary(source: dict[str, Any] | None) -> dict[str, A
         "king_uid", "king_hotkey", "king_agent_username", "king_repo", "king_repo_url",
         "king_pr_url", "duel_rounds", "target_round_count", "gathered_tasks", "needed_tasks",
         "wins", "losses", "ties", "threshold", "task_set_phase", "confirmation_of_duel_id",
-        "confirmation_duel_id", "manual_retest_of_duel_id", "pool_size",
+        "confirmation_duel_id", "manual_retest_of_duel_id", "pool_size", "pause_reason", "status_message",
     ))
     if summary is None:
         return None

@@ -28,6 +28,7 @@ from config import RunConfig, SolverAgentSource
 from openrouter_client import complete_text
 from pipeline import _setup_logging, compare_task_run, generate_task_run, solve_task_run
 from private_submission import accepted_private_submission_entries, private_submission_check_passed
+from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
 from r2 import (
     duel_to_summary,
     fetch_chain_data,
@@ -619,6 +620,7 @@ class ActiveDuelLease:
     updated_at: str | None = None
     task_set_phase: str = "primary"
     confirmation_of_duel_id: int | None = None
+    pause_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -632,6 +634,7 @@ class ActiveDuelLease:
             "updated_at": self.updated_at,
             "task_set_phase": self.task_set_phase,
             "confirmation_of_duel_id": self.confirmation_of_duel_id,
+            "pause_reason": self.pause_reason,
         }
 
     @classmethod
@@ -667,6 +670,11 @@ class ActiveDuelLease:
             confirmation_of_duel_id=(
                 int(payload["confirmation_of_duel_id"])
                 if payload.get("confirmation_of_duel_id") is not None
+                else None
+            ),
+            pause_reason=(
+                str(payload["pause_reason"])
+                if payload.get("pause_reason") is not None
                 else None
             ),
         )
@@ -1070,6 +1078,8 @@ def _active_duel_dashboard_info_from_state(
         "manual_retest_of_duel_id": lease.confirmation_of_duel_id,
         "phase": phase,
         "status": phase,
+        "pause_reason": lease.pause_reason,
+        "status_message": lease.pause_reason,
         "wins": wins,
         "losses": losses,
         "ties": ties,
@@ -1137,6 +1147,7 @@ def _checkpoint_active_duel(
     task_names: list[str] | None = None,
     rounds: list[ValidationRoundResult] | None = None,
     status: str = "running",
+    pause_reason: str | None = None,
 ) -> bool:
     lease = state.active_duel
     if lease is None or lease.duel_id != duel_id:
@@ -1146,6 +1157,8 @@ def _checkpoint_active_duel(
     if rounds is not None:
         lease.rounds = list(rounds)
     lease.status = status
+    if pause_reason is not None:
+        lease.pause_reason = pause_reason
     lease.updated_at = _timestamp()
     return True
 
@@ -1449,6 +1462,71 @@ def _round_winner_from_scores(king_score: float, challenger_score: float) -> str
     if challenger_score < king_score:
         return "king"
     return "tie"
+
+
+def _provider_account_error_exit_reason(exit_reason: str | None) -> bool:
+    return exit_reason == PROVIDER_ACCOUNT_ERROR_EXIT_REASON
+
+
+def _provider_endpoint_error_exit_reason(exit_reason: str | None) -> bool:
+    return exit_reason == PROVIDER_ENDPOINT_ERROR_EXIT_REASON
+
+
+def _provider_error_exit_reason(exit_reason: str | None) -> bool:
+    return _provider_account_error_exit_reason(exit_reason) or _provider_endpoint_error_exit_reason(exit_reason)
+
+
+def _provider_error_kind(exit_reason: str | None) -> str:
+    if _provider_account_error_exit_reason(exit_reason):
+        return "provider_account_error"
+    return "provider_endpoint_error"
+
+
+def _provider_pause_reason() -> str:
+    return "Provider account error detected (OpenRouter auth/billing/quota); validator paused active duel."
+
+
+def _round_has_provider_account_error(round_result: ValidationRoundResult) -> bool:
+    return (
+        _provider_account_error_exit_reason(round_result.king_exit_reason)
+        or _provider_account_error_exit_reason(round_result.challenger_exit_reason)
+        or "provider_account_error" in str(round_result.error or "")
+    )
+
+
+def _provider_endpoint_round_error(
+    *,
+    task: PoolTask,
+    agent_timeout: int,
+    king_exit_reason: str | None,
+    challenger_exit_reason: str | None,
+) -> ValidationRoundResult:
+    failed_roles = [
+        role
+        for role, exit_reason in (
+            ("king", king_exit_reason),
+            ("challenger", challenger_exit_reason),
+        )
+        if _provider_error_exit_reason(exit_reason)
+    ]
+    failed_label = ",".join(failed_roles) if failed_roles else "unknown"
+    return ValidationRoundResult(
+        task_name=task.task_name,
+        winner="error",
+        king_lines=0,
+        challenger_lines=0,
+        king_similarity_ratio=0.0,
+        challenger_similarity_ratio=0.0,
+        king_challenger_similarity=0.0,
+        task_root=task.task_root,
+        king_compare_root="",
+        challenger_compare_root="",
+        king_exit_reason=king_exit_reason,
+        king_agent_timeout_seconds=agent_timeout,
+        challenger_exit_reason=challenger_exit_reason,
+        challenger_agent_timeout_seconds=agent_timeout,
+        error=f"task_error: {_provider_error_kind(king_exit_reason or challenger_exit_reason)} ({failed_label})",
+    )
 
 
 def _judge_round_diffs(
@@ -3371,6 +3449,13 @@ def _solve_and_compare_round(
             solution_name="king",
             config=config,
         ) or (None, None)
+        if _provider_error_exit_reason(king_exit_reason):
+            return _provider_endpoint_round_error(
+                task=task,
+                agent_timeout=agent_timeout,
+                king_exit_reason=king_exit_reason,
+                challenger_exit_reason=None,
+            )
         challenger_cfg = replace(
             _build_agent_config(config, challenger), agent_timeout=agent_timeout,
         )
@@ -3378,6 +3463,20 @@ def _solve_and_compare_round(
             task_name=task.task_name, solution_name=solution_label,
             config=challenger_cfg,
         )
+        challenger_exit_reason = getattr(solve_result, "exit_reason", None)
+        if _provider_error_exit_reason(challenger_exit_reason):
+            result = _provider_endpoint_round_error(
+                task=task,
+                agent_timeout=agent_timeout,
+                king_exit_reason=king_exit_reason,
+                challenger_exit_reason=challenger_exit_reason,
+            )
+            _discard_solution_repo_async(
+                task_name=task.task_name,
+                solution_name=solution_label,
+                config=config,
+            )
+            return result
         chall_timed_out = solve_result.exit_reason == "time_limit_exceeded"
         chall_has_patch = _solution_has_patch(
             task_name=task.task_name,
@@ -3440,7 +3539,7 @@ def _solve_and_compare_round(
             llm_judge_error=diff_judge.error,
             king_exit_reason=king_exit_reason,
             king_agent_timeout_seconds=agent_timeout,
-            challenger_exit_reason=getattr(solve_result, "exit_reason", None),
+            challenger_exit_reason=challenger_exit_reason,
             challenger_agent_timeout_seconds=agent_timeout,
         )
 
@@ -3644,6 +3743,7 @@ def _run_parallel_duel(
     timed_out_clean_shutdown = True
     interrupted_by_shutdown = False
     partial_shutdown_interrupt = False
+    provider_account_pause_reason: str | None = None
     math_stop_reason: str | None = None
     dq_stop_reason: str | None = None
 
@@ -3834,7 +3934,40 @@ def _run_parallel_duel(
                             error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
                         )
                     rounds.append(result)
-                    if result.challenger_exit_reason == "time_limit_exceeded":
+                    if _round_has_provider_account_error(result):
+                        reason = _provider_pause_reason()
+                        provider_account_pause_reason = reason
+                        log.error("Duel %d: %s", duel_id, reason)
+                        _stop_submitting(reason)
+                        _cancel_pending_rounds(reason)
+                        if cancel_event is not None:
+                            cancel_event.set()
+                        try:
+                            if on_round_complete is not None:
+                                wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
+                                losses = sum(1 for r in rounds if r.scored and r.winner == "king")
+                                ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
+                                on_round_complete(
+                                    duel_id=duel_id,
+                                    wins=wins,
+                                    losses=losses,
+                                    ties=ties,
+                                    scored=wins + losses,
+                                    threshold=losses + margin + 1,
+                                    rounds=rounds,
+                                    task_names=[task.task_name for task in tasks],
+                                    phase="paused_provider_account_error",
+                                    gathered_tasks=len(tasks),
+                                    needed_tasks=n_rounds,
+                                    pool_size=pool.size(),
+                                    pause_reason=reason,
+                                    status_message=reason,
+                                )
+                        except Exception:
+                            log.exception("provider account pause checkpoint callback failed (non-fatal)")
+                        partial_shutdown_interrupt = bool(task_queue)
+                        continue
+                    elif result.challenger_exit_reason == "time_limit_exceeded":
                         timeout_streak += 1
                         if timeout_limit > 0 and timeout_streak >= timeout_limit:
                             _stop_submitting(f"{timeout_streak} consecutive challenger timeouts")
@@ -3927,6 +4060,8 @@ def _run_parallel_duel(
         raise RuntimeError("duel interrupted by validator shutdown before in-flight rounds finished")
     if partial_shutdown_interrupt:
         raise RuntimeError("duel interrupted by validator shutdown before all rounds were started")
+    if provider_account_pause_reason:
+        raise RuntimeError(provider_account_pause_reason)
 
     solve_elapsed = time.monotonic() - solve_start
     if dq_stop_reason:
@@ -4554,6 +4689,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         task_names=task_names if isinstance(task_names, list) else None,
                                         rounds=rounds,
                                         status=phase,
+                                        pause_reason=kw.get("pause_reason") if isinstance(kw.get("pause_reason"), str) else None,
                                     ):
                                         _save_state(paths.state_path, state)
                                 except Exception:
@@ -4597,7 +4733,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                                 "king_challenger_similarity": r.king_challenger_similarity}
                                                for r in rounds if r.scored],
                                 }
-                                for key in ("gathered_tasks", "needed_tasks", "pool_size"):
+                                for key in ("gathered_tasks", "needed_tasks", "pool_size", "pause_reason", "status_message"):
                                     if key in kw:
                                         active_duel_info[key] = kw[key]
                                 try:
@@ -4672,14 +4808,20 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 ),
                             )
                         except Exception:
+                            if shutdown_requested.is_set():
+                                log.exception("Parallel duel %d paused during validator shutdown; preserving active duel", duel_id)
+                                duel_count += 1
+                                try:
+                                    _save_state(paths.state_path, state)
+                                except Exception:
+                                    log.exception("Paused active duel state save failed (non-fatal)")
+                                break
                             log.exception("Parallel duel %d raised; requeueing challenger for retry", duel_id)
                             duel_count += 1
                             active_duel_info = None
                             _queue_submission_once_sorted(state, challenger)
                             _clear_active_duel(state, duel_id)
                             _save_state(paths.state_path, state)
-                            if shutdown_requested.is_set():
-                                break
                             if config.validate_max_duels is not None and duel_count >= config.validate_max_duels:
                                 log.info("Reached max_duels=%d; stopping validator loop", config.validate_max_duels)
                                 break

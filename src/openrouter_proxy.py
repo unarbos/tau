@@ -542,6 +542,7 @@ class OpenRouterProxy:
             cache_write_tokens=_extract_cache_write_tokens(response_payload),
             reasoning_tokens=_extract_reasoning_tokens(response_payload),
             cost=_extract_cost(response_payload),
+            error=_extract_response_error(response_payload) if response_status >= 400 else None,
         )
         self._record_request(request_record)
 
@@ -1066,6 +1067,19 @@ def _extract_reasoning_tokens(payload: Any) -> int | None:
         return None
     value = details.get("reasoning_tokens")
     return value if isinstance(value, int) else None
+
+
+def _extract_response_error(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("code") or error.get("type")
+        return str(message) if message else None
+    if isinstance(error, str):
+        return error
+    message = payload.get("message")
+    return str(message) if message else None
 
 
 def _extract_cost(payload: Any) -> float | None:

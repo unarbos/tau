@@ -1,8 +1,16 @@
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from docker_solver import (
+    _DockerSolverCommandResult,
+    _proxy_request_is_provider_account_error,
+    _proxy_request_is_provider_endpoint_error,
+    _resolve_exit_reason,
+)
 from openrouter_proxy import OpenRouterProxy, _upstream_base_url
+from solver_runner import COMPLETED_EXIT_REASON, PROVIDER_ACCOUNT_ERROR_EXIT_REASON
 
 
 class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
@@ -112,6 +120,79 @@ class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
                 "preferred_min_throughput": {"p90": 50},
             },
         )
+
+    def test_provider_endpoint_error_detection_matches_upstream_failures(self):
+        self.assertTrue(
+            _proxy_request_is_provider_endpoint_error(
+                SimpleNamespace(status_code=429, error="rate limited by upstream provider")
+            )
+        )
+        self.assertTrue(
+            _proxy_request_is_provider_endpoint_error(
+                SimpleNamespace(status_code=502, error="bad gateway")
+            )
+        )
+        self.assertTrue(
+            _proxy_request_is_provider_endpoint_error(
+                SimpleNamespace(status_code=400, error="Provider returned error: no endpoints available")
+            )
+        )
+        self.assertFalse(
+            _proxy_request_is_provider_endpoint_error(
+                SimpleNamespace(status_code=400, error="Request body must include messages")
+            )
+        )
+
+
+
+    def test_provider_account_error_detection_matches_billing_and_auth_failures(self):
+        for status_code, error in (
+            (401, "unauthorized"),
+            (402, "insufficient credits"),
+            (403, "invalid api key"),
+            (400, "billing quota exceeded"),
+        ):
+            self.assertTrue(
+                _proxy_request_is_provider_account_error(
+                    SimpleNamespace(status_code=status_code, error=error)
+                )
+            )
+        self.assertFalse(
+            _proxy_request_is_provider_account_error(
+                SimpleNamespace(status_code=502, error="bad gateway")
+            )
+        )
+
+    def test_failed_solve_with_account_error_uses_account_exit_reason(self):
+        proxy = SimpleNamespace(
+            budget_exceeded_reason=None,
+            usage_snapshot=lambda: SimpleNamespace(
+                requests=[SimpleNamespace(status_code=402, error="insufficient credits")]
+            ),
+        )
+
+        exit_reason = _resolve_exit_reason(
+            solver_run=_DockerSolverCommandResult(returncode=1, stdout="", stderr=""),
+            proxy=proxy,
+        )
+
+        self.assertEqual(exit_reason, PROVIDER_ACCOUNT_ERROR_EXIT_REASON)
+
+    def test_recovered_provider_error_does_not_override_successful_solve(self):
+        proxy = SimpleNamespace(
+            budget_exceeded_reason=None,
+            usage_snapshot=lambda: SimpleNamespace(
+                requests=[SimpleNamespace(status_code=429, error="rate limited by upstream provider")]
+            ),
+        )
+
+        exit_reason = _resolve_exit_reason(
+            solver_run=_DockerSolverCommandResult(returncode=0, stdout="", stderr=""),
+            proxy=proxy,
+        )
+
+        self.assertEqual(exit_reason, COMPLETED_EXIT_REASON)
+
 
 
 if __name__ == "__main__":

@@ -21,6 +21,89 @@ class TaskPoolTest(unittest.TestCase):
         (task_dir / "task.json").write_text("{}\n")
         (task_dir / "commit.json").write_text("{}\n")
 
+
+    def test_provider_endpoint_round_error_is_unscored_task_error(self):
+        task = PoolTask(
+            task_name="task-provider-error",
+            task_root="/tmp/task-provider-error",
+            creation_block=1,
+            cursor_elapsed=1.0,
+            king_lines=1,
+            king_similarity=0.5,
+            baseline_lines=1,
+        )
+
+        result = validate._provider_endpoint_round_error(
+            task=task,
+            agent_timeout=123,
+            king_exit_reason=None,
+            challenger_exit_reason=validate.PROVIDER_ENDPOINT_ERROR_EXIT_REASON,
+        )
+
+        self.assertFalse(result.scored)
+        self.assertEqual(result.winner, "error")
+        self.assertEqual(result.challenger_exit_reason, validate.PROVIDER_ENDPOINT_ERROR_EXIT_REASON)
+        self.assertEqual(result.challenger_agent_timeout_seconds, 123)
+        self.assertIn("task_error: provider_endpoint_error", result.error)
+
+
+    def test_provider_account_round_error_is_unscored_task_error(self):
+        task = PoolTask(
+            task_name="task-provider-account-error",
+            task_root="/tmp/task-provider-account-error",
+            creation_block=1,
+            cursor_elapsed=1.0,
+            king_lines=1,
+            king_similarity=0.5,
+            baseline_lines=1,
+        )
+
+        result = validate._provider_endpoint_round_error(
+            task=task,
+            agent_timeout=123,
+            king_exit_reason=None,
+            challenger_exit_reason=validate.PROVIDER_ACCOUNT_ERROR_EXIT_REASON,
+        )
+
+        self.assertFalse(result.scored)
+        self.assertTrue(validate._round_has_provider_account_error(result))
+        self.assertIn("task_error: provider_account_error", result.error)
+
+    def test_active_duel_pause_reason_round_trips(self):
+        king = validate.ValidatorSubmission(
+            hotkey="king-hotkey",
+            uid=1,
+            repo_full_name="king/ninja",
+            repo_url="https://github.com/king/ninja",
+            commit_sha="a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
+            commitment_block=1,
+            source="chain",
+        )
+        challenger = validate.ValidatorSubmission(
+            hotkey="challenger-hotkey",
+            uid=2,
+            repo_full_name="challenger/ninja",
+            repo_url="https://github.com/challenger/ninja",
+            commit_sha="b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
+            commitment_block=1,
+            source="chain",
+        )
+        lease = validate.ActiveDuelLease(
+            duel_id=99,
+            started_at="now",
+            king=king,
+            challenger=challenger,
+            status="paused_provider_account_error",
+            pause_reason=validate._provider_pause_reason(),
+        )
+
+        restored = validate.ActiveDuelLease.from_dict(lease.to_dict())
+
+        self.assertEqual(restored.status, "paused_provider_account_error")
+        self.assertEqual(restored.pause_reason, validate._provider_pause_reason())
+
     @classmethod
     def _write_healthy_king_cache(
         cls,

@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import r2
 from r2 import (
     _is_public_task_leakage_key,
     duel_to_summary,
@@ -393,6 +394,28 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertFalse(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/king.diff"))
         self.assertFalse(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/challenger.diff"))
         self.assertFalse(_is_public_task_leakage_key("sn66/dashboard.json"))
+
+    def test_active_duel_summary_includes_provider_pause_reason(self):
+        payload = {
+            "recent_kings": [],
+            "queue": [],
+            "disqualified": [],
+            "retired": [],
+            "active_duel": {
+                "duel_id": 12,
+                "status": "paused_provider_account_error",
+                "pause_reason": "Provider account error detected",
+                "status_message": "Provider account error detected",
+                "rounds": [],
+            }
+        }
+
+        summary = r2._dashboard_status_summary(payload)
+
+        self.assertEqual(summary["active_duel"]["status"], "paused_provider_account_error")
+        self.assertEqual(summary["active_duel"]["pause_reason"], "Provider account error detected")
+        self.assertEqual(summary["active_duel"]["status_message"], "Provider account error detected")
+
 
 
 if __name__ == "__main__":

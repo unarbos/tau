@@ -19,6 +19,8 @@ COMPLETED_EXIT_REASON = "completed"
 TIME_LIMIT_EXIT_REASON = "time_limit_exceeded"
 SANDBOX_VIOLATION_EXIT_REASON = "sandbox_violation"
 SOLVER_ERROR_EXIT_REASON = "solver_error"
+PROVIDER_ENDPOINT_ERROR_EXIT_REASON = "provider_endpoint_error"
+PROVIDER_ACCOUNT_ERROR_EXIT_REASON = "provider_account_error"
 
 
 @dataclass(slots=True)

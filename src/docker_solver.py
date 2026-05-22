@@ -19,6 +19,8 @@ from config import RunConfig
 from openrouter_proxy import OpenRouterProxy, SolveBudget
 from solver_runner import (
     COMPLETED_EXIT_REASON,
+    PROVIDER_ACCOUNT_ERROR_EXIT_REASON,
+    PROVIDER_ENDPOINT_ERROR_EXIT_REASON,
     SANDBOX_VIOLATION_EXIT_REASON,
     SOLVER_ERROR_EXIT_REASON,
     TIME_LIMIT_EXIT_REASON,
@@ -971,7 +973,50 @@ def _resolve_exit_reason(*, solver_run: _DockerSolverCommandResult, proxy: OpenR
         return proxy.budget_exceeded_reason
     if solver_run.returncode == 0:
         return COMPLETED_EXIT_REASON
+    usage_summary = proxy.usage_snapshot()
+    if _proxy_usage_has_provider_account_error(usage_summary):
+        return PROVIDER_ACCOUNT_ERROR_EXIT_REASON
+    if _proxy_usage_has_provider_endpoint_error(usage_summary):
+        return PROVIDER_ENDPOINT_ERROR_EXIT_REASON
     return SOLVER_ERROR_EXIT_REASON
+
+
+def _proxy_usage_has_provider_account_error(usage_summary: Any) -> bool:
+    return any(_proxy_request_is_provider_account_error(request) for request in usage_summary.requests)
+
+
+def _proxy_usage_has_provider_endpoint_error(usage_summary: Any) -> bool:
+    return any(_proxy_request_is_provider_endpoint_error(request) for request in usage_summary.requests)
+
+
+def _proxy_request_is_provider_account_error(request: Any) -> bool:
+    status_code = request.status_code
+    error_text = str(request.error or "").lower()
+    return (
+        status_code in {401, 402, 403}
+        or "insufficient credit" in error_text
+        or "insufficient balance" in error_text
+        or "billing" in error_text
+        or "payment" in error_text
+        or "quota" in error_text
+        or "unauthorized" in error_text
+        or "invalid api key" in error_text
+        or "invalid_api_key" in error_text
+    )
+
+
+def _proxy_request_is_provider_endpoint_error(request: Any) -> bool:
+    status_code = request.status_code
+    error_text = str(request.error or "").lower()
+    if status_code is None:
+        return bool(error_text)
+    return (
+        status_code == 429
+        or 500 <= status_code <= 599
+        or "provider returned error" in error_text
+        or "no endpoints" in error_text
+        or "temporarily unavailable" in error_text
+    )
 
 
 def _harness_runner_script() -> str:
