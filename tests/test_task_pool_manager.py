@@ -2,6 +2,7 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -56,6 +57,14 @@ class TaskPoolManagerTest(unittest.TestCase):
             json.dumps({"result": {"exit_reason": baseline_exit, "elapsed_seconds": 1.0}}) + "\n"
         )
         return task_root
+
+    def _age_archive_entry(self, config: RunConfig, task_name: str, seconds: int = 3600) -> None:
+        ledger_path = manager.task_archive_ledger_path(config)
+        ledger = manager.load_task_archive_ledger(ledger_path)
+        entry = dict(ledger["tasks"][task_name])
+        entry["updated_at"] = (datetime.now(tz=UTC) - timedelta(seconds=seconds)).isoformat()
+        ledger["tasks"][task_name] = entry
+        manager.write_task_archive_ledger(ledger_path, ledger)
 
     def tearDown(self):
         with manager._SAVED_TASK_FILL_LOCK:
@@ -436,7 +445,7 @@ class TaskPoolManagerTest(unittest.TestCase):
             self.assertEqual(row["task_metadata"], {"issue": "fix"})
             self.assertEqual(row["commit_metadata"], {"sha": "abc"})
 
-    def test_archive_upload_success_removes_pool_and_local_task_when_unleased(self):
+    def test_archive_upload_success_removes_pool_and_defers_local_delete(self):
         with tempfile.TemporaryDirectory() as td:
             config = RunConfig(
                 workspace_root=Path(td),
@@ -460,8 +469,16 @@ class TaskPoolManagerTest(unittest.TestCase):
                 )
 
             self.assertEqual(pool.size(), 0)
-            self.assertFalse(Path(task.task_root).exists())
+            self.assertTrue(Path(task.task_root).exists())
             self.assertEqual(uploaded[0]["dataset_id"], "owner/dataset")
+            ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
+            self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_delete_pending")
+
+            self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 0)
+            self.assertTrue(Path(task.task_root).exists())
+            self._age_archive_entry(config, task.task_name)
+            self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 1)
+            self.assertFalse(Path(task.task_root).exists())
             ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
             self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_deleted")
 
@@ -495,8 +512,9 @@ class TaskPoolManagerTest(unittest.TestCase):
                     upload_jsonl=lambda **_kwargs: "ok",
                 )
 
-            self.assertEqual(pool.size(), 1)
+            self.assertEqual(pool.size(), 0)
             self.assertTrue(Path(task.task_root).exists())
+            self._age_archive_entry(config, task.task_name)
             self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 0)
             self.assertTrue(Path(task.task_root).exists())
 
@@ -563,9 +581,113 @@ class TaskPoolManagerTest(unittest.TestCase):
 
             self.assertEqual(retried, 1)
             self.assertEqual(pool.size(), 0)
+            self.assertTrue(Path(task.task_root).exists())
+            ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
+            self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_delete_pending")
+
+            self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 0)
+            self.assertTrue(Path(task.task_root).exists())
+            self._age_archive_entry(config, task.task_name)
+            self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 1)
             self.assertFalse(Path(task.task_root).exists())
             ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
             self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_deleted")
+
+    def test_archive_upload_defers_delete_when_task_is_leased_during_upload(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_task_archive_enabled=True,
+                validate_task_archive_hf_dataset="owner/dataset",
+            )
+            pool = TaskPool(Path(td) / "pool")
+            task = self._task(config)
+            pool.add(task)
+
+            def upload_and_lease(**_kwargs):
+                lease = ActiveDuelLease(
+                    duel_id=1,
+                    started_at="now",
+                    king=self._submission("king"),
+                    challenger=self._submission("challenger"),
+                    task_names=[task.task_name],
+                )
+                validate._save_state(config.validate_root / "state.json", ValidatorState(active_duel=lease))
+                return "ok"
+
+            with patch.dict("os.environ", {"HF_TOKEN": "token"}):
+                manager.archive_pool_task_to_hf_jsonl(
+                    config=config,
+                    pool=pool,
+                    task=task,
+                    pool_label="primary",
+                    king=None,
+                    leased_task_names=set(),
+                    upload_jsonl=upload_and_lease,
+                )
+
+            self.assertEqual(pool.size(), 0)
+            self.assertTrue(Path(task.task_root).exists())
+            self._age_archive_entry(config, task.task_name)
+            self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 0)
+            self.assertTrue(Path(task.task_root).exists())
+
+            validate._save_state(config.validate_root / "state.json", ValidatorState(active_duel=None))
+            self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 1)
+            self.assertFalse(Path(task.task_root).exists())
+
+    def test_cleanup_old_task_workspaces_preserves_pool_and_active_duel_tasks(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(workspace_root=Path(td), validate_task_cleanup_min_age_seconds=0)
+            pool = TaskPool(Path(td) / "pool")
+            kept_pool_task = self._task(config, "validate-20260101000000-000001")
+            pool.add(kept_pool_task)
+            active_task = self._task(config, "validate-20260101000000-000002")
+            old_task = self._task(config, "validate-20260101000000-000003")
+            lease = ActiveDuelLease(
+                duel_id=1,
+                started_at="now",
+                king=self._submission("king"),
+                challenger=self._submission("challenger"),
+                task_names=[active_task.task_name],
+            )
+            validate._save_state(config.validate_root / "state.json", ValidatorState(active_duel=lease))
+
+            manager.cleanup_old_task_workspaces(config, (pool,))
+
+            self.assertTrue(Path(kept_pool_task.task_root).exists())
+            self.assertTrue(Path(active_task.task_root).exists())
+            self.assertFalse(Path(old_task.task_root).exists())
+
+    def test_cleanup_old_task_workspaces_preserves_archive_delete_pending_tasks(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_task_archive_enabled=True,
+                validate_task_archive_hf_dataset="owner/dataset",
+                validate_task_cleanup_min_age_seconds=0,
+            )
+            pool = TaskPool(Path(td) / "pool")
+            task = self._task(config)
+            pool.add(task)
+
+            with patch.dict("os.environ", {"HF_TOKEN": "token"}):
+                manager.archive_pool_task_to_hf_jsonl(
+                    config=config,
+                    pool=pool,
+                    task=task,
+                    pool_label="primary",
+                    king=None,
+                    leased_task_names=set(),
+                    upload_jsonl=lambda **_kwargs: "ok",
+                )
+
+            manager.cleanup_old_task_workspaces(config, (pool,))
+
+            self.assertTrue(Path(task.task_root).exists())
+            self._age_archive_entry(config, task.task_name)
+            self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 1)
+            self.assertFalse(Path(task.task_root).exists())
 
     def test_append_hf_jsonl_reraises_transient_download_failure(self):
         from huggingface_hub.errors import LocalEntryNotFoundError
@@ -599,10 +721,7 @@ class TaskPoolManagerTest(unittest.TestCase):
             task = self._task(config)
             pool.add(task)
 
-            with patch.dict("os.environ", {"HF_TOKEN": "token"}), patch(
-                "task_pool_manager.shutil.rmtree",
-                side_effect=RuntimeError("busy"),
-            ):
+            with patch.dict("os.environ", {"HF_TOKEN": "token"}):
                 manager.archive_pool_task_to_hf_jsonl(
                     config=config,
                     pool=pool,
@@ -613,11 +732,16 @@ class TaskPoolManagerTest(unittest.TestCase):
                     upload_jsonl=lambda **_kwargs: "ok",
                 )
 
-            self.assertEqual(pool.size(), 0)
+            self._age_archive_entry(config, task.task_name)
+            with patch("task_pool_manager.shutil.rmtree", side_effect=RuntimeError("busy")):
+                self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 0)
+
             self.assertTrue(Path(task.task_root).exists())
             ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
             self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_delete_pending")
+            self.assertIn("busy", ledger["tasks"][task.task_name]["error"])
 
+            self._age_archive_entry(config, task.task_name)
             self.assertEqual(manager.retry_pending_archived_task_deletes(config, (pool,)), 1)
             self.assertFalse(Path(task.task_root).exists())
 

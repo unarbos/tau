@@ -415,42 +415,24 @@ def archive_pool_task_to_hf_jsonl(
         return
 
     upload_url = getattr(upload_result, "commit_url", None) or str(upload_result or "")
-    if task.task_name in leased_task_names:
-        record_task_archive_status(
-            config=config,
-            task_name=task.task_name,
-            pool_label=pool_label,
-            status="uploaded_delete_pending",
-            archive_hour_value=hour,
-            hf_path=hf_path,
-        )
-        log.info("Task archive[%s]: uploaded leased task %s; local delete deferred", pool_label, task.task_name)
-        return
-
     pool.remove(task.task_name)
-    try:
-        shutil.rmtree(Path(task.task_root))
-    except Exception as exc:
-        record_task_archive_status(
-            config=config,
-            task_name=task.task_name,
-            pool_label=pool_label,
-            status="uploaded_delete_pending",
-            archive_hour_value=hour,
-            hf_path=hf_path,
-            error=str(exc),
-        )
-        log.exception("Task archive[%s]: local delete failed for %s", pool_label, task.task_name)
-        return
     record_task_archive_status(
         config=config,
         task_name=task.task_name,
         pool_label=pool_label,
-        status="uploaded_deleted",
+        status="uploaded_delete_pending",
         archive_hour_value=hour,
         hf_path=hf_path,
     )
-    log.info("Task archive[%s]: uploaded %s to %s (%s) and deleted local workspace", pool_label, task.task_name, hf_path, upload_url)
+    lease_note = "; active lease snapshot existed" if task.task_name in leased_task_names else ""
+    log.info(
+        "Task archive[%s]: uploaded %s to %s (%s); removed from pool and deferred local delete%s",
+        pool_label,
+        task.task_name,
+        hf_path,
+        upload_url,
+        lease_note,
+    )
 
 
 def active_duel_task_names(config: RunConfig) -> set[str]:
@@ -459,6 +441,35 @@ def active_duel_task_names(config: RunConfig) -> set[str]:
     except Exception:
         return set()
     return v._active_duel_task_names(state)
+
+
+def pending_archive_delete_task_names(config: RunConfig) -> set[str]:
+    tasks = load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks") or {}
+    return {
+        str(task_name)
+        for task_name, entry in tasks.items()
+        if isinstance(entry, dict) and entry.get("status") == "uploaded_delete_pending"
+    }
+
+
+def _parse_archive_updated_at(entry: dict[str, Any]) -> datetime | None:
+    raw = entry.get("updated_at")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def archived_task_delete_ready(entry: dict[str, Any], *, now: datetime, grace_seconds: int) -> bool:
+    updated_at = _parse_archive_updated_at(entry)
+    if updated_at is None or grace_seconds <= 0:
+        return True
+    return (now - updated_at).total_seconds() >= grace_seconds
 
 
 def pool_task_by_name(pool: v.TaskPool, task_name: str) -> v.PoolTask | None:
@@ -521,6 +532,8 @@ def retry_failed_task_uploads(
 
 def retry_pending_archived_task_deletes(config: RunConfig, pools: Sequence[v.TaskPool]) -> int:
     leased_names = active_duel_task_names(config)
+    now = datetime.now(tz=UTC)
+    grace_seconds = max(0, int(config.validate_poll_interval_seconds))
     ledger_path = task_archive_ledger_path(config)
     removed = 0
     with _TASK_ARCHIVE_LOCK:
@@ -529,12 +542,16 @@ def retry_pending_archived_task_deletes(config: RunConfig, pools: Sequence[v.Tas
         for task_name, entry in list(tasks.items()):
             if not isinstance(entry, dict) or entry.get("status") != "uploaded_delete_pending":
                 continue
+            if not archived_task_delete_ready(entry, now=now, grace_seconds=grace_seconds):
+                continue
             if task_name in leased_names:
                 continue
             for pool in pools:
                 pool.remove(task_name)
+            task_root = config.tasks_root / task_name
             try:
-                shutil.rmtree(config.tasks_root / task_name)
+                if task_root.exists():
+                    shutil.rmtree(task_root)
             except Exception as exc:
                 entry["updated_at"] = v._timestamp()
                 entry["error"] = str(exc)
@@ -930,6 +947,19 @@ def _prepare_one_task_for_pool(
             shutil.rmtree(generated_task_root, ignore_errors=True)
 
 
+def cleanup_old_task_workspaces(config: RunConfig, pools: Sequence[v.TaskPool]) -> None:
+    keep_names = active_duel_task_names(config) | pending_archive_delete_task_names(config)
+    for pool in pools:
+        keep_names |= pool.names()
+    with _SAVED_TASK_FILL_LOCK:
+        keep_names |= set(_SAVED_TASK_FILL_IN_FLIGHT)
+    v._cleanup_old_tasks(
+        config.tasks_root,
+        keep_names=keep_names,
+        min_age_seconds=config.validate_task_cleanup_min_age_seconds,
+    )
+
+
 def _pool_worker_loop(
     *,
     config: RunConfig,
@@ -1010,4 +1040,5 @@ def run_pool_manager(config: RunConfig) -> None:
             removed = retry_pending_archived_task_deletes(config, (pool, retest_pool))
             if removed:
                 log.info("Completed local deletion for %d archived task(s)", removed)
+            cleanup_old_task_workspaces(config, (pool, retest_pool))
             stop_event.wait(max(1, int(config.validate_poll_interval_seconds)))
