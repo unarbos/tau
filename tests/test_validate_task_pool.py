@@ -26,6 +26,31 @@ class TaskPoolTest(unittest.TestCase):
         (task_dir / "reference").mkdir(exist_ok=True)
 
 
+    def test_active_rounds_payload_includes_published_unharvested_rounds(self):
+        scored = validate.ValidationRoundResult(
+            task_name="task-scored",
+            winner="king",
+            king_lines=3,
+            challenger_lines=1,
+            king_similarity_ratio=0.8,
+            challenger_similarity_ratio=0.4,
+            king_challenger_similarity=0.2,
+            task_root="/tmp/task-scored",
+            king_compare_root="",
+            challenger_compare_root="",
+        )
+
+        payload = validate._active_rounds_payload(
+            [scored],
+            ["task-scored", "task-published"],
+        )
+
+        self.assertEqual([item["task_name"] for item in payload], ["task-scored", "task-published"])
+        self.assertEqual(payload[0]["winner"], "king")
+        self.assertEqual(payload[1]["winner"], "pending")
+        self.assertTrue(payload[1]["artifact_published"])
+
+
     def test_provider_endpoint_round_error_is_unscored_task_error(self):
         task = PoolTask(
             task_name="task-provider-error",
@@ -1656,7 +1681,7 @@ class TaskPoolTest(unittest.TestCase):
                 source="chain",
             )
 
-            def copied_round(*, task, king, challenger, config, duel_id, pool=None):
+            def copied_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="challenger",
@@ -1733,7 +1758,7 @@ class TaskPoolTest(unittest.TestCase):
                 source="chain",
             )
 
-            def copied_round(*, task, king, challenger, config, duel_id, pool=None):
+            def copied_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
                 if task.task_name == "task-03":
                     time.sleep(1.0)
                 return validate.ValidationRoundResult(

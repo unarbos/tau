@@ -1353,7 +1353,7 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertEqual(check.status, "failed")
         self.assertTrue(any("cosmetic-copy/goodhart" in item for item in check.findings))
 
-    def test_private_submission_judge_scans_summary_and_reasons_for_non_contribution_risk(self):
+    def test_private_submission_judge_allows_positive_goodhart_mention(self):
         result = run_private_submission_checks(
             hotkey=HOTKEY,
             submitted_agent_py=GOOD_AGENT,
@@ -1361,19 +1361,105 @@ class PrivateSubmissionApiTest(unittest.TestCase):
             min_score=70,
             openrouter_judge=lambda payload: {
                 "verdict": "pass",
-                "overall_score": 74,
-                "real_edit_score": 74,
+                "overall_score": 70,
+                "real_edit_score": 70,
                 "safety_score": 95,
                 "scope_score": 90,
                 "contract_score": 95,
-                "summary": "Mostly newline normalization and parameter-only tweaks.",
-                "reasons": ["comment churn makes up most of the patch"],
+                "summary": "Functional fix; no Goodhart risk in the scoring path.",
+                "reasons": ["avoids goodhart incentives by preserving real behavior"],
                 "risks": [],
             },
         )
 
-        self.assertFalse(result.accepted)
-        self.assertEqual(result.checks["openrouter_judge"].status, "failed")
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.checks["openrouter_judge"].status, "passed")
+
+    def test_private_submission_judge_allows_positive_non_contribution_mentions(self):
+        positive_mentions = (
+            "Functional change; no cosmetic-copy risk remains.",
+            "Functional change; no comment churn risk remains.",
+            "Functional change; newline normalization is not present.",
+            "Functional change; this is not merely normalizes newlines.",
+            "Functional change; parameter-only is not present.",
+        )
+        for summary in positive_mentions:
+            with self.subTest(summary=summary):
+                result = run_private_submission_checks(
+                    hotkey=HOTKEY,
+                    submitted_agent_py=GOOD_AGENT,
+                    base_agent_py=BASE_AGENT,
+                    min_score=70,
+                    openrouter_judge=lambda payload: {
+                        "verdict": "pass",
+                        "overall_score": 70,
+                        "real_edit_score": 70,
+                        "safety_score": 95,
+                        "scope_score": 90,
+                        "contract_score": 95,
+                        "summary": summary,
+                        "reasons": [],
+                        "risks": [],
+                    },
+                )
+
+                self.assertTrue(result.accepted)
+                self.assertEqual(result.checks["openrouter_judge"].status, "passed")
+
+    def test_private_submission_judge_ignores_unstructured_risk_prose(self):
+        result = run_private_submission_checks(
+            hotkey=HOTKEY,
+            submitted_agent_py=GOOD_AGENT,
+            base_agent_py=BASE_AGENT,
+            min_score=70,
+            openrouter_judge=lambda payload: {
+                "verdict": "pass",
+                "overall_score": 70,
+                "real_edit_score": 70,
+                "safety_score": 95,
+                "scope_score": 90,
+                "contract_score": 95,
+                "summary": "Avoids Goodhart incentives but the patch is mostly comment churn.",
+                "reasons": [],
+                "risks": [],
+            },
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.checks["openrouter_judge"].status, "passed")
+
+    def test_private_submission_judge_rejects_structured_non_contribution_risks(self):
+        risk_payloads = (
+            ["comment-churn"],
+            ["comment-churn: comments make up most of the patch"],
+            ["newline-normalization"],
+            ["newline-normalization - mostly line ending churn"],
+            ["parameter-only"],
+            ["parameter-only: only changes a threshold"],
+            [{"category": "goodhart", "evidence": "score-targeted behavior"}],
+        )
+        for risks in risk_payloads:
+            with self.subTest(risks=risks):
+                result = run_private_submission_checks(
+                    hotkey=HOTKEY,
+                    submitted_agent_py=GOOD_AGENT,
+                    base_agent_py=BASE_AGENT,
+                    min_score=70,
+                    openrouter_judge=lambda payload: {
+                        "verdict": "pass",
+                        "overall_score": 74,
+                        "real_edit_score": 74,
+                        "safety_score": 95,
+                        "scope_score": 90,
+                        "contract_score": 95,
+                        "summary": "Functional-looking but judge reported a concrete risk.",
+                        "reasons": [],
+                        "risks": risks,
+                    },
+                )
+
+                self.assertFalse(result.accepted)
+                self.assertEqual(result.checks["openrouter_judge"].status, "failed")
 
     def test_private_submission_judge_prompt_excludes_non_contributions(self):
         from cli import _PRIVATE_SUBMISSION_JUDGE_SYSTEM_PROMPT
