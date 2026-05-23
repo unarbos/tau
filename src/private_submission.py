@@ -300,30 +300,61 @@ def judge_score_failures(judgment: dict[str, Any], *, min_score: int) -> list[st
 
 
 def _judge_risk_failures(judgment: dict[str, Any], *, overall: int, min_score: int) -> list[str]:
-    risk_text = "\n".join(
-        str(item).lower()
-        for item in (
-            judgment.get("summary"),
-            *(judgment.get("reasons") or []),
-            *(judgment.get("risks") or []),
-        )
-        if item is not None
-    )
-    if not risk_text:
-        return []
-    named_cosmetic_or_goodhart = (
-        "cosmetic-copy" in risk_text
-        or "goodhart" in risk_text
-        or "comment churn" in risk_text
-        or "newline normalization" in risk_text
-        or "parameter-only" in risk_text
-    )
+    risk_categories = _judge_risk_categories(judgment.get("risks") or [])
+    named_cosmetic_or_goodhart = bool(risk_categories & _BORDERLINE_NON_CONTRIBUTION_RISK_CATEGORIES)
     borderline = overall <= min(100, int(min_score) + 5)
     if named_cosmetic_or_goodhart and borderline:
         return [
             "judge reported cosmetic-copy/goodhart/non-contribution risk on a borderline score; requires a clearly functional contribution."
         ]
     return []
+
+
+def _judge_risk_categories(risks: Any) -> frozenset[str]:
+    if not isinstance(risks, list):
+        return frozenset()
+    return frozenset(
+        category
+        for item in risks
+        for category in [_judge_risk_category(item)]
+        if category is not None
+    )
+
+
+def _judge_risk_category(item: Any) -> str | None:
+    if isinstance(item, dict):
+        return _normalize_judge_risk_category(
+            item.get("category") or item.get("type") or item.get("name") or item.get("risk")
+        )
+    if isinstance(item, str):
+        return _normalize_judge_risk_category(_risk_label_from_text(item))
+    return None
+
+
+def _risk_label_from_text(text: str) -> str:
+    return re.split(r":|\s+(?:-|--|—)\s+", text.strip(), maxsplit=1)[0]
+
+
+def _normalize_judge_risk_category(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    return _JUDGE_RISK_CATEGORY_ALIASES.get(normalized, normalized or None)
+
+
+_JUDGE_RISK_CATEGORY_ALIASES = {
+    "cosmetic-copy": "cosmetic-copy",
+    "cosmetic": "cosmetic-copy",
+    "goodhart": "goodhart",
+    "goodharting": "goodhart",
+    "comment-churn": "comment-churn",
+    "newline-normalization": "newline-normalization",
+    "normalizes-newlines": "newline-normalization",
+    "parameter-only": "parameter-only",
+}
+_BORDERLINE_NON_CONTRIBUTION_RISK_CATEGORIES = frozenset(
+    {"cosmetic-copy", "goodhart", "comment-churn", "newline-normalization", "parameter-only"}
+)
 
 
 def write_private_submission_bundle(
