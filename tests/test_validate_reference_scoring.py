@@ -28,7 +28,7 @@ def _submission(*, hotkey: str = "hk", uid: int = 7, sha: str = "a" * 40) -> Val
     )
 
 
-class CursorBaselineScoringTest(unittest.TestCase):
+class ReferenceScoringTest(unittest.TestCase):
     def test_challenger_wins_by_beating_king_round_count(self):
         self.assertTrue(_challenger_wins(wins=3, losses=2, margin=0))
         self.assertFalse(_challenger_wins(wins=2, losses=2, margin=0))
@@ -36,16 +36,16 @@ class CursorBaselineScoringTest(unittest.TestCase):
         self.assertTrue(_challenger_wins(wins=8, losses=2, margin=5))
         self.assertFalse(_challenger_wins(wins=7, losses=2, margin=5))
 
-    def test_parallel_round_compares_challenger_to_cursor_baseline(self):
+    def test_parallel_round_compares_challenger_to_reference(self):
         calls: list[tuple[str, ...]] = []
 
         def fake_compare_task_run(*, task_name, solution_names, config):
             calls.append(tuple(solution_names))
-            if solution_names[1] == "baseline":
+            if solution_names[1] == "reference":
                 return SimpleNamespace(
                     matched_changed_lines=123,
                     similarity_ratio=0.82,
-                    comparison_root="/tmp/challenger-vs-baseline",
+                    comparison_root="/tmp/challenger-vs-reference",
                 )
             return SimpleNamespace(
                 matched_changed_lines=77,
@@ -79,9 +79,9 @@ class CursorBaselineScoringTest(unittest.TestCase):
                 duel_id=3,
             )
 
-        self.assertIn(("challenger-7-d3", "baseline"), calls)
+        self.assertIn(("challenger-7-d3", "reference"), calls)
         self.assertIn(("king", "challenger-7-d3"), calls)
-        self.assertNotIn(("challenger-7-d3", "reference"), calls)
+        self.assertNotIn(("challenger-7-d3", "baseline"), calls)
         self.assertEqual(result.winner, "tie")
         self.assertEqual(result.challenger_lines, 123)
         self.assertAlmostEqual(result.king_score, 0.5)
@@ -104,7 +104,7 @@ class CursorBaselineScoringTest(unittest.TestCase):
         self.assertAlmostEqual(result.challenger_score, 1.0)
         self.assertEqual(result.llm_judge_winner, "challenger")
 
-    def test_cursor_similarity_does_not_offset_llm_judge(self):
+    def test_patch_similarity_does_not_offset_llm_judge(self):
         result = self._run_round_with_judge(
             king_similarity=1.0,
             challenger_similarity=0.0,
@@ -268,11 +268,11 @@ class CursorBaselineScoringTest(unittest.TestCase):
         judge: DiffJudgeResult,
     ):
         def fake_compare_task_run(*, task_name, solution_names, config):
-            if solution_names[1] == "baseline":
+            if solution_names[1] == "reference":
                 return SimpleNamespace(
                     matched_changed_lines=int(challenger_similarity * 10_000),
                     similarity_ratio=challenger_similarity,
-                    comparison_root="/tmp/challenger-vs-baseline",
+                    comparison_root="/tmp/challenger-vs-reference",
                 )
             return SimpleNamespace(
                 matched_changed_lines=77,

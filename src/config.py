@@ -152,6 +152,10 @@ class RunConfig:
     validate_task_pool_refresh_count: int = 0
     validate_task_pool_refresh_interval_seconds: int = 0
     validate_task_pool_fill_from_saved: bool = field(default_factory=lambda: _env_bool("VALIDATE_TASK_POOL_FILL_FROM_SAVED"))
+    validate_task_archive_enabled: bool = field(default_factory=lambda: _env_bool("VALIDATE_TASK_ARCHIVE_ENABLED"))
+    validate_task_archive_hf_dataset: str | None = field(default_factory=lambda: _env_str("VALIDATE_TASK_ARCHIVE_HF_DATASET"))
+    validate_task_archive_hf_token_env: str = field(default_factory=lambda: _env_str("VALIDATE_TASK_ARCHIVE_HF_TOKEN_ENV") or "HF_TOKEN")
+    validate_task_archive_per_hour: int = field(default_factory=lambda: _env_int_default("VALIDATE_TASK_ARCHIVE_PER_HOUR", 10))
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
     validate_king_window_size: int = 5

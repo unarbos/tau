@@ -260,7 +260,7 @@ def _git_rev_parse(repo_dir: Path, ref: str) -> str | None:
 
 
 def _read_file_bytes(path: Path) -> bytes | None:
-    if not path.exists():
+    if not path.is_file():
         return None
     return path.read_bytes()
 

@@ -1293,7 +1293,7 @@ class PrivateSubmissionApiTest(unittest.TestCase):
             openrouter_judge=lambda payload: {
                 "verdict": "pass",
                 "overall_score": 72,
-                "real_edit_score": 55,
+                "real_edit_score": 69,
                 "safety_score": 95,
                 "scope_score": 90,
                 "contract_score": 95,
@@ -1305,7 +1305,85 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertFalse(result.accepted)
         check = result.checks["openrouter_judge"]
         self.assertEqual(check.status, "failed")
-        self.assertTrue(any("real_edit_score=55" in item for item in check.findings))
+        self.assertTrue(any("real_edit_score=69" in item for item in check.findings))
+
+
+    def test_private_submission_judge_warn_does_not_auto_accept(self):
+        result = run_private_submission_checks(
+            hotkey=HOTKEY,
+            submitted_agent_py=GOOD_AGENT,
+            base_agent_py=BASE_AGENT,
+            min_score=70,
+            openrouter_judge=lambda payload: {
+                "verdict": "warn",
+                "overall_score": 85,
+                "real_edit_score": 82,
+                "safety_score": 95,
+                "scope_score": 90,
+                "contract_score": 95,
+                "summary": "Possibly useful but needs review.",
+                "reasons": ["uncertain signal"],
+            },
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.checks["openrouter_judge"].status, "warn")
+
+    def test_private_submission_judge_rejects_borderline_cosmetic_goodhart_risk(self):
+        result = run_private_submission_checks(
+            hotkey=HOTKEY,
+            submitted_agent_py=GOOD_AGENT,
+            base_agent_py=BASE_AGENT,
+            min_score=70,
+            openrouter_judge=lambda payload: {
+                "verdict": "pass",
+                "overall_score": 70,
+                "real_edit_score": 72,
+                "safety_score": 95,
+                "scope_score": 90,
+                "contract_score": 95,
+                "summary": "Mostly comment cleanup with a tiny scoring tweak.",
+                "reasons": ["changes comments and normalizes newlines"],
+                "risks": ["cosmetic-copy: significant comment churn and bulk unchanged file"],
+            },
+        )
+
+        self.assertFalse(result.accepted)
+        check = result.checks["openrouter_judge"]
+        self.assertEqual(check.status, "failed")
+        self.assertTrue(any("cosmetic-copy/goodhart" in item for item in check.findings))
+
+    def test_private_submission_judge_scans_summary_and_reasons_for_non_contribution_risk(self):
+        result = run_private_submission_checks(
+            hotkey=HOTKEY,
+            submitted_agent_py=GOOD_AGENT,
+            base_agent_py=BASE_AGENT,
+            min_score=70,
+            openrouter_judge=lambda payload: {
+                "verdict": "pass",
+                "overall_score": 74,
+                "real_edit_score": 74,
+                "safety_score": 95,
+                "scope_score": 90,
+                "contract_score": 95,
+                "summary": "Mostly newline normalization and parameter-only tweaks.",
+                "reasons": ["comment churn makes up most of the patch"],
+                "risks": [],
+            },
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.checks["openrouter_judge"].status, "failed")
+
+    def test_private_submission_judge_prompt_excludes_non_contributions(self):
+        from cli import _PRIVATE_SUBMISSION_JUDGE_SYSTEM_PROMPT
+
+        prompt = _PRIVATE_SUBMISSION_JUDGE_SYSTEM_PROMPT
+
+        self.assertIn("actual contribution to the real function of the agent", prompt)
+        self.assertIn("newline normalization", prompt)
+        self.assertIn("parameter/constant/cap changes", prompt)
+        self.assertIn("count as zero contribution", prompt)
 
 
     def test_private_submission_judge_uses_private_claude_prompt(self):

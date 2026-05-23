@@ -26,7 +26,7 @@ import httpx
 
 from config import RunConfig, SolverAgentSource
 from openrouter_client import complete_text
-from pipeline import _setup_logging, compare_task_run, generate_task_run, solve_task_run
+from pipeline import _setup_logging, compare_task_run, solve_task_run
 from private_submission import accepted_private_submission_entries, private_submission_check_passed
 from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
 from r2 import (
@@ -67,6 +67,8 @@ _BURN_KING_UID = 0
 _BURN_KING_HOTKEY = "burn-uid-0"
 _BURN_KING_COMMITMENT_PREFIX = "burn:uid-0"
 _BASELINE_MODEL = "gemini-3-flash"
+_REFERENCE_SOLUTION_NAME = "reference"
+_LEGACY_BASELINE_SOLUTION_NAME = "baseline"
 _DIFF_JUDGE_MODEL = "anthropic/claude-sonnet-4.6"
 _DIFF_JUDGE_FALLBACK_MODELS = ("moonshotai/kimi-k2.6",)
 _DIFF_JUDGE_WEIGHT = 1.0
@@ -98,10 +100,7 @@ _DUEL_AGENT_TIMEOUT_PROVIDER_SLOWDOWN_FACTOR = 1.5
 _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS = 300.0
 _DIFF_JUDGE_SEMAPHORE = threading.Semaphore(_DIFF_JUDGE_MAX_CONCURRENCY)
 _AGENT_CACHE_LOCK = threading.Lock()
-_POOL_FILL_ADD_LOCK = threading.Lock()
 _POOL_GENERATION_BACKOFF_LOCK = threading.Lock()
-_SAVED_TASK_FILL_LOCK = threading.Lock()
-_SAVED_TASK_FILL_IN_FLIGHT: set[str] = set()
 _pool_generation_backoff_until = 0.0
 
 
@@ -1993,11 +1992,41 @@ def _truncate_middle(text: str, max_chars: int) -> str:
 # Task pool
 # ---------------------------------------------------------------------------
 
+def _pool_task_has_scoring_artifacts(task: PoolTask) -> bool:
+    task_root = Path(task.task_root)
+    task_dir = task_root / "task"
+    reference_patch = task_dir / "reference.patch"
+    if reference_patch.is_file() and (task_dir / "reference").is_dir():
+        return True
+    baseline_dir = task_root / "solutions" / _LEGACY_BASELINE_SOLUTION_NAME
+    return (baseline_dir / "solve.json").is_file() and (baseline_dir / "solution.diff").is_file()
+
+
+def _reference_compare_solution_names(solution_name: str) -> list[str]:
+    return [solution_name, _REFERENCE_SOLUTION_NAME]
+
+
+def _king_reference_compare_paths(task_paths: Any) -> Any:
+    reference_paths = build_compare_paths(
+        task_paths,
+        derive_compare_name(_reference_compare_solution_names("king")),
+    )
+    if reference_paths.compare_json_path.is_file():
+        return reference_paths
+    legacy_paths = build_compare_paths(
+        task_paths,
+        derive_compare_name(["king", _LEGACY_BASELINE_SOLUTION_NAME]),
+    )
+    if legacy_paths.compare_json_path.is_file():
+        return legacy_paths
+    return reference_paths
+
+
 class TaskPool:
     """Thread-safe pool of pre-solved tasks shared across all duels.
 
     Tasks are NOT removed on read so every active duel can reuse the same
-    baseline+king work.  Each duel tracks which tasks it has already used
+    reference+king work.  Each duel tracks which tasks it has already used
     and passes an ``exclude`` set to skip them.
     """
 
@@ -2006,18 +2035,20 @@ class TaskPool:
         self._pool_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
-    def size(self) -> int:
+    def size(self, exclude: set[str] | None = None) -> int:
         with self._lock:
-            return len(list(self._pool_dir.glob("*.json")))
+            excluded = exclude or set()
+            return sum(1 for path in self._pool_dir.glob("*.json") if path.stem not in excluded)
 
-    def names(self) -> set[str]:
+    def names(self, exclude: set[str] | None = None) -> set[str]:
         with self._lock:
+            excluded = exclude or set()
             names: set[str] = set()
             for p in self._pool_dir.glob("*.json"):
                 try:
                     d = json.loads(p.read_text())
                     task_name = str(d.get("task_name") or p.stem)
-                    if task_name:
+                    if task_name and task_name not in excluded:
                         names.add(task_name)
                 except Exception:
                     p.unlink(missing_ok=True)
@@ -2064,12 +2095,17 @@ class TaskPool:
                 removed += 1
             return removed
 
-    def list_tasks(self) -> list[PoolTask]:
+    def list_tasks(self, exclude: set[str] | None = None) -> list[PoolTask]:
         with self._lock:
+            excluded = exclude or set()
             tasks: list[PoolTask] = []
             for p in sorted(self._pool_dir.glob("*.json")):
                 try:
-                    tasks.append(PoolTask.from_dict(json.loads(p.read_text())))
+                    payload = json.loads(p.read_text())
+                    task_name = str(payload.get("task_name") or p.stem)
+                    if task_name in excluded:
+                        continue
+                    tasks.append(PoolTask.from_dict(payload))
                 except Exception:
                     p.unlink(missing_ok=True)
             return tasks
@@ -2080,6 +2116,17 @@ class TaskPool:
             existed = path.exists()
             path.unlink(missing_ok=True)
             return existed
+
+    def remove_many(self, task_names: set[str]) -> int:
+        with self._lock:
+            removed = 0
+            for task_name in task_names:
+                path = self._pool_dir / f"{task_name}.json"
+                existed = path.exists()
+                path.unlink(missing_ok=True)
+                if existed:
+                    removed += 1
+            return removed
 
     def take(
         self,
@@ -2092,31 +2139,34 @@ class TaskPool:
         ``min_block`` is kept for call-site compatibility but no longer filters
         cached tasks; a restart should be able to use the persisted pool.
         """
+        tasks = self.take_many(min_block=min_block, limit=1, exclude=exclude)
+        return tasks[0] if tasks else None
+
+    def take_many(
+        self,
+        min_block: int,
+        limit: int,
+        exclude: set[str] | None = None,
+    ) -> list[PoolTask]:
+        """Return up to *limit* usable pool tasks without removing them."""
         excluded = exclude or set()
         with self._lock:
             candidates: list[PoolTask] = []
             for p in sorted(self._pool_dir.glob("*.json")):
                 try:
                     d = json.loads(p.read_text())
-                    task_name = str(d.get("task_name", ""))
+                    task_name = str(d.get("task_name") or p.stem)
                     if task_name in excluded:
                         continue
                     task = PoolTask.from_dict(d)
-                    task_root = Path(task.task_root)
-                    baseline_dir = task_root / "solutions" / "baseline"
-                    if not (
-                        (baseline_dir / "solve.json").is_file()
-                        and (baseline_dir / "solution.diff").is_file()
-                    ):
+                    if not _pool_task_has_scoring_artifacts(task):
                         p.unlink(missing_ok=True)
                         continue
                     candidates.append(task)
                 except Exception:
                     p.unlink(missing_ok=True)
-            if candidates:
-                candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
-                return candidates[0]
-            return None
+            candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
+            return candidates[: max(0, int(limit))]
 
     # Keep pop() for backward compat (used by nothing now, but safe to have)
     def pop(self, min_block: int) -> PoolTask | None:
@@ -2152,68 +2202,6 @@ class TaskPool:
                 p.unlink(missing_ok=True)
                 count += 1
             return count
-
-
-class TaskPoolRefreshBudget:
-    """Shared permit counter for periodic full-pool refreshes.
-
-    Pool filler threads normally sleep when the pool is already at target size.
-    This budget lets a bounded number of those threads create replacement
-    tasks once per interval. When task purging is disabled, these refresh
-    permits allow the pool to accumulate additional cached tasks over time
-    instead of replacing older ones.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._next_refresh_at: float | None = None
-        self._active = False
-        self._completed = 0
-        self._in_flight = 0
-
-    def claim(self, *, config: RunConfig) -> tuple[bool, bool]:
-        count = max(0, int(config.validate_task_pool_refresh_count))
-        interval = max(0, int(config.validate_task_pool_refresh_interval_seconds))
-        if count <= 0 or interval <= 0:
-            return False, False
-
-        now = time.monotonic()
-        with self._lock:
-            if self._next_refresh_at is None:
-                self._next_refresh_at = now + interval
-                return False, False
-
-            started = False
-            if not self._active:
-                if now < self._next_refresh_at:
-                    return False, False
-                self._active = True
-                self._completed = 0
-                self._in_flight = 0
-                started = True
-
-            if self._completed + self._in_flight >= count:
-                return False, started
-
-            self._in_flight += 1
-            return True, started
-
-    def finish(self, *, config: RunConfig, success: bool) -> bool:
-        count = max(0, int(config.validate_task_pool_refresh_count))
-        interval = max(0, int(config.validate_task_pool_refresh_interval_seconds))
-        if count <= 0 or interval <= 0:
-            return False
-
-        with self._lock:
-            self._in_flight = max(0, self._in_flight - 1)
-            if success:
-                self._completed += 1
-            if self._active and self._completed >= count:
-                self._active = False
-                self._completed = 0
-                self._next_refresh_at = time.monotonic() + interval
-                return True
-        return False
 
 
 def _is_github_rate_limit_error(exc: BaseException) -> bool:
@@ -2282,120 +2270,6 @@ def _zero_scored_duel_reason(duel_id: int, rounds: list[ValidationRoundResult]) 
     return f"duel {duel_id} produced zero scored rounds; retrying instead of recording a defense"
 
 
-def _saved_task_fill_cursor_path(config: RunConfig, pool_label: str) -> Path:
-    safe_label = validate_saved_task_cursor_label(pool_label)
-    return config.validate_root / f"saved-task-fill-cursor-{safe_label}.json"
-
-
-def validate_saved_task_cursor_label(label: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", label.strip() or "pool")
-
-
-def _is_complete_saved_task_dir(task_dir: Path) -> bool:
-    task_subdir = task_dir / "task"
-    return (
-        task_dir.is_dir()
-        and task_dir.name.startswith("validate-")
-        and (task_subdir / "task.json").is_file()
-        and (task_subdir / "task.txt").is_file()
-        and (task_subdir / "commit.json").is_file()
-        and (task_subdir / "reference.patch").is_file()
-    )
-
-
-def _saved_task_baseline_can_fill_pool(task_dir: Path) -> bool:
-    """Return False only for saved tasks with a known-bad cached baseline."""
-    task_paths = resolve_task_paths(task_dir.parent, task_dir.name)
-    baseline_paths = build_solution_paths(task_paths, "baseline")
-    if not baseline_paths.solve_json_path.is_file():
-        return True
-    if not baseline_paths.solution_diff_path.is_file():
-        return False
-    try:
-        payload = json.loads(baseline_paths.solve_json_path.read_text())
-    except Exception:
-        return False
-    result = payload.get("result") if isinstance(payload, dict) else None
-    if not isinstance(result, dict):
-        return False
-    return str(result.get("exit_reason") or "") == "completed"
-
-
-def _pool_task_names_from_disk(validate_root: Path) -> set[str]:
-    names: set[str] = set()
-    for path in validate_root.glob("task-pool*/*.json"):
-        try:
-            payload = json.loads(path.read_text())
-            task_name = str(payload.get("task_name") or path.stem) if isinstance(payload, dict) else path.stem
-            if task_name:
-                names.add(task_name)
-        except Exception:
-            names.add(path.stem)
-    return names
-
-
-def _claim_saved_task_for_pool(
-    config: RunConfig,
-    pool: TaskPool,
-    pool_label: str,
-    extra_exclude: set[str] | None = None,
-) -> Path | None:
-    """Pick the next saved task workspace for a pool fill attempt.
-
-    The cursor lives next to validator state so restarts keep cycling through
-    the saved task set instead of repeatedly grabbing the first directory.
-    """
-    if not config.tasks_root.exists():
-        return None
-    with _SAVED_TASK_FILL_LOCK:
-        existing = pool.names() | _pool_task_names_from_disk(config.validate_root) | (extra_exclude or set())
-        candidates = [
-            task_dir
-            for task_dir in sorted(config.tasks_root.glob("validate-*"), key=lambda p: p.name)
-            if (
-                _is_complete_saved_task_dir(task_dir)
-                and _saved_task_baseline_can_fill_pool(task_dir)
-                and task_dir.name not in existing
-                and task_dir.name not in _SAVED_TASK_FILL_IN_FLIGHT
-            )
-        ]
-        if not candidates:
-            return None
-
-        cursor_path = _saved_task_fill_cursor_path(config, pool_label)
-        last_name = ""
-        try:
-            payload = json.loads(cursor_path.read_text())
-            if isinstance(payload, dict):
-                last_name = str(payload.get("last_task_name") or "")
-        except Exception:
-            pass
-
-        start = 0
-        if last_name:
-            for idx, candidate in enumerate(candidates):
-                if candidate.name > last_name:
-                    start = idx
-                    break
-            else:
-                start = 0
-        chosen = candidates[start]
-        _SAVED_TASK_FILL_IN_FLIGHT.add(chosen.name)
-        try:
-            cursor_path.parent.mkdir(parents=True, exist_ok=True)
-            write_json(cursor_path, {"last_task_name": chosen.name, "updated_at": _timestamp()})
-        except Exception:
-            log.exception("Pool filler[%s]: failed to persist saved-task cursor", pool_label)
-        return chosen
-
-
-def _release_saved_task_claim(task_name: str | None) -> None:
-    if not task_name:
-        return
-    with _SAVED_TASK_FILL_LOCK:
-        _SAVED_TASK_FILL_IN_FLIGHT.discard(task_name)
-
-
 def _active_duel_task_names(state: ValidatorState) -> set[str]:
     active_duel = state.active_duel
     if active_duel is None:
@@ -2443,295 +2317,6 @@ def _cached_solution_agent_timeout_seconds(
         return int(timeout) if timeout is not None else None
     except Exception:
         return None
-
-
-# ---------------------------------------------------------------------------
-# Pool filler (background thread)
-# ---------------------------------------------------------------------------
-
-def _pool_filler_loop(
-    config: RunConfig,
-    state: ValidatorState,
-    pool: TaskPool,
-    stop_event: threading.Event,
-    state_lock: threading.Lock,
-    pool_starved: threading.Event | None = None,
-    pool_refresh: TaskPoolRefreshBudget | None = None,
-    pool_label: str = "primary",
-) -> None:
-    while not stop_event.is_set():
-        refresh_claimed = False
-        added_to_pool = False
-        generated_task_root: Path | None = None
-        saved_task_name: str | None = None
-        try:
-            if state.current_king is None:
-                stop_event.wait(5)
-                continue
-
-            if config.validate_task_pool_target <= 0:
-                stop_event.wait(5)
-                continue
-
-            if not config.validate_task_pool_fill_from_saved:
-                backoff_remaining = _pool_generation_backoff_remaining()
-                if backoff_remaining > 0:
-                    stop_event.wait(min(backoff_remaining, 30.0))
-                    continue
-
-            king = state.current_king
-            assert king is not None
-
-            starved = pool_starved is not None and pool_starved.is_set()
-            needs_fill, _ = _pool_needs_fill_for_king(
-                config=config,
-                pool=pool,
-                king=king,
-                pool_label=pool_label,
-            )
-            if needs_fill and pool_starved is not None:
-                pool_starved.set()
-                starved = True
-            pool_size = pool.size()
-            fill_reason = "starved" if starved else "fill"
-            if not needs_fill:
-                if pool_starved is not None:
-                    pool_starved.clear()
-                if pool_refresh is None:
-                    stop_event.wait(2)
-                    continue
-                refresh_claimed, refresh_started = pool_refresh.claim(config=config)
-                if refresh_started:
-                    log.info(
-                        "Pool filler[%s]: starting scheduled refresh of %d task(s)",
-                        pool_label,
-                        config.validate_task_pool_refresh_count,
-                    )
-                if not refresh_claimed:
-                    stop_event.wait(2)
-                    continue
-                fill_reason = "refresh"
-
-            if config.validate_task_pool_fill_from_saved:
-                saved_task_root = _claim_saved_task_for_pool(
-                    config,
-                    pool,
-                    pool_label,
-                    extra_exclude=_active_duel_task_names(state),
-                )
-                if saved_task_root is None:
-                    log.info(
-                        "Pool filler[%s]: no saved task available for %s (pool size: %d)",
-                        pool_label,
-                        fill_reason,
-                        pool_size,
-                    )
-                    stop_event.wait(5)
-                    continue
-                task_name = saved_task_root.name
-                saved_task_name = task_name
-                task_root = str(saved_task_root)
-                log.info("Pool filler[%s]: reusing saved task %s (%s)", pool_label, task_name, fill_reason)
-            else:
-                with state_lock:
-                    task_name = _allocate_task_name(state)
-                log.info("Pool filler[%s]: generating task %s (%s)", pool_label, task_name, fill_reason)
-
-                generate_result = generate_task_run(task_name=task_name, config=config)
-                task_root = generate_result.task_root
-                generated_task_root = Path(task_root)
-
-            ref_patch_path = Path(task_root) / "task" / "reference.patch"
-            if _count_patch_lines(ref_patch_path) < _MIN_PATCH_LINES:
-                log.info("Pool filler[%s]: skipping %s (patch too small)", pool_label, task_name)
-                continue
-
-            if not refresh_claimed:
-                still_needs_fill, _ = _pool_needs_fill_for_king(
-                    config=config,
-                    pool=pool,
-                    king=king,
-                    pool_label=pool_label,
-                )
-                if not still_needs_fill:
-                    continue
-
-            king_hotkey_before = king.hotkey
-            king_commit_before = king.commit_sha
-
-            cached_baseline = _cached_solution_summary(
-                task_name=task_name,
-                solution_name="baseline",
-                config=config,
-            )
-            if cached_baseline is None:
-                _remove_solution_artifacts(task_name=task_name, solution_name="baseline", config=config)
-                baseline_cfg = replace(_build_baseline_config(config), agent_timeout=_POOL_SOLVE_TIMEOUT_SECONDS)
-                baseline_result = solve_task_run(
-                    task_name=task_name,
-                    solution_name="baseline",
-                    config=baseline_cfg,
-                )
-                baseline_exit_reason = baseline_result.exit_reason
-                baseline_elapsed = baseline_result.elapsed_seconds
-            else:
-                baseline_exit_reason, baseline_elapsed = cached_baseline
-
-            if baseline_exit_reason != "completed":
-                log.info(
-                    "Pool filler[%s]: skipping %s (baseline exit_reason=%s)",
-                    pool_label,
-                    task_name,
-                    baseline_exit_reason,
-                )
-                continue
-            agent_timeout = _agent_timeout_from_cursor_elapsed(baseline_elapsed)
-
-            if not refresh_claimed:
-                still_needs_fill, _ = _pool_needs_fill_for_king(
-                    config=config,
-                    pool=pool,
-                    king=king,
-                    pool_label=pool_label,
-                )
-                if not still_needs_fill:
-                    continue
-
-            _remove_solution_artifacts(task_name=task_name, solution_name="king", config=config)
-            _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
-            king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
-            try:
-                king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
-            except Exception as exc:
-                log.info(
-                    "Pool filler[%s]: king solve failed for %s; using empty king patch: %s",
-                    pool_label,
-                    task_name,
-                    exc,
-                )
-                _ensure_empty_solution(
-                    task_name=task_name,
-                    solution_name="king",
-                    config=king_cfg,
-                    reason=str(exc),
-                )
-                king_result = None
-            if king_result is not None and king_result.exit_reason == "time_limit_exceeded":
-                log.info(
-                    "Pool filler[%s]: king timed out on %s (agent_timeout=%ss)",
-                    pool_label,
-                    task_name,
-                    agent_timeout,
-                )
-
-            current_king = state.current_king
-            if (
-                current_king is None
-                or current_king.hotkey != king_hotkey_before
-                or current_king.commit_sha != king_commit_before
-            ):
-                log.info("Pool filler[%s]: discarding %s (king changed during solve)", pool_label, task_name)
-                continue
-
-            _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
-            king_compare = compare_task_run(task_name=task_name, solution_names=["king", "baseline"], config=config)
-            if king_compare.total_changed_lines_b < _MIN_POOL_BASELINE_LINES:
-                log.info("Pool filler[%s]: skipping %s (baseline produced no patch)", pool_label, task_name)
-                continue
-
-            try:
-                with _open_subtensor(config) as sub:
-                    creation_block = sub.block
-            except Exception:
-                creation_block = 0
-
-            if (
-                state.current_king is None
-                or state.current_king.hotkey != king_hotkey_before
-                or state.current_king.commit_sha != king_commit_before
-            ):
-                log.info("Pool filler[%s]: discarding %s (king changed during compare)", pool_label, task_name)
-                continue
-
-            with _POOL_FILL_ADD_LOCK:
-                still_needs_fill, _ = _pool_needs_fill_for_king(
-                    config=config,
-                    pool=pool,
-                    king=current_king,
-                    pool_label=pool_label,
-                )
-                if not refresh_claimed and not still_needs_fill:
-                    if pool_starved is not None:
-                        pool_starved.clear()
-                    continue
-                prune_first = _static_pool_replacement_prune_names(
-                    config=config,
-                    pool=pool,
-                    king=current_king,
-                )
-                candidate = PoolTask(
-                    task_name=task_name,
-                    task_root=task_root,
-                    creation_block=creation_block,
-                    cursor_elapsed=baseline_elapsed,
-                    king_lines=king_compare.matched_changed_lines,
-                    king_similarity=king_compare.similarity_ratio,
-                    baseline_lines=king_compare.total_changed_lines_b,
-                    agent_timeout_seconds=agent_timeout,
-                    king_hotkey=current_king.hotkey,
-                    king_commit_sha=current_king.commit_sha,
-                )
-                healthy, reason = _pool_task_has_healthy_king_cache(config=config, task=candidate)
-                if not healthy:
-                    log.info("Pool filler[%s]: skipping %s (%s)", pool_label, task_name, reason)
-                    continue
-                pruned = pool.add(
-                    candidate,
-                    keep=config.validate_task_pool_target,
-                    prune_first=prune_first,
-                    preserve=_active_duel_task_names(state),
-                )
-                still_needs_fill, _ = _pool_needs_fill_for_king(
-                    config=config,
-                    pool=pool,
-                    king=current_king,
-                    pool_label=pool_label,
-                )
-            added_to_pool = True
-            if pool_starved is not None:
-                if still_needs_fill:
-                    pool_starved.set()
-                else:
-                    pool_starved.clear()
-            log.info(
-                "Pool filler[%s]: added %s (pool size: %d, pruned: %d)",
-                pool_label,
-                task_name,
-                pool.size(),
-                pruned,
-            )
-
-        except Exception as exc:
-            if _is_github_rate_limit_error(exc):
-                _note_pool_generation_rate_limit(pool_label)
-            log.exception("Pool filler[%s]: error preparing task (retrying)", pool_label)
-            stop_event.wait(5)
-        finally:
-            _release_saved_task_claim(saved_task_name)
-            if not added_to_pool and generated_task_root is not None and generated_task_root.exists():
-                try:
-                    shutil.rmtree(generated_task_root, ignore_errors=True)
-                    log.info("Pool filler[%s]: removed unused task dir %s", pool_label, generated_task_root.name)
-                except Exception:
-                    log.exception("Pool filler[%s]: failed to remove unused task dir %s", pool_label, generated_task_root)
-            if refresh_claimed and pool_refresh is not None:
-                completed = pool_refresh.finish(config=config, success=added_to_pool)
-                if completed:
-                    log.info(
-                        "Pool filler[%s]: completed scheduled refresh of %d task(s)",
-                        pool_label,
-                        config.validate_task_pool_refresh_count,
-                    )
 
 
 def _ensure_empty_solution(*, task_name: str, solution_name: str, config: RunConfig, reason: str) -> None:
@@ -2912,22 +2497,35 @@ def _static_pool_ready_for_king(
     if target <= 0:
         return True, ""
     tasks = pool.list_tasks()
-    size = len(tasks)
-    if size < target:
-        return False, f"{pool_label} pool has {size}/{target} tasks"
-    if size > target:
-        return False, f"{pool_label} pool has {size}/{target} tasks"
-    stale = [task.task_name for task in tasks if not _pool_task_matches_king(task, king)]
-    if stale:
-        return False, f"{pool_label} pool contains {len(stale)} stale task(s)"
+    if len(tasks) < target:
+        return False, f"{pool_label} pool has {len(tasks)}/{target} tasks"
+    valid = 0
+    stale = 0
+    first_unhealthy: tuple[str, str] | None = None
     for task in tasks:
+        if not _pool_task_matches_king(task, king):
+            stale += 1
+            continue
         healthy, reason = _pool_task_has_healthy_king_cache(
             config=config,
             task=task,
         )
         if not healthy:
-            return False, f"{pool_label} pool task {task.task_name} has unhealthy king cache: {reason}"
-    return True, ""
+            if first_unhealthy is None:
+                first_unhealthy = (task.task_name, reason)
+            continue
+        valid += 1
+        if valid >= target:
+            return True, ""
+    if first_unhealthy is not None:
+        task_name, unhealthy_reason = first_unhealthy
+        return (
+            False,
+            f"{pool_label} pool task {task_name} has unhealthy king cache: {unhealthy_reason}",
+        )
+    if stale:
+        return False, f"{pool_label} pool has {valid}/{target} valid tasks ({stale} stale)"
+    return False, f"{pool_label} pool has {valid}/{target} valid tasks"
 
 
 def _pool_task_has_healthy_king_cache(
@@ -2940,15 +2538,12 @@ def _pool_task_has_healthy_king_cache(
     except FileNotFoundError:
         return False, "task workspace is missing"
 
-    baseline_paths = build_solution_paths(task_paths, "baseline")
     king_paths = build_solution_paths(task_paths, "king")
-    compare_paths = build_compare_paths(task_paths, derive_compare_name(["king", "baseline"]))
-    if not baseline_paths.solve_json_path.is_file() or not baseline_paths.solution_diff_path.is_file():
-        return False, "baseline artifacts are missing"
+    compare_paths = _king_reference_compare_paths(task_paths)
     if not king_paths.solve_json_path.is_file() or not king_paths.solution_diff_path.is_file():
         return False, "king artifacts are missing"
     if not compare_paths.compare_json_path.is_file():
-        return False, "king compare artifact is missing"
+        return False, "king reference compare artifact is missing"
 
     expected_timeout = _duel_agent_timeout(task)
     king_timeout = _cached_solution_agent_timeout_seconds(
@@ -2973,7 +2568,7 @@ def _pool_task_has_healthy_king_cache(
     try:
         matched_lines = int(result.get("matched_changed_lines"))
         similarity_ratio = float(result.get("similarity_ratio"))
-        baseline_lines = int(result.get("total_changed_lines_b"))
+        reference_lines = int(result.get("total_changed_lines_b"))
     except (TypeError, ValueError) as exc:
         return False, f"king compare metrics are invalid: {exc}"
 
@@ -2983,8 +2578,8 @@ def _pool_task_has_healthy_king_cache(
         return False, "king produced no matched changed lines"
     if abs(similarity_ratio - float(task.king_similarity)) > 1e-9:
         return False, f"king_similarity mismatch ({similarity_ratio} != {task.king_similarity})"
-    if baseline_lines != int(task.baseline_lines):
-        return False, f"baseline_lines mismatch ({baseline_lines} != {task.baseline_lines})"
+    if reference_lines != int(task.baseline_lines):
+        return False, f"baseline_lines mismatch ({reference_lines} != {task.baseline_lines})"
     return True, ""
 
 
@@ -3083,7 +2678,11 @@ def _ensure_task_ready_for_king(
     task_name = task.task_name
     agent_timeout = _duel_agent_timeout(task)
     _remove_solution_artifacts(task_name=task_name, solution_name="king", config=config)
-    _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
+    _remove_compare_artifacts(
+        task_name=task_name,
+        solution_names=_reference_compare_solution_names("king"),
+        config=config,
+    )
     king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
     try:
         king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
@@ -3107,7 +2706,11 @@ def _ensure_task_ready_for_king(
             agent_timeout,
         )
 
-    king_compare = compare_task_run(task_name=task_name, solution_names=["king", "baseline"], config=config)
+    king_compare = compare_task_run(
+        task_name=task_name,
+        solution_names=_reference_compare_solution_names("king"),
+        config=config,
+    )
     refreshed = PoolTask(
         task_name=task.task_name,
         task_root=task.task_root,
@@ -3123,123 +2726,6 @@ def _ensure_task_ready_for_king(
     if pool is not None and not config.validate_task_pool_static:
         pool.add(refreshed)
     return refreshed
-
-
-def _refresh_pool_task_for_king(
-    *,
-    config: RunConfig,
-    king: ValidatorSubmission,
-    task: PoolTask,
-    pool_label: str,
-) -> PoolTask | None:
-    task_name = task.task_name
-    task_paths = resolve_task_paths(config.tasks_root, task_name)
-    if not task_paths.root.exists():
-        log.warning("Pool refresh[%s]: dropping %s (task root missing)", pool_label, task_name)
-        return None
-
-    agent_timeout = _duel_agent_timeout(task)
-    _remove_solution_artifacts(task_name=task_name, solution_name="king", config=config)
-    _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
-
-    king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
-    try:
-        king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
-    except Exception as exc:
-        log.info(
-            "Pool refresh[%s]: king solve failed for %s; using empty king patch: %s",
-            pool_label,
-            task_name,
-            exc,
-        )
-        _ensure_empty_solution(
-            task_name=task_name,
-            solution_name="king",
-            config=king_cfg,
-            reason=str(exc),
-        )
-        king_result = None
-    if king_result is not None and king_result.exit_reason == "time_limit_exceeded":
-        log.info(
-            "Pool refresh[%s]: king timed out on %s (agent_timeout=%ss)",
-            pool_label,
-            task_name,
-            agent_timeout,
-        )
-
-    king_compare = compare_task_run(task_name=task_name, solution_names=["king", "baseline"], config=config)
-    if king_compare.total_changed_lines_b < _MIN_POOL_BASELINE_LINES:
-        log.info("Pool refresh[%s]: dropping %s (baseline produced no patch)", pool_label, task_name)
-        return None
-
-    refreshed = PoolTask(
-        task_name=task.task_name,
-        task_root=task.task_root,
-        creation_block=task.creation_block,
-        cursor_elapsed=task.cursor_elapsed,
-        king_lines=king_compare.matched_changed_lines,
-        king_similarity=king_compare.similarity_ratio,
-        baseline_lines=king_compare.total_changed_lines_b,
-        agent_timeout_seconds=agent_timeout,
-        king_hotkey=king.hotkey,
-        king_commit_sha=king.commit_sha,
-    )
-    healthy, reason = _pool_task_has_healthy_king_cache(config=config, task=refreshed)
-    if not healthy:
-        log.info("Pool refresh[%s]: dropping %s (%s)", pool_label, task_name, reason)
-        return None
-    return refreshed
-
-
-def _refresh_pool_for_king(
-    *,
-    config: RunConfig,
-    king: ValidatorSubmission,
-    pool: TaskPool,
-    pool_label: str,
-) -> tuple[int, int, int]:
-    tasks = pool.list_tasks()
-    if not tasks:
-        return (0, 0, 0)
-
-    refreshed = 0
-    already_current = 0
-    dropped = 0
-    log.info(
-        "Pool refresh[%s]: refreshing %d cached task(s) for king %s",
-        pool_label,
-        len(tasks),
-        king.agent_ref,
-    )
-    for task in tasks:
-        if _pool_task_matches_king(task, king):
-            already_current += 1
-            continue
-        try:
-            refreshed_task = _refresh_pool_task_for_king(
-                config=config,
-                king=king,
-                task=task,
-                pool_label=pool_label,
-            )
-        except Exception:
-            log.exception("Pool refresh[%s]: dropping %s after refresh failure", pool_label, task.task_name)
-            refreshed_task = None
-        if refreshed_task is None:
-            if pool.remove(task.task_name):
-                dropped += 1
-            continue
-        pool.add(refreshed_task, keep=config.validate_task_pool_target)
-        refreshed += 1
-    log.info(
-        "Pool refresh[%s]: refreshed=%d already_current=%d dropped=%d size=%d",
-        pool_label,
-        refreshed,
-        already_current,
-        dropped,
-        pool.size(),
-    )
-    return (refreshed, already_current, dropped)
 
 
 def _normalize_pool_size(*, pool: TaskPool, keep: int, pool_label: str) -> int:
@@ -3376,10 +2862,10 @@ def _gather_pool_tasks(
                 on_tick(gathered=len(tasks), needed=n)
             except Exception:
                 log.exception("gather on_tick callback failed (non-fatal)")
-        task = pool.take(min_block=min_block, exclude=seen)
-        if task is not None:
-            tasks.append(task)
-            seen.add(task.task_name)
+        batch = pool.take_many(min_block=min_block, limit=n - len(tasks), exclude=seen)
+        if batch:
+            tasks.extend(batch)
+            seen.update(task.task_name for task in batch)
             last_progress = time.monotonic()
         else:
             if pool_starved is not None:
@@ -3403,7 +2889,7 @@ def _gather_pool_tasks(
                 len(tasks), n, elapsed_no_progress, starve_grace,
             )
             break
-        if task is None:
+        if not batch:
             time.sleep(min(3, remaining_time))
     if pool_starved is not None:
         pool_starved.clear()
@@ -3435,7 +2921,7 @@ def _solve_and_compare_round(
         )
         _remove_compare_artifacts(
             task_name=task.task_name,
-            solution_names=[solution_label, "baseline"],
+            solution_names=_reference_compare_solution_names(solution_label),
             config=config,
         )
         _remove_compare_artifacts(
@@ -3495,7 +2981,7 @@ def _solve_and_compare_round(
         with ThreadPoolExecutor(max_workers=2) as cmp_exec:
             chall_fut = cmp_exec.submit(
                 compare_task_run, task_name=task.task_name,
-                solution_names=[solution_label, "baseline"], config=config,
+                solution_names=_reference_compare_solution_names(solution_label), config=config,
             )
             kc_fut = cmp_exec.submit(
                 compare_task_run, task_name=task.task_name,
@@ -3548,7 +3034,9 @@ def _solve_and_compare_round(
                 duel_id=duel_id, task_name=task.task_name,
                 tasks_root=config.tasks_root,
                 solution_labels={
-                    "baseline": "baseline", "king": "king",
+                    "reference": _REFERENCE_SOLUTION_NAME,
+                    "baseline": _LEGACY_BASELINE_SOLUTION_NAME,
+                    "king": "king",
                     "challenger": solution_label,
                 },
             )
@@ -4161,7 +3649,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
     _kill_stale_containers()
     log.info(
-        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s); Cursor similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
+        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s); patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
         config.validate_duel_rounds,
         _DIFF_JUDGE_WEIGHT * 100,
         _DIFF_JUDGE_MODEL,
@@ -4204,14 +3692,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     retest_pool = TaskPool(paths.retest_pool_dir)
     _normalize_pool_size(pool=pool, keep=config.validate_task_pool_target, pool_label="primary")
     _normalize_pool_size(pool=retest_pool, keep=config.validate_task_pool_target, pool_label="retest")
-    pool_refresh = TaskPoolRefreshBudget()
-    retest_pool_refresh = TaskPoolRefreshBudget()
-    pool_stop = threading.Event()
     pool_starved = threading.Event()
     retest_pool_starved = threading.Event()
     shutdown_requested = threading.Event()
     restart_requested = threading.Event()
-    state_lock = threading.Lock()
     validator_started_at = _timestamp()
     chain_data: dict[str, Any] | None = None
     last_king_check = 0.0
@@ -4307,20 +3791,15 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     log.exception("Queue refresh dashboard publish failed (non-fatal)")
         return current_block
 
-    pool_filler_executor = ThreadPoolExecutor(
-        max_workers=max(1, config.validate_pool_filler_concurrency) * 2,
-    )
     previous_signal_handlers: dict[int, Any] = {}
 
     def _request_shutdown(signum: int, _frame: Any) -> None:
         log.warning("Received signal %s; draining current validator work before exit", signum)
         shutdown_requested.set()
-        pool_stop.set()
 
     def _request_restart(signum: int, _frame: Any) -> None:
         log.warning("Received signal %s; draining current duel before validator restart", signum)
         restart_requested.set()
-        pool_stop.set()
 
     try:
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -4434,30 +3913,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     duel_count=duel_count,
                 )
 
-            # Start pool fillers
-            for _ in range(config.validate_pool_filler_concurrency):
-                pool_filler_executor.submit(
-                    _pool_filler_loop,
-                    config,
-                    state,
-                    pool,
-                    pool_stop,
-                    state_lock,
-                    pool_starved,
-                    pool_refresh,
-                    "primary",
-                )
-                pool_filler_executor.submit(
-                    _pool_filler_loop,
-                    config,
-                    state,
-                    retest_pool,
-                    pool_stop,
-                    state_lock,
-                    retest_pool_starved,
-                    retest_pool_refresh,
-                    "retest",
-                )
+            log.info("Validator pool filling is delegated to the external pool-manager process")
 
             while not shutdown_requested.is_set():
               try:
@@ -4532,6 +3988,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "; ".join(pool_gate_reasons),
                         )
                         last_pool_gate_log_at = now
+                    sleep_seconds = _remaining_poll_sleep_seconds(
+                        started_at=loop_started_at,
+                        interval_seconds=poll_interval_seconds,
+                    )
+                    if sleep_seconds > 0:
+                        time.sleep(sleep_seconds)
                     continue
 
                 # --- Candidate processing: continuously drain queue order ---
@@ -4762,7 +4224,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     duel_dict=completed_dict,
                                     tasks_root=config.tasks_root,
                                     solution_labels={
-                                        "baseline": "baseline",
+                                        "reference": _REFERENCE_SOLUTION_NAME,
                                         "king": "king",
                                         "challenger": chall_label,
                                     },
@@ -5177,43 +4639,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     log.info("Restart requested; skipping cleanup and leaving validator loop for PM2 restart")
                     break
 
-                _cleanup_last_touch = [time.monotonic()]
-                _cleanup_last_publish = [time.monotonic()]
-
-                def _cleanup_heartbeat() -> None:
-                    # Two-tier heartbeat during long cleanup passes:
-                    #   - touch dashboard_data.json every 30s so the local
-                    #     watchdog doesn't think the validator is wedged
-                    #   - re-publish the dashboard to R2 every 5 min so the
-                    #     public dashboard doesn't go stale while we're
-                    #     working through a large rmtree backlog (cleanup
-                    #     can take 30-60+ min if many huge venvs exist).
-                    now = time.monotonic()
-                    if now - _cleanup_last_touch[0] >= 30.0:
-                        _cleanup_last_touch[0] = now
-                        try:
-                            Path(paths.root / "dashboard_data.json").touch()
-                        except Exception:
-                            log.exception("cleanup heartbeat touch failed (non-fatal)")
-                    if now - _cleanup_last_publish[0] >= 300.0:
-                        _cleanup_last_publish[0] = now
-                        try:
-                            _publish_dashboard(
-                                state, dashboard_history, config,
-                                validator_started_at, active_duel_info, chain_data,
-                            )
-                        except Exception:
-                            log.exception("cleanup heartbeat r2 publish failed (non-fatal)")
-
-                if config.validate_task_pool_fill_from_saved:
-                    log.info("Task cleanup skipped: saved task pool fill is enabled")
-                else:
-                    _cleanup_old_tasks(
-                        config.tasks_root,
-                        keep_names=pool.names(),
-                        min_age_seconds=config.validate_task_cleanup_min_age_seconds,
-                        on_progress=_cleanup_heartbeat,
-                    )
+                log.debug("Task cleanup delegated to external pool-manager process")
                 _cleanup_orphaned_containers()
 
               except KeyboardInterrupt:
@@ -5229,8 +4655,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                   time.sleep(sleep_seconds)
 
     finally:
-        pool_stop.set()
-        pool_filler_executor.shutdown(wait=False, cancel_futures=True)
         github_client.close()
         github_merge_client.close()
         for sig, handler in previous_signal_handlers.items():
@@ -5317,11 +4741,12 @@ def _publish_dashboard(
             "method": "race",
             "duel_rounds": config.validate_duel_rounds,
             "win_margin": config.validate_win_margin,
+            "patch_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
             "cursor_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
             "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT,
             "llm_diff_judge_model": _DIFF_JUDGE_MODEL,
             "ties_count": False,
-            "description": "Round score is based only on the LLM diff judgment; Cursor similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
+            "description": "Round score is based only on the LLM diff judgment; patch similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
         },
         "queue": [
             {
@@ -7252,9 +6677,11 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
 # Config builders
 # ---------------------------------------------------------------------------
 
+
 def _build_baseline_config(config: RunConfig) -> RunConfig:
     model = config.baseline_model or _BASELINE_MODEL
     return replace(config, solver_backend="cursor", solve_agent="baseline", solver_agent_source=None, solver_model=model)
+
 
 def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfig:
     src = _cached_agent_source(config, sub)

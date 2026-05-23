@@ -32,6 +32,7 @@ from validate import (  # noqa: E402
     _ensure_empty_solution,
     _load_state,
     _prepare_validate_paths,
+    _reference_compare_solution_names,
     _remove_compare_artifacts,
     _remove_solution_artifacts,
 )
@@ -45,7 +46,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--solver-provider-sort")
     parser.add_argument("--solver-provider-only")
     parser.add_argument("--solver-provider-disable-fallbacks", action="store_true")
-    parser.add_argument("--baseline-model")
+    parser.add_argument("--baseline-model", help="Cursor model ID for baseline timeout calibration.")
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--target-count", type=int)
@@ -63,7 +64,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--only-missing-baseline",
         action="store_true",
-        help="Repair only tasks missing baseline artifacts instead of the broader stale set.",
+        help="Repair only tasks missing baseline artifacts.",
     )
     return parser.parse_args()
 
@@ -83,19 +84,23 @@ def _build_config(args: argparse.Namespace) -> RunConfig:
     )
 
 
-def _baseline_paths(task_root: Path) -> tuple[Path, Path]:
-    baseline_dir = task_root / "solutions" / "baseline"
-    return baseline_dir / "solve.json", baseline_dir / "solution.diff"
-
-
 def _king_paths(task_root: Path) -> tuple[Path, Path]:
     king_dir = task_root / "solutions" / "king"
     return king_dir / "solve.json", king_dir / "solution.diff"
 
 
+def _baseline_paths(task_root: Path) -> tuple[Path, Path]:
+    baseline_dir = task_root / "solutions" / "baseline"
+    return baseline_dir / "solve.json", baseline_dir / "solution.diff"
+
+
 def _has_baseline(task_root: Path) -> bool:
     solve_json, solution_diff = _baseline_paths(task_root)
     return solve_json.is_file() and solution_diff.is_file()
+
+
+def _has_reference_compare(task_root: Path) -> bool:
+    return (task_root / "comparisons" / "king--vs--reference" / "compare.json").is_file()
 
 
 def _king_matches_current(task_root: Path, king: ValidatorSubmission) -> bool:
@@ -122,6 +127,8 @@ def _task_has_minimum_files(task_root: Path) -> bool:
         and (task_root / "task" / "commit.json").is_file()
         and reference_patch.is_file()
         and _count_patch_lines(reference_patch) >= _MIN_PATCH_LINES
+        and (task_root / "task" / "original").is_dir()
+        and (task_root / "task" / "reference").is_dir()
     )
 
 
@@ -160,11 +167,12 @@ def _iter_candidate_task_names(
             continue
         name = task_dir.name
         has_baseline = _has_baseline(task_dir)
+        has_reference_compare = _has_reference_compare(task_dir)
         has_current_king = _king_matches_current(task_dir, king)
         sort_key = (
             0 if name in priority else 1,
-            0 if has_baseline and has_current_king else 1,
-            0 if has_baseline or has_current_king else 1,
+            0 if has_baseline and has_reference_compare and has_current_king else 1,
+            0 if has_baseline or has_reference_compare or has_current_king else 1,
             name,
         )
         entries.append((sort_key, name))
@@ -215,7 +223,11 @@ def _repair_one_task(
 
     if not _king_matches_current(task_root, king):
         _remove_solution_artifacts(task_name=task_name, solution_name="king", config=config)
-        _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
+        _remove_compare_artifacts(
+            task_name=task_name,
+            solution_names=_reference_compare_solution_names("king"),
+            config=config,
+        )
         king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
         try:
             king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
@@ -230,10 +242,18 @@ def _repair_one_task(
         if king_result is not None and king_result.exit_reason not in {"completed", "time_limit_exceeded"}:
             return task_name, f"skip:king_{king_result.exit_reason}"
 
-    _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
-    king_compare = compare_task_run(task_name=task_name, solution_names=["king", "baseline"], config=config)
+    _remove_compare_artifacts(
+        task_name=task_name,
+        solution_names=_reference_compare_solution_names("king"),
+        config=config,
+    )
+    king_compare = compare_task_run(
+        task_name=task_name,
+        solution_names=_reference_compare_solution_names("king"),
+        config=config,
+    )
     if king_compare.total_changed_lines_b < _MIN_POOL_BASELINE_LINES:
-        return task_name, "skip:no_baseline_patch"
+        return task_name, "skip:no_reference_patch"
 
     pool.add(
         PoolTask(

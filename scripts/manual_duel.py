@@ -268,11 +268,11 @@ class ManualDuelRunner:
 
         base_compare, base_compare_error = self._compare(
             task.task_name,
-            [base_label, "baseline"],
+            [base_label, "reference"],
         )
         challenger_compare, challenger_compare_error = self._compare(
             task.task_name,
-            [self.challenger_label, "baseline"],
+            [self.challenger_label, "reference"],
         )
         pair_compare, pair_compare_error = self._compare(
             task.task_name,
@@ -583,11 +583,12 @@ def _judge_pair(
         return injection
 
     task_paths = resolve_task_paths(config.tasks_root, task_name)
+    candidate_mapping = {"king": "candidate_a", "challenger": "candidate_b"}
     prompt = _build_diff_judge_prompt(
         task_prompt=task_paths.task_txt_path.read_text(),
         reference_patch=task_paths.reference_patch_path.read_text(),
-        king_patch=base_patch,
-        challenger_patch=challenger_patch,
+        candidate_a_patch=base_patch,
+        candidate_b_patch=challenger_patch,
     )
     system_prompt = (
         "You are a security-conscious code diff judge for a validator duel.\n"
@@ -614,7 +615,7 @@ def _judge_pair(
             payload = _extract_json_object(raw)
             if payload is None:
                 raise RuntimeError("judge did not return a JSON object")
-            return _parse_diff_judge_payload(payload)
+            return _parse_diff_judge_payload(payload, candidate_mapping=candidate_mapping)
         except Exception as exc:
             last_error = str(exc)
             if attempt < _DIFF_JUDGE_ATTEMPTS:

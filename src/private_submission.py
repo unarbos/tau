@@ -154,7 +154,7 @@ def run_private_submission_checks(
             status="skipped",
             summary=f"Skipped because {failed} failed.",
         )
-    accepted = all(check.status in {"passed", "warn"} for check in checks.values())
+    accepted = all(check.status == "passed" for check in checks.values())
     return PrivateSubmissionCheckResult(accepted=accepted, agent_sha256=agent_sha, checks=checks)
 
 
@@ -278,13 +278,17 @@ def judge_score_failures(judgment: dict[str, Any], *, min_score: int) -> list[st
     if overall < min_score:
         failures.append(f"overall_score={overall} is below required minimum {min_score}.")
 
+    failures.extend(_judge_risk_failures(judgment, overall=overall, min_score=min_score))
+
     component_floor = max(0, min(100, int(min_score) - 5))
+    real_edit_floor = max(0, min(100, int(min_score)))
     for name in ("real_edit_score", "safety_score", "scope_score", "contract_score"):
         if name not in judgment:
             continue
         score = _coerce_score(judgment.get(name))
-        if score < component_floor:
-            failures.append(f"{name}={score} is below component minimum {component_floor}.")
+        floor = real_edit_floor if name == "real_edit_score" else component_floor
+        if score < floor:
+            failures.append(f"{name}={score} is below component minimum {floor}.")
 
     if "real_edit_score" in judgment:
         real_edit = _coerce_score(judgment.get("real_edit_score"))
@@ -293,6 +297,33 @@ def judge_score_failures(judgment: dict[str, Any], *, min_score: int) -> list[st
                 f"overall_score={overall} exceeds real_edit_score={real_edit} by more than 10 points."
             )
     return failures
+
+
+def _judge_risk_failures(judgment: dict[str, Any], *, overall: int, min_score: int) -> list[str]:
+    risk_text = "\n".join(
+        str(item).lower()
+        for item in (
+            judgment.get("summary"),
+            *(judgment.get("reasons") or []),
+            *(judgment.get("risks") or []),
+        )
+        if item is not None
+    )
+    if not risk_text:
+        return []
+    named_cosmetic_or_goodhart = (
+        "cosmetic-copy" in risk_text
+        or "goodhart" in risk_text
+        or "comment churn" in risk_text
+        or "newline normalization" in risk_text
+        or "parameter-only" in risk_text
+    )
+    borderline = overall <= min(100, int(min_score) + 5)
+    if named_cosmetic_or_goodhart and borderline:
+        return [
+            "judge reported cosmetic-copy/goodhart/non-contribution risk on a borderline score; requires a clearly functional contribution."
+        ]
+    return []
 
 
 def write_private_submission_bundle(

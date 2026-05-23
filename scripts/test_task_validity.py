@@ -65,17 +65,8 @@ def _task_has_minimum_files(task_root: Path) -> tuple[bool, list[str]]:
         problems.append("reference patch too small")
     if not (task_root / "task" / "original").exists():
         problems.append("missing task/original repo")
-    return not problems, problems
-
-
-def _baseline_ready(task_root: Path) -> tuple[bool, list[str]]:
-    problems: list[str] = []
-    solve_json = task_root / "solutions" / "baseline" / "solve.json"
-    solution_diff = task_root / "solutions" / "baseline" / "solution.diff"
-    if not solve_json.is_file():
-        problems.append("missing baseline solve.json")
-    if not solution_diff.is_file():
-        problems.append("missing baseline solution.diff")
+    if not (task_root / "task" / "reference").exists():
+        problems.append("missing task/reference repo")
     return not problems, problems
 
 
@@ -156,14 +147,13 @@ def main() -> int:
             for name, task_root in entries:
                 counts["checked"] += 1
                 ok_task, task_problems = _task_has_minimum_files(task_root)
-                ok_base, base_problems = _baseline_ready(task_root)
-                if ok_task and ok_base:
+                if ok_task:
                     counts["valid"] += 1
                     continue
                 counts["invalid"] += 1
                 overall_failures += 1
                 if len(failures) < args.sample_errors:
-                    failures.append({"name": name, "problems": task_problems + base_problems})
+                    failures.append({"name": name, "problems": task_problems})
 
         else:
             pool = TaskPool(validate_paths.pool_dir if scope == "main" else validate_paths.retest_pool_dir)
@@ -171,15 +161,14 @@ def main() -> int:
             for name, task_root in entries:
                 counts["checked"] += 1
                 ok_task, task_problems = _task_has_minimum_files(task_root)
-                ok_base, base_problems = _baseline_ready(task_root)
                 ok_king, king_problems = _king_ready_for_current(task_root, current_king)
-                if ok_task and ok_base and ok_king:
+                if ok_task and ok_king:
                     counts["valid"] += 1
                     continue
                 counts["invalid"] += 1
                 overall_failures += 1
                 if len(failures) < args.sample_errors:
-                    failures.append({"name": name, "problems": task_problems + base_problems + king_problems})
+                    failures.append({"name": name, "problems": task_problems + king_problems})
 
         _print_summary(scope, counts, failures)
 

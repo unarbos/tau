@@ -786,7 +786,7 @@ def publish_round_data(
 
     The local workspace keeps task prompts and reference patches for private
     scoring. Public R2 uploads intentionally exclude task.txt, task.json,
-    commit.json, reference.patch, baseline artifacts, model rollouts, and raw
+    commit.json, reference.patch, legacy baseline artifacts, model rollouts, and raw
     solve transcripts so miners cannot recover private task/reference context
     from the dashboard API.
 
@@ -795,7 +795,7 @@ def publish_round_data(
         sn66/duels/{duel_id}/rounds/{task_name}/...
 
     ``solution_labels`` maps canonical R2 names to actual on-disk solution
-    folder names, e.g. ``{"baseline": "baseline", "challenger": "challenger-42"}``.
+    folder names, e.g. ``{"reference": "reference", "challenger": "challenger-42"}``.
     When *None*, falls back to the canonical names as-is.
 
     Returns True if at least one file was uploaded, False otherwise.
@@ -878,9 +878,12 @@ def publish_round_data(
     ]
     for left_canonical, right_canonical in compare_pairs:
         left_disk = labels.get(left_canonical, left_canonical)
-        right_default = "baseline" if right_canonical == "reference" else right_canonical
-        right_disk = labels.get(right_canonical, right_default)
+        right_disk = labels.get(right_canonical, right_canonical)
         disk_cmp_name = f"{left_disk}--vs--{right_disk}"
+        if right_canonical == "reference":
+            candidate_paths = build_compare_paths(task_paths, disk_cmp_name)
+            if not candidate_paths.compare_json_path.exists():
+                disk_cmp_name = f"{left_disk}--vs--baseline"
         r2_cmp_name = f"{left_canonical}--vs--{right_canonical}"
         cmp_paths = build_compare_paths(task_paths, disk_cmp_name)
         _try_upload_public_compare_file(

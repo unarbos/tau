@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "bittensor>=10.2.0",
     "boto3>=1.35.0",
+    "huggingface_hub>=0.36.0",
     "httpx>=0.28.0",
     "pyflakes>=3.2.0",
 ]
@@ -36,6 +37,7 @@ py-modules = [
     "solver_runner",
     "submission_api",
     "task_generation",
+    "task_pool_manager",
     "tau_entrypoint",
     "validate",
     "workspace",
@@ -72,6 +74,7 @@ known-first-party = [
     "solver_runner",
     "submission_api",
     "task_generation",
+    "task_pool_manager",
     "tau_entrypoint",
     "validate",
     "workspace",
