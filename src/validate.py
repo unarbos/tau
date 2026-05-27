@@ -1630,7 +1630,7 @@ def _judge_round_diffs_uncapped(
     )
 
     last_error: str | None = None
-    for model in _DIFF_JUDGE_MODELS:
+    for model in _diff_judge_models(config):
         candidate_mapping = _diff_judge_candidate_mapping(
             seed=f"{task_name}:{challenger_solution_name}:{model}",
         )
@@ -1678,6 +1678,22 @@ def _judge_round_diffs_uncapped(
                     time.sleep(attempt)
 
     return _neutral_diff_judge(f"LLM diff judge failed: {last_error}")
+
+
+def _diff_judge_models(config: RunConfig) -> tuple[str, ...]:
+    primary = (config.diff_judge_model or _DIFF_JUDGE_MODEL).strip()
+    fallbacks = _split_config_models(config.diff_judge_fallback_models)
+    if config.diff_judge_model and config.diff_judge_fallback_models is None:
+        fallbacks = ()
+    models = [primary, *fallbacks] if primary else fallbacks
+    deduped = tuple(dict.fromkeys(model for model in models if model))
+    return deduped or _DIFF_JUDGE_MODELS
+
+
+def _split_config_models(raw: str | None) -> tuple[str, ...]:
+    if raw is None:
+        return _DIFF_JUDGE_FALLBACK_MODELS
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def _diff_judge_prompt_for_model(

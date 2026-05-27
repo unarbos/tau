@@ -450,6 +450,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--queue-size", type=int, help="Max queued challengers.")
     validate.add_argument("--publish-repo", help="Repository where winning private submissions are published, in owner/name form.")
     validate.add_argument("--publish-base", help="Base branch where winning private submissions are published.")
+    validate.add_argument("--diff-judge-model", help="OpenRouter model for validator diff judging.")
+    validate.add_argument(
+        "--diff-judge-fallback-models",
+        help="Comma-separated OpenRouter fallback models for validator diff judging; use an empty string to disable fallbacks.",
+    )
     validate.add_argument("--watch-private-submissions", action="store_true", default=None, help="Accept eligible private API submissions as validator challengers.")
     validate.add_argument("--private-submission-only", action="store_true", default=None, help="Use only private API submissions as miner submissions.")
     validate.add_argument("--private-submission-root", type=Path, help="Directory containing private submission bundles keyed by submission id.")
@@ -1172,6 +1177,12 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_wallet_path=args.wallet_path,
         validate_publish_repo=args.publish_repo or defaults.validate_publish_repo,
         validate_publish_base=args.publish_base or defaults.validate_publish_base,
+        diff_judge_model=_arg_or_env(args.diff_judge_model, "DIFF_JUDGE_MODEL", "OPENROUTER_DIFF_JUDGE_MODEL"),
+        diff_judge_fallback_models=(
+            args.diff_judge_fallback_models
+            if args.diff_judge_fallback_models is not None
+            else defaults.diff_judge_fallback_models
+        ),
         validate_private_submission_watch=(
             defaults.validate_private_submission_watch
             if args.watch_private_submissions is None

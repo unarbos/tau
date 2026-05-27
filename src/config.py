@@ -101,6 +101,10 @@ class RunConfig:
     generator_model: str | None = field(default_factory=lambda: _env_str("GENERATOR_MODEL", "OPENROUTER_GENERATOR_MODEL"))
     solver_model: str | None = None
     eval_model: str | None = field(default_factory=lambda: _env_str("EVAL_MODEL", "OPENROUTER_EVAL_MODEL"))
+    diff_judge_model: str | None = field(default_factory=lambda: _env_str("DIFF_JUDGE_MODEL", "OPENROUTER_DIFF_JUDGE_MODEL"))
+    diff_judge_fallback_models: str | None = field(
+        default_factory=lambda: _env_str("DIFF_JUDGE_FALLBACK_MODELS", "OPENROUTER_DIFF_JUDGE_FALLBACK_MODELS")
+    )
     agent_timeout: int = 600
     solver_max_requests: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_REQUESTS"))
     solver_max_total_tokens: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_TOTAL_TOKENS"))

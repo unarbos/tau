@@ -203,6 +203,28 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertIsInstance(calls[1]["prompt"], str)
         self.assertIsNone(calls[1]["reasoning"])
 
+    def test_diff_judge_model_override_disables_default_fallback(self):
+        config = RunConfig(
+            openrouter_api_key="test-key",
+            diff_judge_model="deepseek/deepseek-v4-flash",
+        )
+        self.assertEqual(validate._diff_judge_models(config), ("deepseek/deepseek-v4-flash",))
+
+    def test_diff_judge_fallback_override_is_explicit(self):
+        config = RunConfig(
+            openrouter_api_key="test-key",
+            diff_judge_model="deepseek/deepseek-v4-flash",
+            diff_judge_fallback_models="moonshotai/kimi-k2.6,google/gemini-flash-1.5",
+        )
+        self.assertEqual(
+            validate._diff_judge_models(config),
+            (
+                "deepseek/deepseek-v4-flash",
+                "moonshotai/kimi-k2.6",
+                "google/gemini-flash-1.5",
+            ),
+        )
+
     def test_diff_judge_parser_maps_blinded_candidates_back_to_roles(self):
         result = validate._parse_diff_judge_payload(
             {
