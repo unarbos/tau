@@ -18,6 +18,11 @@ from typing import Any, Sequence
 
 from config import RunConfig
 from pipeline import compare_task_run, generate_task_run, solve_task_run
+from tau.rollouts.export_hf import (
+    export_retired_rollouts_to_hf,
+    export_task_rollouts_to_hf,
+    rollout_export_enabled,
+)
 import validate as v
 from workspace import build_solution_paths, resolve_task_paths, write_json
 
@@ -616,6 +621,16 @@ def retry_pending_archived_task_deletes(config: RunConfig, pools: Sequence[v.Tas
                 continue
             for pool in pools:
                 pool.remove(task_name)
+            if rollout_export_enabled(config):
+                try:
+                    rollout_hf_path = export_task_rollouts_to_hf(config=config, task_name=task_name)
+                    if rollout_hf_path:
+                        entry["rollout_hf_path"] = rollout_hf_path
+                except Exception as exc:
+                    entry["updated_at"] = v._timestamp()
+                    entry["error"] = f"rollout export failed: {exc}"
+                    tasks[task_name] = entry
+                    continue
             task_root = config.tasks_root / task_name
             try:
                 if task_root.exists():
@@ -1108,5 +1123,12 @@ def run_pool_manager(config: RunConfig) -> None:
             removed = retry_pending_archived_task_deletes(config, (pool, retest_pool))
             if removed:
                 log.info("Completed local deletion for %d archived task(s)", removed)
+            active_rollout_tasks = pool.names() | retest_pool.names() | active_duel_task_names(config)
+            exported_rollouts = export_retired_rollouts_to_hf(
+                config=config,
+                active_task_names=active_rollout_tasks,
+            )
+            if exported_rollouts:
+                log.info("Exported %d retired rollout task bundle(s) to Hugging Face", exported_rollouts)
             cleanup_old_task_workspaces(config, (pool, retest_pool))
             stop_event.wait(max(1, int(config.validate_poll_interval_seconds)))

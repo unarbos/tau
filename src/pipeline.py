@@ -157,6 +157,10 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             timeout=config.agent_timeout,
             config=config,
             run_label=f"{task_name}-{solution_name}",
+            task_name=task_name,
+            solution_name=solution_name,
+            repo_full_name=candidate.repo_full_name,
+            commit_sha=candidate.commit_sha,
         )
     elif config.use_claw_solver:
         solve_result = solve_task_claw(
