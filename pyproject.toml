@@ -19,6 +19,10 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
+packages = [
+    "tau",
+    "tau.rollouts",
+]
 py-modules = [
     "claude_runner",
     "claw_runner",

@@ -156,6 +156,18 @@ class RunConfig:
     validate_task_archive_hf_dataset: str | None = field(default_factory=lambda: _env_str("VALIDATE_TASK_ARCHIVE_HF_DATASET"))
     validate_task_archive_hf_token_env: str = field(default_factory=lambda: _env_str("VALIDATE_TASK_ARCHIVE_HF_TOKEN_ENV") or "HF_TOKEN")
     validate_task_archive_per_hour: int = field(default_factory=lambda: _env_int_default("VALIDATE_TASK_ARCHIVE_PER_HOUR", 10))
+    record_rollouts: bool = field(default_factory=lambda: _env_bool("TAU_RECORD_ROLLOUTS"))
+    rollout_root: Path | None = field(
+        default_factory=lambda: (
+            Path(value).expanduser()
+            if (value := os.environ.get("TAU_ROLLOUT_ROOT"))
+            else None
+        ),
+    )
+    push_rollouts_to_hf: bool = field(default_factory=lambda: _env_bool("TAU_PUSH_ROLLOUTS_TO_HF"))
+    rollout_hf_dataset: str | None = field(default_factory=lambda: _env_str("TAU_ROLLOUT_HF_DATASET"))
+    rollout_hf_token_env: str = field(default_factory=lambda: _env_str("TAU_ROLLOUT_HF_TOKEN_ENV") or "HF_TOKEN")
+    rollout_export_format: str = field(default_factory=lambda: _env_str("TAU_ROLLOUT_EXPORT_FORMAT") or "jsonl")
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
     validate_king_window_size: int = 5
@@ -195,6 +207,9 @@ class RunConfig:
     @property
     def validate_root(self) -> Path:
         return self.workspace_root / "workspace" / "validate" / f"netuid-{self.validate_netuid}"
+
+    def resolved_rollout_root(self) -> Path:
+        return self.rollout_root or (self.workspace_root / "workspace" / "rollouts")
 
     @property
     def use_docker_solver(self) -> bool:

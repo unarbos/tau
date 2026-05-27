@@ -9,9 +9,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 
 import httpx
+
+from tau.rollouts.schema import build_llm_event, utc_now
 
 log = logging.getLogger("swe-eval.openrouter_proxy")
 
@@ -227,6 +229,8 @@ class OpenRouterProxy:
     enforced_sampling_params: dict[str, Any] | None = field(default_factory=lambda: dict(_VALIDATOR_SAMPLING_PARAMS))
     require_auth: bool = True
     auth_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
+    rollout_event_sink: Callable[[dict[str, Any]], None] | None = None
+    rollout_capture_bodies: bool = False
     _server: _ReusableThreadingHTTPServer | None = field(default=None, init=False, repr=False)
     _unix_server: _ReusableThreadingUnixServer | None = field(default=None, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -485,6 +489,7 @@ class OpenRouterProxy:
             request_model = _extract_request_model(prepared_payload) or request_model
         upstream_url = f"{_upstream_base_url()}{handler.path}"
         upstream_headers = self._build_upstream_headers(handler)
+        started_at = utc_now()
         start = time.monotonic()
 
         try:
@@ -513,19 +518,29 @@ class OpenRouterProxy:
                     first_token_latency_ms = None
         except httpx.HTTPError as exc:
             latency_ms = int((time.monotonic() - start) * 1000)
-            self._record_request(
-                ProxyRequestRecord(
-                    method=handler.command,
-                    path=handler.path,
-                    status_code=None,
-                    latency_ms=latency_ms,
-                    request_model=request_model,
-                    error=str(exc),
-                ),
+            finished_at = utc_now()
+            request_record = ProxyRequestRecord(
+                method=handler.command,
+                path=handler.path,
+                status_code=None,
+                latency_ms=latency_ms,
+                request_model=request_model,
+                error=str(exc),
+            )
+            self._record_request(request_record)
+            self._emit_rollout_llm_event(
+                method=handler.command,
+                path=handler.path,
+                request_payload=prepared_payload if self.rollout_capture_bodies else None,
+                response_payload={"error": {"message": str(exc), "type": "upstream_transport_error"}},
+                request_record=request_record,
+                started_at=started_at,
+                finished_at=finished_at,
             )
             raise
 
         latency_ms = int((time.monotonic() - start) * 1000)
+        finished_at = utc_now()
         request_record = ProxyRequestRecord(
             method=handler.command,
             path=handler.path,
@@ -545,6 +560,15 @@ class OpenRouterProxy:
             error=_extract_response_error(response_payload) if response_status >= 400 else None,
         )
         self._record_request(request_record)
+        self._emit_rollout_llm_event(
+            method=handler.command,
+            path=handler.path,
+            request_payload=prepared_payload if self.rollout_capture_bodies else None,
+            response_payload=response_payload if self.rollout_capture_bodies else None,
+            request_record=request_record,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
 
         handler.send_response(response_status)
         for key, value in response_headers.items():
@@ -557,6 +581,48 @@ class OpenRouterProxy:
         handler.wfile.write(response_body)
         handler.wfile.flush()
         handler.close_connection = True
+
+    def _emit_rollout_llm_event(
+        self,
+        *,
+        method: str,
+        path: str,
+        request_payload: Any,
+        response_payload: Any,
+        request_record: ProxyRequestRecord,
+        started_at: str,
+        finished_at: str,
+    ) -> None:
+        if self.rollout_event_sink is None:
+            return
+        usage = {
+            "prompt_tokens": request_record.prompt_tokens,
+            "completion_tokens": request_record.completion_tokens,
+            "total_tokens": request_record.total_tokens,
+            "cached_tokens": request_record.cached_tokens,
+            "cache_write_tokens": request_record.cache_write_tokens,
+            "reasoning_tokens": request_record.reasoning_tokens,
+        }
+        secrets_tuple = tuple(value for value in (self.openrouter_api_key, self.auth_token) if value)
+        event = build_llm_event(
+            method=method,
+            path=path,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            status_code=request_record.status_code,
+            latency_ms=request_record.latency_ms,
+            request_model=request_record.request_model,
+            response_model=request_record.response_model,
+            usage=usage,
+            cost=request_record.cost,
+            started_at=started_at,
+            finished_at=finished_at,
+            secrets=secrets_tuple,
+        )
+        try:
+            self.rollout_event_sink(event)
+        except Exception:
+            log.exception("rollout LLM event sink failed")
 
     def _build_upstream_headers(self, handler: BaseHTTPRequestHandler) -> dict[str, str]:
         headers: dict[str, str] = {
@@ -856,31 +922,37 @@ class OpenRouterProxy:
         path: str,
         request_model: str | None,
     ) -> None:
+        request_record = ProxyRequestRecord(
+            method=method,
+            path=path,
+            status_code=status,
+            latency_ms=0,
+            request_model=request_model,
+            rejected=True,
+            error=reason,
+        )
         with self._lock:
             self._usage.budget_exceeded_reason = reason
             self._usage.rejected_request_count += 1
-            self._usage.requests.append(
-                ProxyRequestRecord(
-                    method=method,
-                    path=path,
-                    status_code=429,
-                    latency_ms=0,
-                    request_model=request_model,
-                    rejected=True,
-                    error=reason,
-                ),
-            )
-        self._send_json(
-            handler,
-            status,
-            {
-                "error": {
-                    "message": message,
-                    "type": error_type,
-                    "code": reason,
-                },
+            self._usage.requests.append(request_record)
+        response_payload = {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": reason,
             },
+        }
+        now = utc_now()
+        self._emit_rollout_llm_event(
+            method=method,
+            path=path,
+            request_payload=None,
+            response_payload=response_payload,
+            request_record=request_record,
+            started_at=now,
+            finished_at=now,
         )
+        self._send_json(handler, status, response_payload)
 
     def _record_request(self, request: ProxyRequestRecord) -> None:
         with self._lock:

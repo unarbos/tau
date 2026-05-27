@@ -29,6 +29,7 @@ from openrouter_client import complete_text
 from pipeline import _setup_logging, compare_task_run, solve_task_run
 from private_submission import accepted_private_submission_entries, private_submission_check_passed
 from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
+from tau.rollouts.store import update_rollout
 from r2 import (
     duel_to_summary,
     fetch_chain_data,
@@ -566,6 +567,8 @@ class ValidationRoundResult:
     king_agent_timeout_seconds: int | None = None
     challenger_exit_reason: str | None = None
     challenger_agent_timeout_seconds: int | None = None
+    king_rollout_id: str | None = None
+    challenger_rollout_id: str | None = None
     error: str | None = None
 
     @property
@@ -2945,6 +2948,67 @@ def _active_rounds_payload(
 
 
 
+def _record_round_rollout_outcomes(
+    *,
+    config: RunConfig,
+    task_name: str,
+    winner: str,
+    king_rollout_id: str | None,
+    challenger_rollout_id: str | None,
+    duel_id: int,
+    diff_judge: DiffJudgeResult,
+) -> None:
+    if not config.record_rollouts:
+        return
+    root = config.resolved_rollout_root()
+    judge = {
+        "winner": diff_judge.winner,
+        "king_score": diff_judge.king_score,
+        "challenger_score": diff_judge.challenger_score,
+        "model": diff_judge.model,
+        "rationale": diff_judge.rationale,
+        "error": diff_judge.error,
+    }
+    pairs = {
+        "king": (king_rollout_id, challenger_rollout_id),
+        "challenger": (challenger_rollout_id, king_rollout_id),
+    }
+    for role, (rollout_id, opponent_id) in pairs.items():
+        won = winner == role
+        update_rollout(
+            root,
+            task_name,
+            rollout_id,
+            {
+                "duel_id": duel_id,
+                "judge": judge,
+                "pairwise": {
+                    "duel_id": duel_id,
+                    "opponent_rollout_id": opponent_id,
+                    "won_vs_opponent": won,
+                    "winner_role": winner,
+                    "role": role,
+                },
+            },
+        )
+
+
+def _solution_rollout_id(*, task_name: str, solution_name: str, config: RunConfig) -> str | None:
+    try:
+        task_paths = resolve_task_paths(config.tasks_root, task_name)
+        solve_path = build_solution_paths(task_paths, solution_name).solve_json_path
+        payload = json.loads(solve_path.read_text())
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    rollout_id = result.get("rollout_id")
+    return str(rollout_id) if rollout_id else None
+
+
 def _solve_and_compare_round(
     *,
     task: PoolTask,
@@ -3055,6 +3119,16 @@ def _solve_and_compare_round(
 
         winner = _round_winner_from_scores(king_score, challenger_score)
 
+        king_rollout_id = _solution_rollout_id(
+            task_name=task.task_name,
+            solution_name="king",
+            config=config,
+        )
+        challenger_rollout_id = _solution_rollout_id(
+            task_name=task.task_name,
+            solution_name=solution_label,
+            config=config,
+        )
         result = ValidationRoundResult(
             task_name=task.task_name, winner=winner,
             king_lines=k_lines, challenger_lines=c_lines,
@@ -3077,6 +3151,18 @@ def _solve_and_compare_round(
             king_agent_timeout_seconds=agent_timeout,
             challenger_exit_reason=challenger_exit_reason,
             challenger_agent_timeout_seconds=agent_timeout,
+            king_rollout_id=king_rollout_id,
+            challenger_rollout_id=challenger_rollout_id,
+        )
+
+        _record_round_rollout_outcomes(
+            config=config,
+            task_name=task.task_name,
+            winner=winner,
+            king_rollout_id=king_rollout_id,
+            challenger_rollout_id=challenger_rollout_id,
+            duel_id=duel_id,
+            diff_judge=diff_judge,
         )
 
         try:

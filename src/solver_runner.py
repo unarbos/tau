@@ -45,6 +45,8 @@ class SolveResult:
     rollout_format: str | None = None
     rollout_filename: str | None = None
     session_id: str | None = None
+    rollout_id: str | None = None
+    rollout_path: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -67,6 +69,8 @@ class SolveResult:
             "rollout_format": self.rollout_format,
             "rollout_filename": self.rollout_filename,
             "session_id": self.session_id,
+            "rollout_id": self.rollout_id,
+            "rollout_path": self.rollout_path,
         }
 
 

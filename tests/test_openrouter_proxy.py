@@ -194,6 +194,50 @@ class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
         self.assertEqual(exit_reason, COMPLETED_EXIT_REASON)
 
 
+    def test_rejected_request_emits_rollout_event(self):
+        events = []
+        proxy = OpenRouterProxy(openrouter_api_key="upstream-key", rollout_event_sink=events.append)
+
+        class WFile:
+            def __init__(self):
+                self.body = b""
+            def write(self, body):
+                self.body += body
+            def flush(self):
+                pass
+
+        class Handler:
+            def __init__(self):
+                self.wfile = WFile()
+                self.headers = []
+                self.status = None
+                self.close_connection = False
+            def send_response(self, status):
+                self.status = status
+            def send_header(self, key, value):
+                self.headers.append((key, value))
+            def end_headers(self):
+                pass
+
+        handler = Handler()
+        proxy._reject_request(
+            handler,
+            reason="proxy_error",
+            status=403,
+            error_type="proxy_policy_violation",
+            message="Endpoint not allowed",
+            method="POST",
+            path="/v1/not-allowed",
+            request_model="model/a",
+        )
+
+        self.assertEqual(handler.status, 403)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "llm_call")
+        self.assertEqual(events[0]["status_code"], 403)
+        self.assertEqual(events[0]["response"]["error"]["code"], "proxy_error")
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import textwrap
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -27,6 +28,10 @@ from solver_runner import (
     SolveResult,
 )
 from task_generation import GeneratedTask
+from tau.rollouts.ids import rollout_id as make_rollout_id
+from tau.rollouts.redaction import redact_value
+from tau.rollouts.schema import build_rollout_record, utc_now
+from tau.rollouts.store import append_rollout
 from workspace import ensure_tree_has_no_symlinks, git_diff
 
 log = logging.getLogger("swe-eval.docker_solver")
@@ -51,6 +56,7 @@ _CONTAINER_RUNNER_FILE = f"{_CONTAINER_ROOT}/run_single_file_agent.py"
 _CONTAINER_PROXY_SOCKET_DIR = "/proxy-socket"
 _CONTAINER_PROXY_SOCKET_FILE = f"{_CONTAINER_PROXY_SOCKET_DIR}/openrouter-proxy.sock"
 _CONTAINER_PROXY_BRIDGE_FILE = f"{_CONTAINER_ROOT}/proxy_bridge.py"
+_CONTAINER_RUNNER_EVENTS_FILE = f"{_CONTAINER_ROOT}/tau_events.jsonl"
 _CONTAINER_PROXY_PORT = 4318
 _DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash"
 _DEFAULT_AGENT_FILE = "agent.py"
@@ -74,6 +80,7 @@ class _DockerSolverCommandResult:
     tool_calls: int | None = None
     reported_patch: str | None = None
     reported_success: bool | None = None
+    trusted_events_output: str | None = None
 
     @property
     def combined_output(self) -> str:
@@ -109,6 +116,10 @@ def solve_task_in_docker(
     timeout: int,
     config: RunConfig,
     run_label: str | None = None,
+    task_name: str | None = None,
+    solution_name: str | None = None,
+    repo_full_name: str | None = None,
+    commit_sha: str | None = None,
 ) -> SolveResult:
     if not config.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set. Load it from .env or export it before running swe-eval.")
@@ -132,6 +143,21 @@ def solve_task_in_docker(
         os.chmod(proxy_socket_dir, 0o755)
         agent_src_path = Path(agent_src_dir)
         agent_file = _materialize_agent_source(config=config, target_dir=agent_src_path)
+        rollout_started_at = utc_now()
+        agent_hash = _file_sha256(agent_file)
+        rollout_id_value = make_rollout_id(
+            task_name=task_name or run_label or "unknown-task",
+            solution_name=solution_name or run_label or "solution",
+            agent_hash=agent_hash,
+            started_at=rollout_started_at,
+        )
+        rollout_events: list[dict[str, Any]] = []
+        rollout_events_lock = threading.Lock()
+
+        def _append_rollout_event(event: dict[str, Any]) -> None:
+            with rollout_events_lock:
+                rollout_events.append(event)
+
         proxy_transport = _resolve_proxy_transport(proxy_socket_dir=Path(proxy_socket_dir))
         with OpenRouterProxy(
             openrouter_api_key=config.openrouter_api_key,
@@ -141,6 +167,8 @@ def solve_task_in_docker(
             enforced_model=model_id,
             enforced_provider=_solver_provider_preferences(config),
             require_auth=True,
+            rollout_event_sink=_append_rollout_event if config.record_rollouts else None,
+            rollout_capture_bodies=config.record_rollouts,
         ) as proxy:
             sensitive_values = _sensitive_values(config=config, proxy=proxy)
             try:
@@ -168,6 +196,10 @@ def solve_task_in_docker(
                     use_proxy_bridge=proxy_transport.mount_socket_dir,
                     proxy_base_url=proxy_transport.container_base_url(proxy),
                     model_id=model_id,
+                )
+                solver_run = replace(
+                    solver_run,
+                    trusted_events_output=_read_runner_events_from_container(container_id=container_id),
                 )
                 solver_run = _redact_solver_run(solver_run, sensitive_values)
                 if container_id is not None and _container_is_running(container_id):
@@ -207,6 +239,38 @@ def solve_task_in_docker(
     usage_summary = proxy.usage_snapshot()
     exit_reason = _resolve_exit_reason(solver_run=solver_run, proxy=proxy)
     success = solver_run.returncode == 0 and exit_reason == COMPLETED_EXIT_REASON
+    rollout_path: str | None = None
+    if config.record_rollouts:
+        runner_events = _parse_runner_events(solver_run.trusted_events_output)
+        trajectory = [*rollout_events, *runner_events]
+        record = build_rollout_record(
+            rollout_id_value=rollout_id_value,
+            task_name=task_name or run_label or "unknown-task",
+            solution_name=solution_name or run_label or "solution",
+            role=None,
+            repo=repo_full_name,
+            commit_sha=commit_sha,
+            issue=issue,
+            agent_hash=agent_hash,
+            agent_source=config.solver_agent_source.to_dict() if config.solver_agent_source else None,
+            started_at=rollout_started_at,
+            finished_at=utc_now(),
+            trajectory=redact_value(trajectory, sensitive_values),
+            final_patch=solution_diff or "",
+            miner_logs=_redact_sensitive_text(_build_solver_raw_output(solver_run), sensitive_values),
+            steps=solver_run.tool_calls,
+            cost=usage_summary.cost,
+            success=success,
+            exit_reason=exit_reason,
+            runner={
+                "backend": "docker-file",
+                "image": image_tag,
+                "timeout_seconds": timeout,
+                "container_network": proxy_transport.container_network,
+            },
+        )
+        rollout_path = str(append_rollout(config.resolved_rollout_root(), record))
+
     return SolveResult(
         success=success,
         elapsed_seconds=elapsed,
@@ -228,6 +292,8 @@ def solve_task_in_docker(
         rollout_format="single-file-json" if solver_run.rollout_output else None,
         rollout_filename=_HARNESS_ROLLOUT_FILENAME if solver_run.rollout_output else None,
         session_id=solver_run.session_id,
+        rollout_id=rollout_id_value if config.record_rollouts else None,
+        rollout_path=rollout_path,
     )
 
 
@@ -606,6 +672,37 @@ def _run_solver_command(
         )
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_runner_events_from_container(*, container_id: str) -> str:
+    result = _run(
+        ["docker", "exec", container_id, "bash", "-lc", f"cat {_CONTAINER_RUNNER_EVENTS_FILE} 2>/dev/null || true"],
+        timeout=30,
+        check=False,
+    )
+    return result.stdout or ""
+
+
+def _parse_runner_events(raw_output: str | None) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in (raw_output or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
+
+
 def _remove_container(container_id: str) -> None:
     _run(["docker", "rm", "-f", container_id], timeout=30, check=False)
 
@@ -833,6 +930,7 @@ def _redact_solver_run(
         parsed_output=_redact_sensitive_text(solver_run.parsed_output, sensitive_values),
         rollout_output=_redact_sensitive_text(solver_run.rollout_output, sensitive_values),
         reported_patch=_redact_sensitive_text(solver_run.reported_patch, sensitive_values),
+        trusted_events_output=_redact_sensitive_text(solver_run.trusted_events_output, sensitive_values),
     )
 
 
@@ -1025,9 +1123,25 @@ def _harness_runner_script() -> str:
         import importlib.util
         import json
         import os
+        import subprocess
         import sys
+        import tempfile
+        import time
         import traceback
         from pathlib import Path
+
+        _ORIGINAL_SUBPROCESS_RUN = subprocess.run
+        _ORIGINAL_SUBPROCESS_CALL = subprocess.call
+        _ORIGINAL_SUBPROCESS_CHECK_CALL = subprocess.check_call
+        _ORIGINAL_SUBPROCESS_CHECK_OUTPUT = subprocess.check_output
+        _ORIGINAL_SUBPROCESS_POPEN = subprocess.Popen
+        _ORIGINAL_OS_SYSTEM = os.system
+        _ORIGINAL_OS_POPEN = os.popen
+        _TAU_SUPPRESS_POPEN_EVENT = {"value": False}
+        _MAX_EVENT_TEXT_CHARS = 64000
+        _MAX_EVENT_DIFF_CHARS = 256000
+        _RUNNER_EVENTS_OUTPUT_PATH = Path(os.environ.get("TAU_HARNESS_RUNNER", "/work/run_single_file_agent.py")).with_name("tau_events.jsonl")
+        _RUNNER_EVENTS_BUFFER = tempfile.TemporaryFile("w+", encoding="utf-8")
 
 
         def _load_agent(path):
@@ -1040,10 +1154,397 @@ def _harness_runner_script() -> str:
             solve = getattr(module, "solve", None)
             if not callable(solve):
                 raise RuntimeError("Agent file must define solve(repo_path, issue, model, api_base, api_key)")
-            return solve
+            return module
+
+
+        def _append_event(event):
+            try:
+                _RUNNER_EVENTS_BUFFER.write(json.dumps(event, sort_keys=True) + "\\n")
+                _RUNNER_EVENTS_BUFFER.flush()
+            except Exception:
+                pass
+
+
+        def _flush_events_to_output():
+            try:
+                _RUNNER_EVENTS_BUFFER.flush()
+                _RUNNER_EVENTS_BUFFER.seek(0)
+                payload = _RUNNER_EVENTS_BUFFER.read()
+                _RUNNER_EVENTS_OUTPUT_PATH.write_text(payload, encoding="utf-8")
+            except Exception:
+                pass
+
+
+        def _truncate_text(value, limit):
+            if value is None:
+                return ""
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            text = str(value)
+            if len(text) <= limit:
+                return text
+            half = max(1, limit // 2)
+            return text[:half] + f"\\n...[truncated {len(text) - limit} chars]...\\n" + text[-half:]
+
+
+        def _repo_diff(repo_dir):
+            previous = _TAU_SUPPRESS_POPEN_EVENT["value"]
+            _TAU_SUPPRESS_POPEN_EVENT["value"] = True
+            try:
+                proc = _ORIGINAL_SUBPROCESS_RUN(
+                    ["git", "diff", "--binary", "--", "."],
+                    cwd=str(repo_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                diff = proc.stdout or ""
+                untracked = _ORIGINAL_SUBPROCESS_RUN(
+                    ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                    cwd=str(repo_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                for relative_path in [item for item in (untracked.stdout or "").split("\\0") if item]:
+                    file_diff = _ORIGINAL_SUBPROCESS_RUN(
+                        ["git", "diff", "--binary", "--no-index", "--", "/dev/null", relative_path],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    if file_diff.returncode in (0, 1):
+                        diff += file_diff.stdout or ""
+                return diff
+            finally:
+                _TAU_SUPPRESS_POPEN_EVENT["value"] = previous
+
+
+        def _diff_hash(text):
+            import hashlib
+            return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+        def _cmd_text(cmd):
+            if isinstance(cmd, (list, tuple)):
+                return " ".join(str(part) for part in cmd)
+            return str(cmd)
+
+
+        def _cwd_text(kwargs):
+            return str(kwargs.get("cwd") or os.getcwd())
+
+
+        def _emit_edit_if_changed(repo_dir, last_diff_hash):
+            diff = _repo_diff(repo_dir)
+            current_hash = _diff_hash(diff)
+            if current_hash == last_diff_hash["value"]:
+                return
+            last_diff_hash["value"] = current_hash
+            _append_event({
+                "type": "edit",
+                "source": "tau_runner_process_hook",
+                "finished_at": _iso_now(),
+                "repo_diff_sha256": current_hash,
+                "diff": _truncate_text(diff, _MAX_EVENT_DIFF_CHARS),
+                "truncated": len(diff) > _MAX_EVENT_DIFF_CHARS,
+            })
+
+
+        def _raw_text(value):
+            if value is None:
+                return ""
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            return str(value)
+
+
+        def _output_was_truncated(value, limit):
+            return len(_raw_text(value)) > limit
+
+
+        def _completed_stdout(result):
+            return getattr(result, "stdout", "")
+
+
+        def _completed_stderr(result):
+            return getattr(result, "stderr", "")
+
+
+        def _write_stream_value(stream, value):
+            if value in (None, "", b""):
+                return
+            try:
+                if isinstance(value, bytes):
+                    buffer = getattr(stream, "buffer", None)
+                    if buffer is not None:
+                        buffer.write(value)
+                        buffer.flush()
+                        return
+                    value = value.decode("utf-8", errors="replace")
+                stream.write(str(value))
+                stream.flush()
+            except Exception:
+                pass
+
+
+        def _replay_captured_output(stdout, stderr):
+            _write_stream_value(sys.stdout, stdout)
+            _write_stream_value(sys.stderr, stderr)
+
+
+        def _run_should_capture_for_event(kwargs):
+            return (
+                "stdout" not in kwargs
+                and "stderr" not in kwargs
+                and not bool(kwargs.get("capture_output"))
+            )
+
+
+        class _TauPopenProxy:
+            def __init__(self, process, *, emit_command, cmd, cwd, started_at, started):
+                self._process = process
+                self._emit_command = emit_command
+                self._cmd = cmd
+                self._cwd = cwd
+                self._started_at = started_at
+                self._started = started
+                self._emitted = False
+
+            def _emit_once(self, *, stdout="", stderr="", timed_out=False, error=None):
+                if self._emitted:
+                    return
+                self._emitted = True
+                self._emit_command(
+                    cmd=self._cmd,
+                    cwd=self._cwd,
+                    started_at=self._started_at,
+                    started=self._started,
+                    result=self._process,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timed_out=timed_out,
+                    error=error,
+                )
+
+            def communicate(self, *args, **kwargs):
+                try:
+                    stdout, stderr = self._process.communicate(*args, **kwargs)
+                except subprocess.TimeoutExpired as exc:
+                    self._emit_once(
+                        stdout=getattr(exc, "stdout", None) or getattr(exc, "output", None) or "",
+                        stderr=_raw_text(getattr(exc, "stderr", None)) + f"\\nCommand timed out after {exc.timeout}s.",
+                        timed_out=True,
+                        error=exc,
+                    )
+                    raise
+                except Exception as exc:
+                    self._emit_once(error=exc)
+                    raise
+                self._emit_once(stdout=stdout, stderr=stderr)
+                return stdout, stderr
+
+            def wait(self, *args, **kwargs):
+                try:
+                    returncode = self._process.wait(*args, **kwargs)
+                except subprocess.TimeoutExpired as exc:
+                    self._emit_once(
+                        stderr=f"Command timed out after {exc.timeout}s.",
+                        timed_out=True,
+                        error=exc,
+                    )
+                    raise
+                except Exception as exc:
+                    self._emit_once(error=exc)
+                    raise
+                self._emit_once()
+                return returncode
+
+            def poll(self):
+                return self._process.poll()
+
+            def kill(self):
+                return self._process.kill()
+
+            def terminate(self):
+                return self._process.terminate()
+
+            def send_signal(self, signal):
+                return self._process.send_signal(signal)
+
+            def __enter__(self):
+                self._process.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                result = self._process.__exit__(exc_type, exc, tb)
+                if self._process.poll() is not None:
+                    self._emit_once(error=exc)
+                return result
+
+            def __getattr__(self, name):
+                return getattr(self._process, name)
+
+
+        def _install_process_event_hooks(repo_dir):
+            last_diff_hash = {"value": _diff_hash(_repo_diff(repo_dir))}
+
+            def emit_command(*, cmd, cwd, started_at, started, result=None, returncode=None, stdout="", stderr="", timed_out=False, error=None):
+                finished_at = _iso_now()
+                raw_stdout = stdout if stdout not in (None, "", b"") else _completed_stdout(result)
+                raw_stderr = stderr if stderr not in (None, "", b"") else _completed_stderr(result)
+                event = {
+                    "type": "command",
+                    "source": "tau_runner_process_hook",
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "cmd": _cmd_text(cmd),
+                    "cwd": cwd,
+                    "exit_code": returncode if returncode is not None else getattr(result, "returncode", None),
+                    "stdout": _truncate_text(raw_stdout, _MAX_EVENT_TEXT_CHARS),
+                    "stderr": _truncate_text(raw_stderr, _MAX_EVENT_TEXT_CHARS),
+                    "duration_ms": int((time.time() - started) * 1000),
+                    "timed_out": timed_out,
+                    "error": str(error) if error is not None else None,
+                }
+                event["stdout_truncated"] = _output_was_truncated(raw_stdout, _MAX_EVENT_TEXT_CHARS)
+                event["stderr_truncated"] = _output_was_truncated(raw_stderr, _MAX_EVENT_TEXT_CHARS)
+                _append_event(event)
+                _emit_edit_if_changed(repo_dir, last_diff_hash)
+
+            def wrapped_run(*args, **kwargs):
+                cmd = args[0] if args else kwargs.get("args")
+                run_kwargs = dict(kwargs)
+                capture_for_event = _run_should_capture_for_event(run_kwargs)
+                if capture_for_event:
+                    run_kwargs["capture_output"] = True
+                started = time.time()
+                started_at = _iso_now()
+                cwd = _cwd_text(run_kwargs)
+                previous = _TAU_SUPPRESS_POPEN_EVENT["value"]
+                _TAU_SUPPRESS_POPEN_EVENT["value"] = True
+                try:
+                    result = _ORIGINAL_SUBPROCESS_RUN(*args, **run_kwargs)
+                except subprocess.TimeoutExpired as exc:
+                    if capture_for_event:
+                        _replay_captured_output(exc.stdout or getattr(exc, "output", None), exc.stderr)
+                    emit_command(
+                        cmd=cmd,
+                        cwd=cwd,
+                        started_at=started_at,
+                        started=started,
+                        returncode=124,
+                        stdout=exc.stdout or getattr(exc, "output", None) or "",
+                        stderr=_raw_text(exc.stderr) + f"\\nCommand timed out after {exc.timeout}s.",
+                        timed_out=True,
+                        error=exc,
+                    )
+                    raise
+                except subprocess.CalledProcessError as exc:
+                    if capture_for_event:
+                        _replay_captured_output(exc.output, exc.stderr)
+                    emit_command(
+                        cmd=cmd,
+                        cwd=cwd,
+                        started_at=started_at,
+                        started=started,
+                        returncode=exc.returncode,
+                        stdout=exc.output or "",
+                        stderr=exc.stderr or "",
+                        error=exc,
+                    )
+                    raise
+                except Exception as exc:
+                    emit_command(cmd=cmd, cwd=cwd, started_at=started_at, started=started, returncode=None, error=exc)
+                    raise
+                finally:
+                    _TAU_SUPPRESS_POPEN_EVENT["value"] = previous
+                if capture_for_event:
+                    _replay_captured_output(result.stdout, result.stderr)
+                emit_command(
+                    cmd=cmd,
+                    cwd=cwd,
+                    started_at=started_at,
+                    started=started,
+                    result=result,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
+                if not capture_for_event:
+                    return result
+                return subprocess.CompletedProcess(result.args, result.returncode)
+
+            def wrapped_call(*args, **kwargs):
+                result = wrapped_run(*args, **kwargs)
+                return int(getattr(result, "returncode", result))
+
+            def wrapped_check_call(*args, **kwargs):
+                result = wrapped_run(*args, **kwargs)
+                returncode = int(getattr(result, "returncode", result))
+                if returncode != 0:
+                    raise subprocess.CalledProcessError(returncode, args[0] if args else kwargs.get("args"))
+                return 0
+
+            def wrapped_check_output(*args, **kwargs):
+                kwargs = dict(kwargs)
+                kwargs.setdefault("stdout", subprocess.PIPE)
+                result = wrapped_run(*args, **kwargs)
+                if result.returncode != 0:
+                    raise subprocess.CalledProcessError(result.returncode, args[0] if args else kwargs.get("args"), output=result.stdout, stderr=result.stderr)
+                return result.stdout
+
+            def wrapped_popen(*args, **kwargs):
+                if _TAU_SUPPRESS_POPEN_EVENT["value"]:
+                    return _ORIGINAL_SUBPROCESS_POPEN(*args, **kwargs)
+                cmd = args[0] if args else kwargs.get("args")
+                started = time.time()
+                started_at = _iso_now()
+                cwd = _cwd_text(kwargs)
+                try:
+                    process = _ORIGINAL_SUBPROCESS_POPEN(*args, **kwargs)
+                except Exception as exc:
+                    emit_command(cmd=cmd, cwd=cwd, started_at=started_at, started=started, returncode=None, error=exc)
+                    raise
+                return _TauPopenProxy(process, emit_command=emit_command, cmd=cmd, cwd=cwd, started_at=started_at, started=started)
+
+            def wrapped_os_system(command):
+                started = time.time()
+                started_at = _iso_now()
+                returncode = _ORIGINAL_OS_SYSTEM(command)
+                emit_command(cmd=command, cwd=os.getcwd(), started_at=started_at, started=started, returncode=returncode)
+                return returncode
+
+            def wrapped_os_popen(command, mode="r", buffering=-1):
+                started = time.time()
+                started_at = _iso_now()
+                try:
+                    handle = _ORIGINAL_OS_POPEN(command, mode, buffering)
+                except Exception as exc:
+                    emit_command(cmd=command, cwd=os.getcwd(), started_at=started_at, started=started, returncode=None, error=exc)
+                    raise
+                emit_command(cmd=command, cwd=os.getcwd(), started_at=started_at, started=started, returncode=None)
+                return handle
+
+            subprocess.run = wrapped_run
+            subprocess.call = wrapped_call
+            subprocess.check_call = wrapped_check_call
+            subprocess.check_output = wrapped_check_output
+            subprocess.Popen = wrapped_popen
+            os.system = wrapped_os_system
+            os.popen = wrapped_os_popen
+
+
+        def _iso_now():
+            from datetime import UTC, datetime
+            return datetime.now(tz=UTC).isoformat()
 
 
         def main():
+            exit_code = 1
             try:
                 agent_file = Path(os.environ["TAU_AGENT_FILE"])
                 repo_dir = Path(os.environ["TAU_REPO_DIR"])
@@ -1051,7 +1552,9 @@ def _harness_runner_script() -> str:
                 model = _required_env("AGENT_MODEL")
                 api_base = _required_env("OPENAI_BASE_URL")
                 api_key = _required_env("OPENAI_API_KEY")
-                solve = _load_agent(agent_file)
+                _install_process_event_hooks(repo_dir)
+                module = _load_agent(agent_file)
+                solve = getattr(module, "solve")
                 result = solve(
                     repo_path=str(repo_dir),
                     issue=issue,
@@ -1062,10 +1565,13 @@ def _harness_runner_script() -> str:
                 if not isinstance(result, dict):
                     raise RuntimeError(f"solve() must return a dict, got {type(result).__name__}")
                 print(json.dumps({"ok": True, "result": result}, sort_keys=True), flush=True)
-                return 0 if result.get("success") else 1
+                exit_code = 0 if result.get("success") else 1
             except Exception:
                 print(json.dumps({"ok": False, "error": traceback.format_exc()}, sort_keys=True), flush=True)
-                return 1
+                exit_code = 1
+            finally:
+                _flush_events_to_output()
+            return exit_code
 
 
         def _required_env(name):

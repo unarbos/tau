@@ -314,6 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_solver_args(solve)
+    _add_rollout_args(solve)
 
     evaluate = subparsers.add_parser("eval", help="Evaluate ordered solution pairs for one named task.")
     _add_shared_args(evaluate)
@@ -419,6 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_shared_args(validate)
     _add_solver_args(validate)
+    _add_rollout_args(validate)
     validate.set_defaults(agent_timeout=1800, docker_solver_max_output_bytes=100000000)
     validate.add_argument("--netuid", type=int, default=66, help="Subnet netuid to validate.")
     validate.add_argument("--network", help="Optional Bittensor network name or websocket endpoint.")
@@ -461,6 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_shared_args(pool_manager)
     _add_solver_args(pool_manager)
+    _add_rollout_args(pool_manager)
     pool_manager.set_defaults(agent_timeout=1800, docker_solver_max_output_bytes=100000000)
     pool_manager.add_argument("--netuid", type=int, default=66, help="Subnet netuid whose validator pools should be managed.")
     pool_manager.add_argument("--network", help="Optional Bittensor network name or websocket endpoint.")
@@ -694,6 +697,12 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
         docker_solver_read_only_rootfs=not args.docker_solver_writeable_rootfs,
         docker_solver_user=args.docker_solver_user,
         docker_solver_no_cache=args.docker_solver_no_cache,
+        record_rollouts=args.record_rollouts or defaults.record_rollouts,
+        rollout_root=args.rollout_root if args.rollout_root is not None else defaults.rollout_root,
+        push_rollouts_to_hf=args.push_rollouts_to_hf or defaults.push_rollouts_to_hf,
+        rollout_hf_dataset=args.rollout_hf_dataset or defaults.rollout_hf_dataset,
+        rollout_hf_token_env=args.rollout_hf_token_env or defaults.rollout_hf_token_env,
+        rollout_export_format=args.rollout_export_format or defaults.rollout_export_format,
         debug=args.debug,
     )
 
@@ -1130,6 +1139,12 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         docker_solver_read_only_rootfs=not args.docker_solver_writeable_rootfs,
         docker_solver_user=args.docker_solver_user,
         docker_solver_no_cache=args.docker_solver_no_cache,
+        record_rollouts=args.record_rollouts or defaults.record_rollouts,
+        rollout_root=args.rollout_root if args.rollout_root is not None else defaults.rollout_root,
+        push_rollouts_to_hf=args.push_rollouts_to_hf or defaults.push_rollouts_to_hf,
+        rollout_hf_dataset=args.rollout_hf_dataset or defaults.rollout_hf_dataset,
+        rollout_hf_token_env=args.rollout_hf_token_env or defaults.rollout_hf_token_env,
+        rollout_export_format=args.rollout_export_format or defaults.rollout_export_format,
         validate_netuid=args.netuid,
         validate_network=args.network,
         validate_subtensor_endpoint=args.subtensor_endpoint,
@@ -1221,6 +1236,12 @@ def _build_pool_manager_config(args: argparse.Namespace) -> RunConfig:
         docker_solver_read_only_rootfs=not args.docker_solver_writeable_rootfs,
         docker_solver_user=args.docker_solver_user,
         docker_solver_no_cache=args.docker_solver_no_cache,
+        record_rollouts=args.record_rollouts or defaults.record_rollouts,
+        rollout_root=args.rollout_root if args.rollout_root is not None else defaults.rollout_root,
+        push_rollouts_to_hf=args.push_rollouts_to_hf or defaults.push_rollouts_to_hf,
+        rollout_hf_dataset=args.rollout_hf_dataset or defaults.rollout_hf_dataset,
+        rollout_hf_token_env=args.rollout_hf_token_env or defaults.rollout_hf_token_env,
+        rollout_export_format=args.rollout_export_format or defaults.rollout_export_format,
         validate_netuid=args.netuid,
         validate_network=args.network,
         validate_subtensor_endpoint=args.subtensor_endpoint,
@@ -1535,6 +1556,15 @@ def _add_solver_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Build the solver Docker image with --no-cache.",
     )
+
+
+def _add_rollout_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--record-rollouts", action="store_true", help="Record trusted tau rollout JSONL for solver runs.")
+    parser.add_argument("--rollout-root", type=Path, help="Directory for local rollout JSONL records.")
+    parser.add_argument("--push-rollouts-to-hf", action="store_true", help="Publish retired-task rollouts to Hugging Face.")
+    parser.add_argument("--rollout-hf-dataset", help="Hugging Face dataset repo id for public retired-task rollout exports.")
+    parser.add_argument("--rollout-hf-token-env", default="HF_TOKEN", help="Environment variable containing the Hugging Face token for rollout export.")
+    parser.add_argument("--rollout-export-format", default="jsonl", choices=("jsonl",), help="Rollout export format.")
 
 
 def _load_dotenv() -> None:
