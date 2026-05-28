@@ -46,6 +46,35 @@ def _env_bool_optional(*names: str) -> bool | None:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _split_env_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+
+
+def _github_merge_token_env() -> str | None:
+    return _env_str("GITHUB_MERGE_TOKEN", "GITHUB_TOKEN_UNARBOS")
+
+
+def _github_read_token_env() -> str | None:
+    reserved = _github_merge_token_env()
+    for value in (
+        _env_str("GITHUB_TASK_TOKEN"),
+        _env_str("GITHUB_READ_TOKEN"),
+        _env_str("GITHUB_TOKEN"),
+        _env_str("GH_TOKEN"),
+    ):
+        if value and value != reserved:
+            return value
+    return None
+
+
+def _github_read_tokens_env() -> str | None:
+    reserved = _github_merge_token_env()
+    tokens = [token for token in _split_env_list(os.environ.get("GITHUB_TOKENS")) if token != reserved]
+    return ",".join(tokens) or None
+
+
 @dataclass(slots=True)
 class SolverAgentSource:
     raw: str
@@ -77,23 +106,17 @@ class RunConfig:
 
     workspace_root: Path = field(default_factory=Path.cwd)
     github_token: str | None = field(
-        default_factory=lambda: os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"),
+        default_factory=_github_read_token_env,
     )
     github_tokens: str | None = field(
-        default_factory=lambda: os.environ.get("GITHUB_TOKENS"),
+        default_factory=_github_read_tokens_env,
     )
     # Dedicated owner-scoped token used only for write paths (publishing the
-    # winning private submission into the public base repo). Kept separate from
-    # the rotation pool in `github_tokens` so a non-owner rotation token can never
-    # be selected for the write call (which would 404). Falls back to
-    # GITHUB_TOKEN_UNARBOS, then GITHUB_TOKEN, then the first token in
-    # GITHUB_TOKENS.
+    # winning private submission into the public base repo). This intentionally
+    # does not fall back to task-generation read tokens; set GITHUB_MERGE_TOKEN
+    # or GITHUB_TOKEN_UNARBOS for promotion publishing.
     github_merge_token: str | None = field(
-        default_factory=lambda: (
-            os.environ.get("GITHUB_MERGE_TOKEN")
-            or os.environ.get("GITHUB_TOKEN_UNARBOS")
-            or os.environ.get("GITHUB_TOKEN")
-        ),
+        default_factory=_github_merge_token_env,
     )
     openrouter_api_key: str | None = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY"))
     cursor_api_key: str | None = field(default_factory=lambda: os.environ.get("CURSOR_API_KEY"))

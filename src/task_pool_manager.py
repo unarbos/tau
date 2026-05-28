@@ -33,13 +33,11 @@ _TASK_ARCHIVE_UPLOAD_LOCK = threading.Lock()
 _SAVED_TASK_FILL_LOCK = threading.Lock()
 _SAVED_TASK_FILL_IN_FLIGHT: set[str] = set()
 _POOL_FILL_ADD_LOCK = threading.Lock()
-_POOL_FILLER_WORKER_OVERSUBSCRIBE = 3
+_POOL_FILLER_WORKER_OVERSUBSCRIBE = 1
 _ARCHIVE_UPLOAD_COMPLETE_STATUSES = {"uploaded_delete_pending", "uploaded_deleted"}
 _ARCHIVE_UPLOAD_RETRY_STATUSES = {"pool_inserted", "upload_failed"}
 _ARCHIVE_QUOTA_USED_STATUSES = {
-    "archive_reserved",
     "pool_inserted",
-    "upload_failed",
     "uploaded_delete_pending",
     "uploaded_deleted",
 }
@@ -973,6 +971,19 @@ def _prepare_one_task_for_pool(
             leased_task_names = v._active_duel_task_names(current_state)
             should_archive = archive_rotation and archive_reservation_name is not None
             if should_archive:
+                if archive_quota_remaining(
+                    config,
+                    pool_label=pool_label,
+                    hour=archive_reservation_hour,
+                ) <= 0:
+                    log.info(
+                        "Pool manager[%s]: hourly archive quota exhausted before inserting %s",
+                        pool_label,
+                        task_name,
+                    )
+                    release_archive_reservation(config=config, task_name=archive_reservation_name)
+                    archive_reservation_name = None
+                    return False
                 archive_task = select_rotation_archive_task(
                     pool.list_tasks(),
                     candidate_name=candidate.task_name,
@@ -1053,6 +1064,10 @@ def _pool_worker_loop(
     pool_solve_semaphore: threading.Semaphore,
 ) -> None:
     while not stop_event.is_set():
+        backoff_remaining = v._pool_generation_backoff_remaining()
+        if backoff_remaining > 0:
+            stop_event.wait(min(backoff_remaining, 30.0))
+            continue
         did_work = _prepare_one_task_for_pool(
             config=config,
             pool=pool,

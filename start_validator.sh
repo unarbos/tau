@@ -13,6 +13,8 @@ exec doppler run -p arbos -c dev -- \
   --poll-interval-seconds 600 \
   --task-pool-target 50 \
   --task-pool-static \
+  --record-rollouts \
+  --rollout-root /home/const/subnet66/tau/workspace/rollouts \
   --duel-rounds 50 \
   --win-margin 3 \
   --min-commitment-block 7951985 \

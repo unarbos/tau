@@ -1,7 +1,9 @@
 #!/bin/bash
 exec doppler run -p arbos -c dev -- bash -lc '
 set -euo pipefail
-: "${VALIDATE_TASK_ARCHIVE_HF_DATASET:?Set VALIDATE_TASK_ARCHIVE_HF_DATASET to owner/name}"
+TAU_POLAR_HF_DATASET="Wejh/ninja-rollouts-polar"
+VALIDATE_TASK_ARCHIVE_HF_DATASET="$TAU_POLAR_HF_DATASET"
+TAU_ROLLOUT_HF_DATASET="$TAU_POLAR_HF_DATASET"
 : "${HF_TOKEN:?Set HF_TOKEN for Hugging Face task archive uploads}"
 exec /home/const/subnet66/.venv/bin/python -m cli pool-manager \
   --workspace-root /home/const/subnet66/tau \
@@ -14,5 +16,9 @@ exec /home/const/subnet66/.venv/bin/python -m cli pool-manager \
   --task-archive-enabled \
   --task-archive-hf-dataset "$VALIDATE_TASK_ARCHIVE_HF_DATASET" \
   --task-archive-per-hour 10 \
-  --pool-filler-concurrency 25
+  --record-rollouts \
+  --rollout-root /home/const/subnet66/tau/workspace/rollouts \
+  --push-rollouts-to-hf \
+  --rollout-hf-dataset "$TAU_ROLLOUT_HF_DATASET" \
+  --pool-filler-concurrency 10
 '

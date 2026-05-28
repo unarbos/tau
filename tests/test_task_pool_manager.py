@@ -70,11 +70,11 @@ class TaskPoolManagerTest(unittest.TestCase):
         with manager._SAVED_TASK_FILL_LOCK:
             manager._SAVED_TASK_FILL_IN_FLIGHT.clear()
 
-    def test_pool_filler_worker_count_oversubscribes_solve_slots(self):
+    def test_pool_filler_worker_count_matches_solve_slots(self):
         config = RunConfig(validate_pool_filler_concurrency=25)
 
-        self.assertEqual(manager.pool_filler_worker_count(config), 75)
-        self.assertEqual(manager.pool_filler_executor_workers(config), 150)
+        self.assertEqual(manager.pool_filler_worker_count(config), 25)
+        self.assertEqual(manager.pool_filler_executor_workers(config), 50)
 
     def test_pool_solve_slot_uses_shared_semaphore(self):
         semaphore = threading.BoundedSemaphore(1)
@@ -111,7 +111,7 @@ class TaskPoolManagerTest(unittest.TestCase):
             self.assertEqual(manager.archive_quota_remaining(config, pool_label="retest", hour="2026-05-22-01"), 0)
             self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-02"), 2)
 
-    def test_archive_quota_reservation_blocks_concurrent_attempts_until_released(self):
+    def test_archive_quota_counts_replacements_not_failed_attempts(self):
         with tempfile.TemporaryDirectory() as td:
             config = RunConfig(workspace_root=Path(td), validate_task_archive_per_hour=1)
 
@@ -123,8 +123,8 @@ class TaskPoolManagerTest(unittest.TestCase):
             )
 
             self.assertIsNotNone(reserved)
-            self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-01"), 0)
-            self.assertIsNone(
+            self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-01"), 1)
+            self.assertIsNotNone(
                 manager.reserve_archive_quota(
                     config=config,
                     task_name="validate-20260101000000-000002",
@@ -136,16 +136,17 @@ class TaskPoolManagerTest(unittest.TestCase):
             manager.release_archive_reservation(config=config, task_name="validate-20260101000000-000001")
 
             self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-01"), 1)
-            self.assertIsNotNone(
-                manager.reserve_archive_quota(
-                    config=config,
-                    task_name="validate-20260101000000-000002",
-                    pool_label="primary",
-                    hour="2026-05-22-01",
-                )
-            )
             ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
             self.assertEqual(ledger["tasks"]["validate-20260101000000-000001"]["status"], "archive_generation_skipped")
+
+            manager.record_task_archive_status(
+                config=config,
+                task_name="validate-20260101000000-000003",
+                pool_label="primary",
+                status="pool_inserted",
+                archive_hour_value="2026-05-22-01",
+            )
+            self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-01"), 0)
 
     def test_select_rotation_archive_task_skips_replacement_and_leases(self):
         with tempfile.TemporaryDirectory() as td:

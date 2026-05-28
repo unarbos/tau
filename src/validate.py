@@ -74,7 +74,7 @@ _DIFF_JUDGE_MODEL = "anthropic/claude-sonnet-4.6"
 _DIFF_JUDGE_FALLBACK_MODELS = ("moonshotai/kimi-k2.6",)
 _DIFF_JUDGE_WEIGHT = 1.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
-_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 180
+_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_MAX_TOKENS = 16_000
 _DIFF_JUDGE_REASONING = {"enabled": True, "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
@@ -99,6 +99,8 @@ _MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
 _MAX_DUEL_AGENT_TIMEOUT_SECONDS = 600
 _DUEL_AGENT_TIMEOUT_PROVIDER_SLOWDOWN_FACTOR = 1.5
 _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS = 300.0
+_POOL_FILLER_RATE_LIMIT_BACKOFF_BUFFER_SECONDS = 30.0
+_POOL_FILLER_RATE_LIMIT_BACKOFF_MAX_SECONDS = 3600.0
 _KING_EMISSION_SHARES = (0.40, 0.15, 0.15, 0.15, 0.15)
 
 
@@ -2239,10 +2241,40 @@ def _pool_generation_backoff_remaining() -> float:
         return max(0.0, _pool_generation_backoff_until - time.monotonic())
 
 
-def _note_github_api_rate_limit(context: str) -> None:
+def _clamp_rate_limit_backoff(seconds: float) -> float:
+    return min(
+        _POOL_FILLER_RATE_LIMIT_BACKOFF_MAX_SECONDS,
+        max(_POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS, seconds),
+    )
+
+
+def _github_rate_limit_backoff_seconds(resp: httpx.Response, *, now: float | None = None) -> float:
+    retry_after = resp.headers.get("retry-after")
+    if retry_after:
+        try:
+            return _clamp_rate_limit_backoff(float(retry_after) + _POOL_FILLER_RATE_LIMIT_BACKOFF_BUFFER_SECONDS)
+        except ValueError:
+            pass
+    reset = resp.headers.get("x-ratelimit-reset")
+    remaining = resp.headers.get("x-ratelimit-remaining")
+    if reset and remaining == "0":
+        try:
+            epoch_now = time.time() if now is None else now
+            return _clamp_rate_limit_backoff(
+                float(reset) - epoch_now + _POOL_FILLER_RATE_LIMIT_BACKOFF_BUFFER_SECONDS
+            )
+        except ValueError:
+            pass
+    return _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS
+
+
+def _note_github_api_rate_limit(context: str, *, backoff_seconds: float | None = None) -> None:
     global _pool_generation_backoff_until
     now = time.monotonic()
-    next_until = now + _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS
+    duration = _clamp_rate_limit_backoff(
+        _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS if backoff_seconds is None else backoff_seconds
+    )
+    next_until = now + duration
     with _POOL_GENERATION_BACKOFF_LOCK:
         extended = next_until > _pool_generation_backoff_until + 1.0
         _pool_generation_backoff_until = max(_pool_generation_backoff_until, next_until)
@@ -2250,12 +2282,20 @@ def _note_github_api_rate_limit(context: str) -> None:
         log.warning(
             "%s: GitHub rate limit detected; pausing GitHub API work for %.0fs",
             context,
-            _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS,
+            duration,
         )
 
 
 def _note_pool_generation_rate_limit(pool_label: str) -> None:
     _note_github_api_rate_limit(f"Pool filler[{pool_label}]")
+
+
+def _note_github_response_rate_limit(context: str, resp: httpx.Response) -> None:
+    if _github_response_is_rate_limited(resp):
+        _note_github_api_rate_limit(
+            context,
+            backoff_seconds=_github_rate_limit_backoff_seconds(resp),
+        )
 
 
 def _github_response_is_rate_limited(resp: httpx.Response) -> bool:
@@ -5416,9 +5456,7 @@ def _build_github_client(config: RunConfig) -> _GitHubAuthRotatingClient:
 def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
     # Owner-scoped client used for publishing promoted private submissions. Prefers github_merge_token
     # (typically GITHUB_TOKEN_UNARBOS) so we never accidentally use a rotation
-    # token that lacks write access to the public base repo. Falls back to the
-    # same selection as _build_github_client so behaviour is preserved when the
-    # dedicated merge token is not configured.
+    # token that lacks write access to the public base repo.
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -5427,9 +5465,6 @@ def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
     tokens: list[str] = []
     if config.github_merge_token:
         tokens.append(config.github_merge_token)
-    if config.github_token:
-        tokens.append(config.github_token)
-    tokens.extend(_split_github_tokens(config.github_tokens))
     return _GitHubAuthRotatingClient(
         base_headers=headers,
         timeout=config.http_timeout,
@@ -5464,6 +5499,7 @@ def _fetch_branch_head_sha(
             if re.fullmatch(r"[0-9a-fA-F]{40}", sha):
                 return sha.lower()
         else:
+            _note_github_response_rate_limit("GitHub branch fetch", resp)
             log.warning(
                 "GitHub branch fetch failed for %s:%s: HTTP %s",
                 repo,
@@ -5773,6 +5809,7 @@ def _fetch_github_text_file(
         log.warning("GitHub content fetch failed for %s:%s@%s: %s", repo, path, ref, exc)
         return None
     if resp.status_code != 200:
+        _note_github_response_rate_limit("GitHub content fetch", resp)
         log.warning("GitHub content fetch failed for %s:%s@%s: HTTP %s", repo, path, ref, resp.status_code)
         return None
     try:
@@ -7606,6 +7643,7 @@ def _resolve_public_commit(client: httpx.Client, repo: str, sha: str) -> str | N
         return None  # definitively not public
     if r.status_code != 200:
         # 5xx, 403 rate-limit, 401, etc -- all transient from our POV
+        _note_github_response_rate_limit("GitHub repo fetch", r)
         raise _TransientCommitCheckError(f"GET /repos/{repo} -> HTTP {r.status_code}")
     try:
         body = r.json()
@@ -7620,6 +7658,7 @@ def _resolve_public_commit(client: httpx.Client, repo: str, sha: str) -> str | N
     if r2.status_code == 404 or r2.status_code == 422:
         return None  # commit definitively gone/invalid
     if r2.status_code != 200:
+        _note_github_response_rate_limit("GitHub commit fetch", r2)
         raise _TransientCommitCheckError(f"GET /repos/{repo}/commits/{sha} -> HTTP {r2.status_code}")
     try:
         full_sha = r2.json().get("sha", sha)
@@ -7649,6 +7688,7 @@ def _is_commit_on_branch(client: httpx.Client, repo: str, sha: str, branch: str)
     if r.status_code == 404 or r.status_code == 422:
         return False
     if r.status_code != 200:
+        _note_github_response_rate_limit("GitHub compare fetch", r)
         raise _TransientCommitCheckError(f"GET /repos/{repo}/compare/{sha}...{branch} -> HTTP {r.status_code}")
     try:
         status = str(r.json().get("status") or "")
