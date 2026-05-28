@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from config import RunConfig
 from solve_spend import build_solve_spend_payload
-from submission_api import solve_spend_payload_for_query
+from submission_api import rate_limit_client_ip, solve_spend_payload_for_query
 from private_submission import (
     build_public_submissions_api_payload,
     check_and_record_private_submission_attempt,
@@ -127,6 +127,37 @@ def fake_signature_verifier(hotkey, payload, signature):
 
 
 class PrivateSubmissionChecksTest(unittest.TestCase):
+    def test_rate_limit_client_ip_uses_forwarded_for_from_local_proxy(self):
+        headers = Message()
+        headers["X-Forwarded-For"] = "203.0.113.7, 127.0.0.1"
+
+        client_ip = rate_limit_client_ip(headers=headers, client_address=("127.0.0.1", 39196))
+
+        self.assertEqual(client_ip, "203.0.113.7")
+
+    def test_rate_limit_client_ip_uses_real_ip_from_local_proxy(self):
+        headers = Message()
+        headers["X-Real-IP"] = "2001:db8::66"
+
+        client_ip = rate_limit_client_ip(headers=headers, client_address=("::1", 39196))
+
+        self.assertEqual(client_ip, "2001:db8::66")
+
+    def test_rate_limit_client_ip_does_not_trust_forwarded_for_from_remote_peer(self):
+        headers = Message()
+        headers["X-Forwarded-For"] = "203.0.113.7"
+
+        client_ip = rate_limit_client_ip(headers=headers, client_address=("198.51.100.8", 39196))
+
+        self.assertEqual(client_ip, "198.51.100.8")
+
+    def test_rate_limit_client_ip_falls_back_to_local_peer_without_proxy_header(self):
+        headers = Message()
+
+        client_ip = rate_limit_client_ip(headers=headers, client_address=("127.0.0.1", 39196))
+
+        self.assertEqual(client_ip, "127.0.0.1")
+
     def test_scope_guard_failure_skips_judge_and_rejects(self):
         result = run_private_submission_checks(
             hotkey=HOTKEY,

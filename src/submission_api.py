@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -96,7 +97,7 @@ def build_handler(config: SubmissionApiConfig):
             if self.path.rstrip("/") != "/api/submissions":
                 send_json(self, 404, {"error": "not_found"})
                 return
-            client_ip = self.client_address[0] if self.client_address else "unknown"
+            client_ip = rate_limit_client_ip(headers=self.headers, client_address=self.client_address)
             if not rate_limit_allowed(client_ip, config=config):
                 send_json(self, 429, {"accepted": False, "error": "rate_limited"})
                 return
@@ -603,6 +604,59 @@ def request_too_large(headers: Any, *, max_request_bytes: int) -> bool:
     except (TypeError, ValueError):
         return True
     return content_length <= 0 or content_length > max_request_bytes
+
+
+def rate_limit_client_ip(*, headers: Any, client_address: Any) -> str:
+    peer_ip = socket_peer_ip(client_address)
+    if not local_proxy_ip(peer_ip):
+        return peer_ip
+    return forwarded_client_ip(headers) or peer_ip
+
+
+def socket_peer_ip(client_address: Any) -> str:
+    if not client_address:
+        return "unknown"
+    try:
+        return str(client_address[0])
+    except (IndexError, TypeError):
+        return "unknown"
+
+
+def local_proxy_ip(value: str) -> bool:
+    try:
+        parsed = ip_address(value)
+    except ValueError:
+        return False
+    return parsed.is_loopback
+
+
+def forwarded_client_ip(headers: Any) -> str | None:
+    forwarded_for = header_value(headers, "X-Forwarded-For")
+    if forwarded_for:
+        first_forwarded = forwarded_for.split(",", 1)[0].strip()
+        if valid_ip(first_forwarded):
+            return first_forwarded
+
+    real_ip = header_value(headers, "X-Real-IP")
+    if real_ip and valid_ip(real_ip.strip()):
+        return real_ip.strip()
+
+    return None
+
+
+def header_value(headers: Any, name: str) -> str:
+    try:
+        return str(headers.get(name, "") or "")
+    except AttributeError:
+        return ""
+
+
+def valid_ip(value: str) -> bool:
+    try:
+        ip_address(value)
+    except ValueError:
+        return False
+    return True
 
 
 def rate_limit_allowed(client_ip: str, *, config: SubmissionApiConfig) -> bool:
