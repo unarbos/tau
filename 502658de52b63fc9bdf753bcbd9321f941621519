@@ -1,0 +1,12 @@
+Adds benchmark/export tooling plus validator disk cleanup controls.
+
+Key changes:
+- New SWE-bench, Terminal-Bench, and fast king-eval daemons with fixtures, agents, start scripts, and tests.
+- Task-only Hugging Face export command.
+- Validator/pool-manager disk headroom cleanup for old validate task dirs.
+- Optional cleanup of uploaded, inactive rollout task dirs.
+- Immediate archived task deletion after successful HF upload, with retry on failure or lease protection.
+- Private-submission queue wakeup marker so accepted private submissions can wake validation early.
+- Shorter queued pool-gate sleeps, best-effort Docker cleanup, normalized swebench-local R2 payload, and reduced diff-judge prompt-injection false positives.
+
+Validation: PATH=/home/const/subnet66/tau/.venv/bin:/home/const/.local/bin:/home/const/.codex/tmp/arg0/codex-arg0U2T3cL:/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:/home/const/.local/bin:/home/const/.local/bin:/home/const/.cursor-server/bin/linux-x64/bin:/home/const/.local/bin:/home/const/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin PYTHONPATH=src .venv/bin/pytest tests/test_private_submission.py tests/test_rollouts.py tests/test_task_pool_manager.py tests/test_validate_poll_gating.py tests/test_validate_reference_scoring.py tests/test_validate_task_pool.py tests/test_benchmarks.py tests/test_docker_solver_cleanup.py tests/test_swebench_crown_benchmark.py tests/test_task_only_hf_export.py tests/test_terminal_bench_crown_benchmark.py => 200 passed, 1 warning.
