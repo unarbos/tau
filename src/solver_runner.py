@@ -3,75 +3,23 @@ from __future__ import annotations
 import json
 import logging
 import textwrap
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from claude_runner import run_claude
 from claw_runner import run_claw
 from config import RunConfig
-from openrouter_proxy import SolveBudget, SolveUsageSummary
+from openrouter_proxy import SolveBudget
 from task_generation import GeneratedTask
+from tau.solver import (
+    COMPLETED_EXIT_REASON,
+    SOLVER_ERROR_EXIT_REASON,
+    TIME_LIMIT_EXIT_REASON,
+    SolveResult,
+)
 from workspace import git_diff
 
 log = logging.getLogger("swe-eval.solver_runner")
-COMPLETED_EXIT_REASON = "completed"
-TIME_LIMIT_EXIT_REASON = "time_limit_exceeded"
-SANDBOX_VIOLATION_EXIT_REASON = "sandbox_violation"
-SOLVER_ERROR_EXIT_REASON = "solver_error"
-PROVIDER_ENDPOINT_ERROR_EXIT_REASON = "provider_endpoint_error"
-PROVIDER_ACCOUNT_ERROR_EXIT_REASON = "provider_account_error"
-
-
-@dataclass(slots=True)
-class SolveResult:
-    success: bool
-    elapsed_seconds: float
-    raw_output: str
-    model: str | None
-    solution_diff: str
-    exit_reason: str = COMPLETED_EXIT_REASON
-    usage_summary: SolveUsageSummary | None = None
-    request_count: int | None = None
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    total_tokens: int | None = None
-    cached_tokens: int | None = None
-    cache_write_tokens: int | None = None
-    reasoning_tokens: int | None = None
-    cost: float | None = None
-    tool_calls: int | None = None
-    rollout_output: str | None = None
-    rollout_format: str | None = None
-    rollout_filename: str | None = None
-    session_id: str | None = None
-    rollout_id: str | None = None
-    rollout_path: str | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "success": self.success,
-            "elapsed_seconds": self.elapsed_seconds,
-            "raw_output": self.raw_output,
-            "model": self.model,
-            "solution_diff": self.solution_diff,
-            "exit_reason": self.exit_reason,
-            "usage_summary": self.usage_summary.to_dict() if self.usage_summary else None,
-            "request_count": self.request_count,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens,
-            "cached_tokens": self.cached_tokens,
-            "cache_write_tokens": self.cache_write_tokens,
-            "reasoning_tokens": self.reasoning_tokens,
-            "cost": self.cost,
-            "tool_calls": self.tool_calls,
-            "rollout_format": self.rollout_format,
-            "rollout_filename": self.rollout_filename,
-            "session_id": self.session_id,
-            "rollout_id": self.rollout_id,
-            "rollout_path": self.rollout_path,
-        }
 
 
 def solve_task(

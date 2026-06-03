@@ -26,15 +26,15 @@ from docker_solver import (
     _sanitize_repo_git_metadata_in_container,
     _write_text_to_container,
 )
-from solver_runner import (
+from solver_runner import build_solver_prompt
+from task_generation import GeneratedTask
+from tau.solver import (
     COMPLETED_EXIT_REASON,
     SANDBOX_VIOLATION_EXIT_REASON,
     SOLVER_ERROR_EXIT_REASON,
     TIME_LIMIT_EXIT_REASON,
     SolveResult,
-    build_solver_prompt,
 )
-from task_generation import GeneratedTask
 from workspace import git_diff
 
 log = logging.getLogger("swe-eval.cursor_runner")

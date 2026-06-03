@@ -21,7 +21,12 @@ from typing import Any
 
 from config import RunConfig
 from openrouter_proxy import OpenRouterProxy, SolveBudget
-from solver_runner import (
+from task_generation import GeneratedTask
+from tau.rollouts.ids import rollout_id as make_rollout_id
+from tau.rollouts.redaction import redact_value
+from tau.rollouts.schema import build_rollout_record, utc_now
+from tau.rollouts.store import append_rollout
+from tau.solver import (
     COMPLETED_EXIT_REASON,
     PROVIDER_ACCOUNT_ERROR_EXIT_REASON,
     PROVIDER_ENDPOINT_ERROR_EXIT_REASON,
@@ -30,11 +35,6 @@ from solver_runner import (
     TIME_LIMIT_EXIT_REASON,
     SolveResult,
 )
-from task_generation import GeneratedTask
-from tau.rollouts.ids import rollout_id as make_rollout_id
-from tau.rollouts.redaction import redact_value
-from tau.rollouts.schema import build_rollout_record, utc_now
-from tau.rollouts.store import append_rollout
 from workspace import ensure_tree_has_no_symlinks, git_diff
 
 log = logging.getLogger("swe-eval.docker_solver")
