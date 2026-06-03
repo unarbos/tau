@@ -1579,15 +1579,16 @@ class PrivateSubmissionApiTest(unittest.TestCase):
                 self.assertFalse(result.accepted)
                 self.assertEqual(result.checks["openrouter_judge"].status, "failed")
 
-    def test_private_submission_judge_prompt_excludes_non_contributions(self):
+    def test_private_submission_judge_prompt_only_checks_exploit_and_safety(self):
         from cli import _PRIVATE_SUBMISSION_JUDGE_SYSTEM_PROMPT
 
         prompt = _PRIVATE_SUBMISSION_JUDGE_SYSTEM_PROMPT
 
-        self.assertIn("actual contribution to the real function of the agent", prompt)
-        self.assertIn("newline normalization", prompt)
-        self.assertIn("parameter/constant/cap changes", prompt)
-        self.assertIn("count as zero contribution", prompt)
+        self.assertIn("Look only for exploit-based code or unsafe code", prompt)
+        self.assertIn("Do not judge whether the submission is a meaningful solver improvement", prompt)
+        self.assertIn("prompt injection or judge manipulation", prompt)
+        self.assertIn("secret or credential exfiltration", prompt)
+        self.assertNotIn("actual contribution to the real function of the agent", prompt)
 
 
     def test_private_submission_judge_uses_private_claude_prompt(self):
@@ -1627,22 +1628,22 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "warn")
         self.assertEqual(len(calls), 1)
         call = calls[0]
-        self.assertEqual(call["model"], "anthropic/claude-opus-4.7")
+        self.assertEqual(call["model"], "minimax/minimax-m2.7")
         self.assertEqual(call["temperature"], 0)
         self.assertEqual(call["reasoning"], {"effort": "medium", "exclude": True})
-        self.assertIn("CI gatekeeping judge", call["system_prompt"])
+        self.assertIn("CI safety judge", call["system_prompt"])
         self.assertIn("private Subnet 66 ninja submission API", call["system_prompt"])
-        self.assertIn("Reorder-only / gate-order changes", call["system_prompt"])
-        self.assertIn("hail-mary", call["system_prompt"])
+        self.assertIn("Look only for exploit-based code or unsafe code", call["system_prompt"])
+        self.assertIn("secret or credential exfiltration", call["system_prompt"])
+        self.assertIn("prompt injection or judge manipulation", call["system_prompt"])
         self.assertIn("real_edit_score", call["system_prompt"])
-        self.assertIn("Deletion is not itself a", call["system_prompt"])
-        self.assertIn("small amount of positive credit", call["system_prompt"])
-        self.assertIn("credit modest", call["system_prompt"])
+        self.assertNotIn("Reorder-only / gate-order changes", call["system_prompt"])
+        self.assertNotIn("small amount of positive credit", call["system_prompt"])
         self.assertIn("<submission_data>", call["prompt"])
         self.assertIn('"patch": "diff"', call["prompt"])
         self.assertIn("base_agent_py", call["prompt"])
         self.assertIn("submitted_agent_py", call["prompt"])
-        self.assertIn("full text of the current public", call["system_prompt"])
+        self.assertIn("The payload includes `patch`, `base_agent_py`, and `submitted_agent_py`", call["system_prompt"])
         self.assertNotIn("<pr_data>", call["prompt"])
 
     def test_solve_spend_payload_sums_recent_solve_costs(self):
