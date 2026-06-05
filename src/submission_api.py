@@ -25,8 +25,20 @@ from private_submission import (
     private_submission_signature_payload,
     registration_check_is_existing_acceptance,
     record_private_submission_acceptance,
+    run_private_bundle_submission_checks,
     run_private_submission_checks,
+    write_private_multi_file_submission_bundle,
     write_private_submission_bundle,
+)
+from submission_bundle import (
+    DEFAULT_ENTRYPOINT,
+    MAX_BUNDLE_BYTES,
+    bundle_files_from_archive,
+    bundle_signature_payload,
+    canonical_bundle_sha256,
+    enforce_bundle_size_limit,
+    entrypoint_sha256,
+    read_harness_from_git_repo,
 )
 from r2 import publish_submissions_api_data
 from solve_spend import build_solve_spend_payload
@@ -63,9 +75,12 @@ class SubmissionApiConfig:
     base_agent_git_repo: Path | None = None
     base_agent_git_ref: str = "main"
     base_agent_git_path: str = "agent.py"
+    base_harness_git_repo: Path | None = None
+    base_harness_git_ref: str = "main"
     overwrite: bool = False
     max_request_bytes: int = MAX_REQUEST_BYTES
     max_agent_bytes: int = MAX_AGENT_BYTES
+    max_bundle_bytes: int = MAX_BUNDLE_BYTES
     rate_limit_window_seconds: int = RATE_LIMIT_WINDOW_SECONDS
     rate_limit_max_requests: int = RATE_LIMIT_MAX_REQUESTS
     rate_limit_max_failures: int = RATE_LIMIT_MAX_FAILURES
@@ -162,28 +177,25 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
             "signature": form_value(form, "coldkey_signature") or form_value(form, "coldkeySignature"),
         }
         submitted_id = form_value(form, "submission_id")
-        agent_py = form_file_text(form, "agent")
-        if not hotkey or not signature or not agent_py:
-            return 400, {"accepted": False, "error": "hotkey, signature, and agent file are required"}
-        if len(agent_py.encode("utf-8")) > config.max_agent_bytes:
-            return 413, {"accepted": False, "error": "agent_too_large"}
-        agent_sha256 = hashlib.sha256(agent_py.encode("utf-8")).hexdigest()
+        parsed = parse_submission_form(form, config=config)
+        if not hotkey or not signature:
+            return 400, {"accepted": False, "error": "hotkey and signature are required"}
+        if parsed.error:
+            return parsed.status_code, {"accepted": False, "error": parsed.error}
+
         submission_id = submitted_id or derive_submission_id(
             hotkey=hotkey,
-            agent_sha256=agent_sha256,
+            agent_sha256=parsed.content_sha256,
         )
-        signature_payload = private_submission_signature_payload(
-            hotkey=hotkey,
-            submission_id=submission_id,
-            agent_sha256=agent_sha256,
-        )
-        signature_valid = _verify_hotkey_signature(hotkey, signature_payload, signature)
+        parsed = attach_signature_payload(parsed, hotkey=hotkey, submission_id=submission_id)
+        signature_valid = _verify_hotkey_signature(hotkey, parsed.signature_payload, signature)
         if not signature_valid:
             return 401, precheck_signature_failure_payload(
                 hotkey=hotkey,
                 submission_id=submission_id,
-                agent_sha256=agent_sha256,
-                signature_payload=signature_payload,
+                agent_sha256=parsed.agent_sha256,
+                bundle_sha256=parsed.bundle_sha256,
+                signature_payload=parsed.signature_payload,
             )
         registration_block, uid, registration_error = registration_context(
             hotkey=hotkey,
@@ -194,7 +206,7 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 root=config.private_submission_root,
                 hotkey=hotkey,
                 submission_id=submission_id,
-                agent_sha256=agent_sha256,
+                agent_sha256=parsed.content_sha256,
                 registration_block=registration_block,
             )
             if registration_error is None
@@ -210,8 +222,9 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
             return 422, precheck_registration_failure_payload(
                 signature_valid=signature_valid,
                 submission_id=submission_id,
-                agent_sha256=agent_sha256,
-                signature_payload=signature_payload,
+                agent_sha256=parsed.agent_sha256,
+                bundle_sha256=parsed.bundle_sha256,
+                signature_payload=parsed.signature_payload,
                 registration_check=registration_check,
                 uid=uid,
                 registration_block=registration_block,
@@ -228,8 +241,9 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
             return 200, already_accepted_response_payload(
                 signature_valid=signature_valid,
                 submission_id=submission_id,
-                agent_sha256=agent_sha256,
-                signature_payload=signature_payload,
+                agent_sha256=parsed.agent_sha256,
+                bundle_sha256=parsed.bundle_sha256,
+                signature_payload=parsed.signature_payload,
                 bundle_path=existing_bundle,
                 uid=uid,
                 registration_block=registration_block,
@@ -242,7 +256,7 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 root=config.private_submission_root,
                 hotkey=hotkey,
                 submission_id=submission_id,
-                agent_sha256=agent_sha256,
+                agent_sha256=parsed.content_sha256,
                 window_seconds=config.hotkey_rate_limit_window_seconds,
                 max_attempts=config.hotkey_rate_limit_max_attempts,
             )
@@ -250,20 +264,31 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
             return 429, hotkey_rate_limit_payload(
                 hotkey=hotkey,
                 submission_id=submission_id,
-                agent_sha256=agent_sha256,
-                signature_payload=signature_payload,
+                agent_sha256=parsed.agent_sha256,
+                bundle_sha256=parsed.bundle_sha256,
+                signature_payload=parsed.signature_payload,
                 uid=uid,
                 registration_block=registration_block,
                 hotkey_rate=hotkey_rate,
             )
-        base_agent_py = read_base_agent_py(config=config)
-        result = run_private_submission_checks(
-            hotkey=hotkey,
-            submitted_agent_py=agent_py,
-            base_agent_py=base_agent_py,
-            openrouter_judge=config.judge,
-            min_score=config.judge_min_score,
-        )
+        if parsed.is_multi_file:
+            base_files = read_base_harness_files(config=config)
+            result = run_private_bundle_submission_checks(
+                hotkey=hotkey,
+                submitted_files=parsed.bundle_files or {},
+                base_files=base_files,
+                openrouter_judge=config.judge,
+                min_score=config.judge_min_score,
+            )
+        else:
+            base_agent_py = read_base_agent_py(config=config)
+            result = run_private_submission_checks(
+                hotkey=hotkey,
+                submitted_agent_py=parsed.agent_py or "",
+                base_agent_py=base_agent_py,
+                openrouter_judge=config.judge,
+                min_score=config.judge_min_score,
+            )
         result.checks["registration_gate"] = registration_check
         bundle_path = None
         accepted = bool(result.accepted)
@@ -281,7 +306,8 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 root=config.private_submission_root,
                 submission_id=submission_id,
                 hotkey=hotkey,
-                agent_py=agent_py,
+                agent_py=parsed.agent_py,
+                bundle_files=parsed.bundle_files,
                 result=result,
                 signature=signature,
                 registration_block=registration_block,
@@ -300,6 +326,7 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                     agent_username=identity["agent_username"] if identity else None,
                     coldkey=identity["coldkey"] if identity else None,
                     coldkey_signature=identity["coldkey_signature"] if identity else None,
+                    bundle_sha256=result.bundle_sha256,
                 )
             publish_submissions_api_data(build_public_submissions_api_payload(root=config.private_submission_root))
 
@@ -308,7 +335,7 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
             signature_valid=signature_valid,
             submission_id=submission_id,
             result=result,
-            signature_payload=signature_payload,
+            signature_payload=parsed.signature_payload,
             bundle_path=bundle_path,
             uid=uid,
             registration_block=registration_block,
@@ -319,6 +346,126 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
     except Exception as exc:
         log.exception("private submission request failed")
         return 500, {"accepted": False, "error": str(exc)}
+
+
+@dataclass(frozen=True)
+class ParsedSubmissionForm:
+    is_multi_file: bool
+    agent_py: str | None
+    bundle_files: dict[str, bytes] | None
+    agent_sha256: str
+    bundle_sha256: str | None
+    content_sha256: str
+    signature_payload: bytes
+    error: str | None = None
+    status_code: int = 400
+
+
+def parse_submission_form(form: cgi.FieldStorage, *, config: SubmissionApiConfig) -> ParsedSubmissionForm:
+    bundle_bytes, bundle_name = form_file_bytes(form, "bundle")
+    agent_py = form_file_text(form, "agent")
+    if bundle_bytes:
+        try:
+            bundle_files = bundle_files_from_archive(bundle_bytes, archive_name=bundle_name)
+            enforce_bundle_size_limit(bundle_files, max_bytes=config.max_bundle_bytes)
+        except ValueError as exc:
+            return ParsedSubmissionForm(
+                is_multi_file=True,
+                agent_py=None,
+                bundle_files=None,
+                agent_sha256="",
+                bundle_sha256=None,
+                content_sha256="",
+                signature_payload=b"",
+                error=str(exc),
+                status_code=413 if "maximum" in str(exc) else 400,
+            )
+        agent_sha = entrypoint_sha256(bundle_files)
+        bundle_sha = canonical_bundle_sha256(bundle_files)
+        return ParsedSubmissionForm(
+            is_multi_file=True,
+            agent_py=bundle_files[DEFAULT_ENTRYPOINT].decode("utf-8", errors="replace"),
+            bundle_files=bundle_files,
+            agent_sha256=agent_sha,
+            bundle_sha256=bundle_sha,
+            content_sha256=bundle_sha,
+            signature_payload=b"",
+            error=None,
+        )
+    if not agent_py:
+        return ParsedSubmissionForm(
+            is_multi_file=False,
+            agent_py=None,
+            bundle_files=None,
+            agent_sha256="",
+            bundle_sha256=None,
+            content_sha256="",
+            signature_payload=b"",
+            error="hotkey, signature, and agent or bundle file are required",
+        )
+    if len(agent_py.encode("utf-8")) > config.max_agent_bytes:
+        return ParsedSubmissionForm(
+            is_multi_file=False,
+            agent_py=agent_py,
+            bundle_files=None,
+            agent_sha256="",
+            bundle_sha256=None,
+            content_sha256="",
+            signature_payload=b"",
+            error="agent_too_large",
+            status_code=413,
+        )
+    agent_sha256 = hashlib.sha256(agent_py.encode("utf-8")).hexdigest()
+    return ParsedSubmissionForm(
+        is_multi_file=False,
+        agent_py=agent_py,
+        bundle_files=None,
+        agent_sha256=agent_sha256,
+        bundle_sha256=None,
+        content_sha256=agent_sha256,
+        signature_payload=b"",
+    )
+
+
+def attach_signature_payload(parsed: ParsedSubmissionForm, *, hotkey: str, submission_id: str) -> ParsedSubmissionForm:
+    if parsed.signature_payload:
+        return parsed
+    if parsed.is_multi_file and parsed.bundle_sha256:
+        payload = bundle_signature_payload(
+            hotkey=hotkey,
+            submission_id=submission_id,
+            bundle_sha256=parsed.bundle_sha256,
+        )
+    else:
+        payload = private_submission_signature_payload(
+            hotkey=hotkey,
+            submission_id=submission_id,
+            agent_sha256=parsed.agent_sha256,
+        )
+    return ParsedSubmissionForm(
+        is_multi_file=parsed.is_multi_file,
+        agent_py=parsed.agent_py,
+        bundle_files=parsed.bundle_files,
+        agent_sha256=parsed.agent_sha256,
+        bundle_sha256=parsed.bundle_sha256,
+        content_sha256=parsed.content_sha256,
+        signature_payload=payload,
+        error=parsed.error,
+        status_code=parsed.status_code,
+    )
+
+
+def read_base_harness_files(*, config: SubmissionApiConfig) -> dict[str, bytes]:
+    harness_repo = config.base_harness_git_repo or config.base_agent_git_repo
+    if harness_repo is not None:
+        return read_harness_from_git_repo(
+            repo=harness_repo.expanduser(),
+            ref=config.base_harness_git_ref or config.base_agent_git_ref,
+        )
+    if config.base_agent.is_dir():
+        return collect_harness_from_directory(config.base_agent.expanduser())
+    agent_text = config.base_agent.expanduser().read_text(encoding="utf-8")
+    return {DEFAULT_ENTRYPOINT: agent_text.encode("utf-8")}
 
 
 def read_base_agent_py(*, config: SubmissionApiConfig) -> str:
@@ -361,7 +508,8 @@ def persist_accepted_submission(
     root: Path,
     submission_id: str,
     hotkey: str,
-    agent_py: str,
+    agent_py: str | None,
+    bundle_files: dict[str, bytes] | None,
     result: Any,
     signature: str,
     registration_block: int | None,
@@ -370,6 +518,7 @@ def persist_accepted_submission(
     coldkey_signature: str | None,
     overwrite: bool,
 ) -> Path:
+    content_sha = result.bundle_sha256 or result.agent_sha256
     existing_bundle = root / submission_id
     if (
         existing_bundle.exists()
@@ -377,17 +526,31 @@ def persist_accepted_submission(
         and private_submission_check_passed(
             root,
             submission_id,
-            result.agent_sha256,
+            content_sha,
             hotkey=hotkey,
             signature_verifier=_verify_hotkey_signature,
         )
     ):
         return existing_bundle
+    if bundle_files is not None:
+        return write_private_multi_file_submission_bundle(
+            root=root,
+            submission_id=submission_id,
+            hotkey=hotkey,
+            bundle_files=bundle_files,
+            check_result=result,
+            signature=signature,
+            registration_block=registration_block,
+            agent_username=agent_username,
+            coldkey=coldkey,
+            coldkey_signature=coldkey_signature,
+            overwrite=overwrite,
+        )
     return write_private_submission_bundle(
         root=root,
         submission_id=submission_id,
         hotkey=hotkey,
-        agent_py=agent_py,
+        agent_py=agent_py or "",
         check_result=result,
         signature=signature,
         registration_block=registration_block,
@@ -431,21 +594,31 @@ def response_payload(
     coldkey: str | None = None,
 ) -> dict[str, Any]:
     ci_checks = {name: check.to_dict() for name, check in result.checks.items()}
-    return {
+    content_sha = result.bundle_sha256 or result.agent_sha256
+    payload = {
         "accepted": accepted,
         "signature_valid": signature_valid,
         "submission_id": submission_id,
         "agent_sha256": result.agent_sha256,
-        "commitment": f"private-submission:{submission_id}:{result.agent_sha256}",
+        "commitment": f"private-submission:{submission_id}:{content_sha}",
         "agent_username": agent_username,
         "coldkey": coldkey,
         "signature_payload": signature_payload.decode("utf-8"),
+        "signature_version": result.signature_version,
         "bundle_path": str(bundle_path) if bundle_path is not None else None,
         "registration": {"uid": uid, "registration_block": registration_block},
         "ci_checks": ci_checks,
         "llm_judge": ci_checks.get("openrouter_judge"),
         "checks": ci_checks,
     }
+    if result.bundle_sha256:
+        payload["bundle_sha256"] = result.bundle_sha256
+    return payload
+
+
+def _submission_response_commitment(*, submission_id: str, agent_sha256: str, bundle_sha256: str | None) -> str:
+    content_sha = bundle_sha256 or agent_sha256
+    return f"private-submission:{submission_id}:{content_sha}"
 
 
 def already_accepted_response_payload(
@@ -453,6 +626,7 @@ def already_accepted_response_payload(
     signature_valid: bool,
     submission_id: str,
     agent_sha256: str,
+    bundle_sha256: str | None,
     signature_payload: bytes,
     bundle_path: Path,
     uid: int | None,
@@ -462,14 +636,18 @@ def already_accepted_response_payload(
     coldkey: str | None = None,
 ) -> dict[str, Any]:
     ci_checks = {"registration_gate": registration_check.to_dict()}
-    return {
+    payload = {
         "accepted": True,
         "already_accepted": True,
         "message": "This exact private submission was already accepted; no CI or LLM checks were rerun.",
         "signature_valid": signature_valid,
         "submission_id": submission_id,
         "agent_sha256": agent_sha256,
-        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+        "commitment": _submission_response_commitment(
+            submission_id=submission_id,
+            agent_sha256=agent_sha256,
+            bundle_sha256=bundle_sha256,
+        ),
         "agent_username": agent_username,
         "coldkey": coldkey,
         "signature_payload": signature_payload.decode("utf-8"),
@@ -479,6 +657,12 @@ def already_accepted_response_payload(
         "llm_judge": None,
         "checks": ci_checks,
     }
+    if bundle_sha256:
+        payload["bundle_sha256"] = bundle_sha256
+        payload["signature_version"] = "v2"
+    else:
+        payload["signature_version"] = "v1"
+    return payload
 
 
 def hotkey_rate_limit_payload(
@@ -486,6 +670,7 @@ def hotkey_rate_limit_payload(
     hotkey: str,
     submission_id: str,
     agent_sha256: str,
+    bundle_sha256: str | None,
     signature_payload: bytes,
     uid: int | None,
     registration_block: int | None,
@@ -514,7 +699,12 @@ def hotkey_rate_limit_payload(
         "signature_valid": True,
         "submission_id": submission_id,
         "agent_sha256": agent_sha256,
-        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+        "bundle_sha256": bundle_sha256,
+        "commitment": _submission_response_commitment(
+            submission_id=submission_id,
+            agent_sha256=agent_sha256,
+            bundle_sha256=bundle_sha256,
+        ),
         "signature_payload": signature_payload.decode("utf-8"),
         "bundle_path": None,
         "registration": {"uid": uid, "registration_block": registration_block},
@@ -530,6 +720,7 @@ def precheck_signature_failure_payload(
     hotkey: str,
     submission_id: str,
     agent_sha256: str,
+    bundle_sha256: str | None,
     signature_payload: bytes,
 ) -> dict[str, Any]:
     signature_check = SubmissionCheck(
@@ -546,7 +737,12 @@ def precheck_signature_failure_payload(
         "signature_valid": False,
         "submission_id": submission_id,
         "agent_sha256": agent_sha256,
-        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+        "bundle_sha256": bundle_sha256,
+        "commitment": _submission_response_commitment(
+            submission_id=submission_id,
+            agent_sha256=agent_sha256,
+            bundle_sha256=bundle_sha256,
+        ),
         "signature_payload": signature_payload.decode("utf-8"),
         "bundle_path": None,
         "registration": {"uid": None, "registration_block": None},
@@ -562,6 +758,7 @@ def precheck_registration_failure_payload(
     signature_valid: bool,
     submission_id: str,
     agent_sha256: str,
+    bundle_sha256: str | None,
     signature_payload: bytes,
     registration_check: SubmissionCheck,
     uid: int | None,
@@ -573,7 +770,12 @@ def precheck_registration_failure_payload(
         "signature_valid": signature_valid,
         "submission_id": submission_id,
         "agent_sha256": agent_sha256,
-        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+        "bundle_sha256": bundle_sha256,
+        "commitment": _submission_response_commitment(
+            submission_id=submission_id,
+            agent_sha256=agent_sha256,
+            bundle_sha256=bundle_sha256,
+        ),
         "signature_payload": signature_payload.decode("utf-8"),
         "bundle_path": None,
         "registration": {"uid": uid, "registration_block": registration_block},
@@ -589,13 +791,21 @@ def form_value(form: cgi.FieldStorage, name: str) -> str:
 
 
 def form_file_text(form: cgi.FieldStorage, name: str) -> str:
+    data, _filename = form_file_bytes(form, name)
+    if not data:
+        return ""
+    return data.decode("utf-8")
+
+
+def form_file_bytes(form: cgi.FieldStorage, name: str) -> tuple[bytes, str]:
     item = form[name] if name in form else None
     if item is None or not getattr(item, "file", None):
-        return ""
+        return b"", ""
     data = item.file.read()
     if isinstance(data, str):
-        return data
-    return data.decode("utf-8")
+        data = data.encode("utf-8")
+    filename = str(getattr(item, "filename", "") or "")
+    return data, filename
 
 
 def request_too_large(headers: Any, *, max_request_bytes: int) -> bool:

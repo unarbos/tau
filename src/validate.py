@@ -32,6 +32,12 @@ from private_submission import (
     accepted_private_submission_entries,
     private_submission_check_passed,
 )
+from submission_bundle import (
+    bundle_entrypoint_path,
+    is_multi_file_bundle,
+    load_bundle_directory,
+    read_manifest,
+)
 from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
 from tau.rollouts.store import update_rollout
 from r2 import (
@@ -5072,6 +5078,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         retest_pool=retest_pool,
                     ),
                     max_dirs_per_pass=config.validate_disk_cleanup_max_dirs_per_pass,
+                    min_age_seconds=config.validate_task_cleanup_min_age_seconds,
                 )
                 _cleanup_orphaned_containers()
 
@@ -5731,8 +5738,12 @@ def _publish_promoted_private_submission(
 
     base_repo = (config.validate_publish_repo or _MINER_AGENT_REPO_FULL_NAME).strip() or _MINER_AGENT_REPO_FULL_NAME
     base_ref = (config.validate_publish_base or _MINER_AGENT_BRANCH).strip() or _MINER_AGENT_BRANCH
-    agent_path = _private_submission_agent_path(config, submission)
+    submission_id = _private_submission_id(submission)
+    root = _private_submission_root(config)
+    bundle_root = root / submission_id if root is not None and submission_id else None
+    is_multi_file = bool(bundle_root and is_multi_file_bundle(bundle_root))
     try:
+        agent_path = _private_submission_agent_path(config, submission)
         winning_agent = agent_path.read_text(encoding="utf-8")
     except OSError as exc:
         log.warning("Promoted private submission %s could not read agent.py: %s", submission.commitment, exc)
@@ -5751,32 +5762,44 @@ def _publish_promoted_private_submission(
     if not base_head_sha:
         log.warning("Promoted private submission %s could not resolve %s:%s", submission.commitment, base_repo, base_ref)
         return submission
-    current_base = _fetch_github_text_file(
-        github_client,
-        repo=base_repo,
-        path=_DEFAULT_GITHUB_AGENT_FILE,
-        ref=base_head_sha,
-    )
-    if current_base is None:
-        log.warning("Promoted private submission %s could not fetch current base agent.py", submission.commitment)
-        return submission
 
-    published_sha, update_error = _update_github_text_file_detailed(
-        github_client,
-        repo=base_repo,
-        path=_DEFAULT_GITHUB_AGENT_FILE,
-        branch=base_ref,
-        current_blob_sha=current_base[1],
-        content=winning_agent,
-        message=(
-            f"Promote private miner {submission.hotkey[:12]} as ninja king\n\n"
-            f"Winning miner hotkey: {submission.hotkey}\n"
-            f"Winning uid: {submission.uid}\n"
-            f"Private submission commitment: {submission.commitment}\n"
-            f"Private submission sha256: {submission.commit_sha}\n"
-            f"Base head before publication: {base_head_sha}"
-        ),
+    commit_message = (
+        f"Promote private miner {submission.hotkey[:12]} as ninja king\n\n"
+        f"Winning miner hotkey: {submission.hotkey}\n"
+        f"Winning uid: {submission.uid}\n"
+        f"Private submission commitment: {submission.commitment}\n"
+        f"Private submission sha256: {submission.commit_sha}\n"
+        f"Base head before publication: {base_head_sha}"
     )
+    if is_multi_file and bundle_root is not None:
+        _manifest, harness_files = load_bundle_directory(bundle_root)
+        published_sha, update_error = _publish_github_harness_files(
+            github_client,
+            repo=base_repo,
+            branch=base_ref,
+            base_head_sha=base_head_sha,
+            files=harness_files,
+            message=commit_message,
+        )
+    else:
+        current_base = _fetch_github_text_file(
+            github_client,
+            repo=base_repo,
+            path=_DEFAULT_GITHUB_AGENT_FILE,
+            ref=base_head_sha,
+        )
+        if current_base is None:
+            log.warning("Promoted private submission %s could not fetch current base agent.py", submission.commitment)
+            return submission
+        published_sha, update_error = _update_github_text_file_detailed(
+            github_client,
+            repo=base_repo,
+            path=_DEFAULT_GITHUB_AGENT_FILE,
+            branch=base_ref,
+            current_blob_sha=current_base[1],
+            content=winning_agent,
+            message=commit_message,
+        )
     if not published_sha:
         log.warning(
             "Promoted private submission %s could not publish to %s:%s: %s",
@@ -6083,6 +6106,114 @@ def _update_github_text_file_detailed(
         return sha.lower(), None
     log.warning("GitHub content update for %s:%s succeeded but no commit SHA was returned", repo, path)
     return None, "GitHub content update failed: content update succeeded but no commit SHA was returned"
+
+
+def _publish_github_harness_files(
+    client: httpx.Client,
+    *,
+    repo: str,
+    branch: str,
+    base_head_sha: str,
+    files: dict[str, bytes],
+    message: str,
+) -> tuple[str | None, str | None]:
+    try:
+        commit_resp = client.get(f"/repos/{repo}/git/commits/{base_head_sha}")
+    except (httpx.HTTPError, OSError) as exc:
+        return None, _format_github_error("GitHub commit fetch failed", detail=str(exc))
+    if commit_resp.status_code != 200:
+        return None, _format_github_error(
+            "GitHub commit fetch failed",
+            status_code=commit_resp.status_code,
+            detail=_github_response_text(commit_resp),
+        )
+    try:
+        base_tree_sha = str(commit_resp.json().get("tree", {}).get("sha") or "")
+    except ValueError:
+        base_tree_sha = ""
+    if not base_tree_sha:
+        return None, "GitHub commit fetch failed: missing base tree sha"
+
+    tree_entries: list[dict[str, str]] = []
+    for path, content in sorted(files.items()):
+        try:
+            blob_resp = client.post(
+                f"/repos/{repo}/git/blobs",
+                json={
+                    "content": base64.b64encode(content).decode("ascii"),
+                    "encoding": "base64",
+                },
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            return None, _format_github_error(f"GitHub blob create failed for {path}", detail=str(exc))
+        if blob_resp.status_code not in {200, 201}:
+            return None, _format_github_error(
+                f"GitHub blob create failed for {path}",
+                status_code=blob_resp.status_code,
+                detail=_github_response_text(blob_resp),
+            )
+        try:
+            blob_sha = str(blob_resp.json().get("sha") or "")
+        except ValueError:
+            blob_sha = ""
+        if not blob_sha:
+            return None, f"GitHub blob create failed for {path}: missing blob sha"
+        tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_sha})
+
+    try:
+        tree_resp = client.post(
+            f"/repos/{repo}/git/trees",
+            json={"base_tree": base_tree_sha, "tree": tree_entries},
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        return None, _format_github_error("GitHub tree create failed", detail=str(exc))
+    if tree_resp.status_code not in {200, 201}:
+        return None, _format_github_error(
+            "GitHub tree create failed",
+            status_code=tree_resp.status_code,
+            detail=_github_response_text(tree_resp),
+        )
+    try:
+        new_tree_sha = str(tree_resp.json().get("sha") or "")
+    except ValueError:
+        new_tree_sha = ""
+    if not new_tree_sha:
+        return None, "GitHub tree create failed: missing tree sha"
+
+    try:
+        new_commit_resp = client.post(
+            f"/repos/{repo}/git/commits",
+            json={"message": message, "tree": new_tree_sha, "parents": [base_head_sha]},
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        return None, _format_github_error("GitHub commit create failed", detail=str(exc))
+    if new_commit_resp.status_code not in {200, 201}:
+        return None, _format_github_error(
+            "GitHub commit create failed",
+            status_code=new_commit_resp.status_code,
+            detail=_github_response_text(new_commit_resp),
+        )
+    try:
+        new_commit_sha = str(new_commit_resp.json().get("sha") or "")
+    except ValueError:
+        new_commit_sha = ""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", new_commit_sha):
+        return None, "GitHub commit create failed: missing commit sha"
+
+    try:
+        ref_resp = client.patch(
+            f"/repos/{repo}/git/refs/heads/{quote(branch, safe='')}",
+            json={"sha": new_commit_sha.lower()},
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        return None, _format_github_error("GitHub ref update failed", detail=str(exc))
+    if ref_resp.status_code not in {200, 201}:
+        return None, _format_github_error(
+            "GitHub ref update failed",
+            status_code=ref_resp.status_code,
+            detail=_github_response_text(ref_resp),
+        )
+    return new_commit_sha.lower(), None
 
 
 def _github_response_text(resp: httpx.Response) -> str:
@@ -6685,7 +6816,7 @@ def _private_api_submission_from_entry(
 ) -> ValidatorSubmission | None:
     hotkey = str(entry.get("hotkey") or "")
     submission_id = str(entry.get("submission_id") or "")
-    sha256 = str(entry.get("agent_sha256") or "").lower()
+    sha256 = str(entry.get("bundle_sha256") or entry.get("agent_sha256") or "").lower()
     accepted_at = str(entry.get("accepted_at") or "") or None
     accepted_registration_block = _coerce_int(entry.get("registration_block"))
     identity = _verified_submission_identity(
@@ -7201,7 +7332,34 @@ def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfi
 
 def _cached_agent_source(config: RunConfig, sub: ValidatorSubmission) -> SolverAgentSource:
     if _is_private_submission(sub):
-        agent_path = _private_submission_agent_path(config, sub)
+        submission_id = _private_submission_id(sub)
+        if not submission_id:
+            raise RuntimeError(f"private submission {sub.commitment} has no submission id")
+        root = _private_submission_root(config)
+        if root is None:
+            raise RuntimeError("private submission root is not configured")
+        bundle_root = root / submission_id
+        if not private_submission_check_passed(
+            root,
+            submission_id,
+            sub.commit_sha,
+            hotkey=sub.hotkey,
+            signature_verifier=_verify_hotkey_signature,
+        ):
+            raise RuntimeError(f"private submission {submission_id} has not passed local checks")
+        if is_multi_file_bundle(bundle_root):
+            manifest = read_manifest(bundle_root / "manifest.json")
+            files_dir = bundle_root / "files"
+            return SolverAgentSource(
+                raw=sub.agent_ref,
+                kind="local_path",
+                local_path=str(files_dir),
+                agent_file=manifest.entrypoint,
+                commit_sha=sub.commit_sha,
+            )
+        agent_path = bundle_root / _DEFAULT_GITHUB_AGENT_FILE
+        if not agent_path.is_file():
+            raise RuntimeError(f"private submission agent.py is missing: {agent_path}")
         return SolverAgentSource(
             raw=sub.agent_ref,
             kind="local_file",
@@ -7241,9 +7399,7 @@ def _private_submission_agent_path(config: RunConfig, sub: ValidatorSubmission) 
     root = _private_submission_root(config)
     if root is None:
         raise RuntimeError("private submission root is not configured")
-    agent_path = root / submission_id / _DEFAULT_GITHUB_AGENT_FILE
-    if not agent_path.is_file():
-        raise RuntimeError(f"private submission agent.py is missing: {agent_path}")
+    bundle_root = root / submission_id
     if not private_submission_check_passed(
         root,
         submission_id,
@@ -7252,6 +7408,11 @@ def _private_submission_agent_path(config: RunConfig, sub: ValidatorSubmission) 
         signature_verifier=_verify_hotkey_signature,
     ):
         raise RuntimeError(f"private submission {submission_id} has not passed local checks")
+    if is_multi_file_bundle(bundle_root):
+        return bundle_entrypoint_path(bundle_root)
+    agent_path = bundle_root / _DEFAULT_GITHUB_AGENT_FILE
+    if not agent_path.is_file():
+        raise RuntimeError(f"private submission agent.py is missing: {agent_path}")
     return agent_path
 
 
@@ -8028,7 +8189,9 @@ def _task_cleanup_candidates(
     *,
     tasks_root: Path,
     keep_names: set[str],
+    min_age_seconds: int = 0,
 ) -> list[Path]:
+    now = time.time()
     return [
         task_dir
         for task_dir in sorted(
@@ -8036,6 +8199,7 @@ def _task_cleanup_candidates(
             key=lambda path: _path_mtime(path),
         )
         if task_dir.name not in keep_names
+        and (min_age_seconds <= 0 or now - _path_mtime(task_dir) >= min_age_seconds)
     ]
 
 
@@ -8059,6 +8223,7 @@ def _cleanup_tasks_until_disk_headroom(
     min_free_bytes: int,
     keep_names: set[str] | None = None,
     max_dirs_per_pass: int = 100,
+    min_age_seconds: int = 0,
     free_bytes: Any = _disk_free_bytes,
 ) -> int:
     if min_free_bytes <= 0 or max_dirs_per_pass <= 0:
@@ -8070,6 +8235,7 @@ def _cleanup_tasks_until_disk_headroom(
         candidates = _task_cleanup_candidates(
             tasks_root=tasks_root,
             keep_names=keep_names or set(),
+            min_age_seconds=min_age_seconds,
         )
         removed = 0
         log.warning(

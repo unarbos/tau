@@ -22,6 +22,7 @@ from private_submission import (
     private_submission_registration_check,
     record_private_submission_acceptance,
     run_agent_smoke_checks,
+    run_private_bundle_submission_checks,
     run_private_submission_checks,
     write_private_submission_bundle,
 )
@@ -197,6 +198,69 @@ class PrivateSubmissionChecksTest(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertEqual(result.checks["scope_guard"].status, "failed")
         self.assertTrue(any("solve()" in item or "validator-owned" in item for item in result.checks["scope_guard"].findings))
+
+    def test_bundle_submission_checks_run_smoke_and_scope_on_all_files(self):
+        base_files = {
+            "agent.py": BASE_AGENT.encode("utf-8"),
+            "helper.py": b"VALUE = 1\n",
+        }
+        submitted = {
+            "agent.py": GOOD_AGENT.encode("utf-8"),
+            "helper.py": b"VALUE = 2\n",
+        }
+        result = run_private_bundle_submission_checks(
+            hotkey=HOTKEY,
+            submitted_files=submitted,
+            base_files=base_files,
+            openrouter_judge=lambda payload: {"verdict": "pass", "overall_score": 90},
+        )
+        self.assertTrue(result.accepted)
+        self.assertIsNotNone(result.bundle_sha256)
+        self.assertEqual(result.signature_version, "v2")
+
+    def test_multi_file_bundle_round_trip_and_check_passed(self):
+        from private_submission import write_private_multi_file_submission_bundle
+        from submission_bundle import bundle_signature_payload
+
+        submitted = {
+            "agent.py": GOOD_AGENT.encode("utf-8"),
+            "helper.py": b"LOG_PREFIX = 'ninja'\n",
+        }
+        result = run_private_bundle_submission_checks(
+            hotkey=HOTKEY,
+            submitted_files=submitted,
+            base_files={"agent.py": BASE_AGENT.encode("utf-8")},
+            openrouter_judge=lambda payload: {"verdict": "pass", "overall_score": 90},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            submission_id = "bundle-sub-1"
+            write_private_multi_file_submission_bundle(
+                root=root,
+                submission_id=submission_id,
+                hotkey=HOTKEY,
+                bundle_files=submitted,
+                check_result=result,
+                signature=SIGNATURE,
+            )
+
+            def verifier(hotkey, payload, signature):
+                expected = bundle_signature_payload(
+                    hotkey=HOTKEY,
+                    submission_id=submission_id,
+                    bundle_sha256=result.bundle_sha256 or "",
+                )
+                return hotkey == HOTKEY and payload == expected and signature == SIGNATURE
+
+            self.assertTrue(
+                private_submission_check_passed(
+                    root,
+                    submission_id,
+                    result.bundle_sha256 or "",
+                    hotkey=HOTKEY,
+                    signature_verifier=verifier,
+                )
+            )
 
     def test_passing_checks_can_be_written_as_bundle(self):
         result = run_private_submission_checks(
