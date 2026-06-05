@@ -603,6 +603,10 @@ def _run_solver_command(
         "-e",
         f"TAU_HARNESS_RUNNER={_CONTAINER_RUNNER_FILE}",
         "-e",
+        f"TAU_AGENT_TIMEOUT_SECONDS={int(timeout)}",
+        "-e",
+        f"TAU_AGENT_DEADLINE_EPOCH={time.time() + max(1, int(timeout))}",
+        "-e",
         f"OPENAI_BASE_URL={proxy_base_url}",
         "-e",
         f"OPENAI_API_KEY={proxy.auth_token}",
@@ -957,6 +961,8 @@ def _clean_harness_command() -> str:
         'TAU_PROMPT_FILE="$TAU_PROMPT_FILE" '
         'TAU_AGENT_FILE="$TAU_AGENT_FILE" '
         'TAU_HARNESS_RUNNER="$TAU_HARNESS_RUNNER" '
+        'TAU_AGENT_TIMEOUT_SECONDS="$TAU_AGENT_TIMEOUT_SECONDS" '
+        'TAU_AGENT_DEADLINE_EPOCH="$TAU_AGENT_DEADLINE_EPOCH" '
         'OPENAI_BASE_URL="$OPENAI_BASE_URL" '
         'OPENAI_API_KEY="$OPENAI_API_KEY" '
         'AGENT_API_BASE="$AGENT_API_BASE" '
@@ -1239,6 +1245,7 @@ def _proxy_request_is_provider_endpoint_error(request: Any) -> bool:
 def _harness_runner_script() -> str:
     return textwrap.dedent(
         """\
+        import inspect
         import importlib.util
         import json
         import os
@@ -1664,6 +1671,18 @@ def _harness_runner_script() -> str:
             from datetime import UTC, datetime
             return datetime.now(tz=UTC).isoformat()
 
+        def _solve_kwargs(solve, *, timeout_seconds, deadline_epoch):
+            params = inspect.signature(solve).parameters
+            optional = {
+                "timeout_seconds": timeout_seconds,
+                "deadline_epoch": deadline_epoch,
+            }
+            return {
+                name: value
+                for name, value in optional.items()
+                if name in params
+            }
+
 
         def main():
             exit_code = 1
@@ -1674,6 +1693,8 @@ def _harness_runner_script() -> str:
                 model = _required_env("AGENT_MODEL")
                 api_base = _required_env("OPENAI_BASE_URL")
                 api_key = _required_env("OPENAI_API_KEY")
+                timeout_seconds = int(os.environ.get("TAU_AGENT_TIMEOUT_SECONDS", "0") or "0")
+                deadline_epoch = float(os.environ.get("TAU_AGENT_DEADLINE_EPOCH", "0") or "0")
                 _install_process_event_hooks(repo_dir)
                 module = _load_agent(agent_file)
                 solve = getattr(module, "solve")
@@ -1683,6 +1704,11 @@ def _harness_runner_script() -> str:
                     model=model,
                     api_base=api_base,
                     api_key=api_key,
+                    **_solve_kwargs(
+                        solve,
+                        timeout_seconds=timeout_seconds,
+                        deadline_epoch=deadline_epoch,
+                    ),
                 )
                 if not isinstance(result, dict):
                     raise RuntimeError(f"solve() must return a dict, got {type(result).__name__}")
