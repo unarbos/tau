@@ -13,6 +13,7 @@ from eval import evaluate_candidate_pair
 from github_miner import GitHubMiner, GitHubTokenRotator
 from task_generation import generate_task_description
 from tau.solver import Solver, SolveRequest, SolveResult
+from tau.solver.caching_solver import CachingSolver
 from tau.solver.claude_solver import ClaudeSolver
 from tau.solver.claw_solver import ClawSolver
 from tau.solver.cursor_solver import CursorSolver
@@ -157,6 +158,20 @@ def _choose_solver(config: RunConfig) -> Solver:
         return ClaudeSolver(model=config.solver_model, timeout=config.agent_timeout, config=config)
 
 
+def _maybe_wrap_with_cache(solver: Solver, config: RunConfig) -> Solver:
+    if config.solver_result_cache_dir is None:
+        return solver
+    return CachingSolver(
+        model=config.solver_model,
+        timeout=config.agent_timeout,
+        config=config,
+        inner=solver,
+        cache_dir=config.solver_result_cache_dir,
+        read=config.solver_result_cache_read,
+        write=config.solver_result_cache_write,
+    )
+
+
 def _write_solve_result(*, solution_paths: SolutionPaths, solve_request: SolveRequest, solve_result: SolveResult, config: RunConfig) -> None:
     solution_paths.solution_diff_path.write_text(solve_result.solution_diff + "\n")
     if solve_result.rollout_output:
@@ -195,6 +210,7 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
     solution_paths = prepare_solution_workspace(task_paths, solution_name)
 
     solver = _choose_solver(config)
+    solver = _maybe_wrap_with_cache(solver, config)
 
     solve_request = SolveRequest(
         repo_dir=solution_paths.repo_dir,

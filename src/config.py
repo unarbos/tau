@@ -185,6 +185,13 @@ class RunConfig:
             Path(value).expanduser() if (value := os.environ.get("PROXY_REPLAY_DIR")) else None
         ),
     )
+    solver_result_cache_dir: Path | None = field(
+        default_factory=lambda: (
+            Path(value).expanduser() if (value := os.environ.get("SOLVER_RESULT_CACHE_DIR")) else None
+        ),
+    )
+    solver_result_cache_read: bool = field(default_factory=lambda: _env_bool("SOLVER_RESULT_CACHE_READ", default=False))
+    solver_result_cache_write: bool = field(default_factory=lambda: _env_bool("SOLVER_RESULT_CACHE_WRITE", default=False))
     random_seed: int | None = None
     max_mining_attempts: int = 50
     http_timeout: float = 30.0
