@@ -9,7 +9,7 @@ from pathlib import Path
 
 from openrouter_proxy import OpenRouterProxy, SolveBudget, SolveUsageSummary
 
-log = logging.getLogger("swe-eval.claude_runner")
+log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)

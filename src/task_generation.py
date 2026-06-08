@@ -8,9 +8,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_runner import run_claude
 from github_miner import CommitCandidate
 from openrouter_client import complete_text
+from tau.runners.claude_runner import run_claude
 
 log = logging.getLogger("swe-eval.task_generation")
 

@@ -1,0 +1,140 @@
+import json
+import textwrap
+from typing import Any
+
+from task_generation import GeneratedTask
+from tau.solver.constants import (
+    COMPLETED_EXIT_REASON,
+    SOLVER_ERROR_EXIT_REASON,
+    TIME_LIMIT_EXIT_REASON,
+)
+
+
+def build_solver_prompt(task: GeneratedTask) -> str:
+    return textwrap.dedent(
+        f"""\
+        You are solving a software engineering task. Your diff will be scored by
+        positional line-level exact matching against a reference solution.
+        Score = matched_lines / max(your_lines, reference_lines).
+
+        Task:
+        {task.prompt_text}
+
+        Strategy:
+        1. Read the files that need to change IN FULL before editing.
+        2. Identify the MINIMAL set of changes — every extra line hurts your score.
+        3. Make precise, targeted edits. Match existing code style exactly.
+        4. Stop. Do not summarize, verify, or re-read files.
+
+        Critical rules:
+        - Change ONLY what the task requires. No cosmetic changes, no refactoring.
+        - Match indentation, quotes, semicolons, naming, and spacing character-for-character.
+        - Do not add comments, docstrings, type annotations, or error handling.
+        - Do not reorder imports, rename variables, or fix unrelated issues.
+        - Process files in alphabetical path order. Edit top-to-bottom within each file.
+        - Do not run tests, builds, or linters.
+        - Do not create new files unless the task explicitly requires it.
+        - When unsure about a change, leave the code as-is.
+        """,
+    )
+
+
+def _parse_claude_json_output(raw_output: str) -> tuple[str, int | None, int | None]:
+    text = raw_output.strip()
+    if not text:
+        return "", None, None
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text, None, None
+
+    if not isinstance(payload, dict):
+        return text, None, None
+
+    extracted_text = _extract_text(payload).strip() or text
+    token_count = _extract_token_count(payload)
+    tool_calls = _count_tool_calls(payload)
+    return extracted_text, token_count, tool_calls
+
+
+def _extract_text(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, list):
+        parts = [_extract_text(item).strip() for item in payload]
+        return "\n".join(part for part in parts if part)
+    if isinstance(payload, dict):
+        for key in ("result", "content", "text", "message", "completion"):
+            value = payload.get(key)
+            if value:
+                return _extract_text(value)
+        if payload.get("type") == "text":
+            return str(payload.get("text") or "")
+        if isinstance(payload.get("content"), list):
+            return _extract_text(payload["content"])
+    return ""
+
+
+def _extract_token_count(payload: Any) -> int | None:
+    usage = _find_usage_dict(payload)
+    if not usage:
+        return None
+    total = usage.get("total_tokens")
+    if isinstance(total, int):
+        return total
+    prompt_tokens = usage.get("input_tokens")
+    completion_tokens = usage.get("output_tokens")
+    if isinstance(prompt_tokens, int) or isinstance(completion_tokens, int):
+        return int(prompt_tokens or 0) + int(completion_tokens or 0)
+    return None
+
+
+def _find_usage_dict(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            return usage
+        for value in payload.values():
+            nested = _find_usage_dict(value)
+            if nested:
+                return nested
+    elif isinstance(payload, list):
+        for item in payload:
+            nested = _find_usage_dict(item)
+            if nested:
+                return nested
+    return None
+
+
+def _count_tool_calls(payload: Any) -> int | None:
+    count = _count_tool_calls_inner(payload)
+    return count or None
+
+
+def _count_tool_calls_inner(payload: Any) -> int:
+    if isinstance(payload, list):
+        return sum(_count_tool_calls_inner(item) for item in payload)
+    if not isinstance(payload, dict):
+        return 0
+
+    count = 0
+    entry_type = payload.get("type")
+    if entry_type in {"tool_call", "tool_use"}:
+        count += 1
+    tool_calls = payload.get("tool_calls")
+    if isinstance(tool_calls, list):
+        count += len(tool_calls)
+    for value in payload.values():
+        count += _count_tool_calls_inner(value)
+    return count
+
+
+def _resolve_exit_reason(result) -> str:
+    if result.timed_out:
+        return TIME_LIMIT_EXIT_REASON
+    if result.budget_exceeded_reason:
+        return result.budget_exceeded_reason
+    if result.returncode == 0:
+        return COMPLETED_EXIT_REASON
+    return SOLVER_ERROR_EXIT_REASON

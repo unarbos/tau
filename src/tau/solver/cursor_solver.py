@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from config import RunConfig
-from solver_runner import build_solver_prompt
 from task_generation import GeneratedTask
 from tau.solver import (
     COMPLETED_EXIT_REASON,
@@ -21,6 +20,7 @@ from tau.solver import (
     TIME_LIMIT_EXIT_REASON,
 )
 from tau.solver.base import Solver, SolveRequest, SolveResult
+from tau.solver.utils import build_solver_prompt
 from tau.solver.utils_docker import (
     _CONTAINER_REPO_DIR,
     _apply_patch_to_repo,
