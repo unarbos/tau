@@ -1,13 +1,15 @@
 from .base import (
+    Solver,
+    SolveRequest,
+    SolveResult,
+)
+from .constants import (
     COMPLETED_EXIT_REASON,
     PROVIDER_ACCOUNT_ERROR_EXIT_REASON,
     PROVIDER_ENDPOINT_ERROR_EXIT_REASON,
     SANDBOX_VIOLATION_EXIT_REASON,
     SOLVER_ERROR_EXIT_REASON,
     TIME_LIMIT_EXIT_REASON,
-    ProxyRequestRecord,
-    SolveResult,
-    SolveUsageSummary,
 )
 
 __all__ = [
@@ -17,7 +19,7 @@ __all__ = [
     "SANDBOX_VIOLATION_EXIT_REASON",
     "SOLVER_ERROR_EXIT_REASON",
     "TIME_LIMIT_EXIT_REASON",
-    "ProxyRequestRecord",
+    "SolveRequest",
     "SolveResult",
-    "SolveUsageSummary",
+    "Solver",
 ]

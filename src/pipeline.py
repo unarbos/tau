@@ -9,13 +9,16 @@ from pathlib import Path
 
 from compare import compare_solution_repos
 from config import RunConfig
-from cursor_runner import solve_task_with_cursor_in_docker
-from docker_solver import solve_task_in_docker
 from eval import evaluate_candidate_pair
 from github_miner import GitHubMiner, GitHubTokenRotator
-from solver_runner import solve_task, solve_task_claw
 from task_generation import generate_task_description
+from tau.solver import Solver, SolveRequest, SolveResult
+from tau.solver.claude_solver import ClaudeSolver
+from tau.solver.claw_solver import ClawSolver
+from tau.solver.cursor_solver import CursorSolver
+from tau.solver.docker_solver import DockerSolver
 from workspace import (
+    SolutionPaths,
     delete_all_task_workspaces,
     delete_task_workspace,
     derive_compare_name,
@@ -143,52 +146,18 @@ def generate_task_run(*, task_name: str, config: RunConfig) -> GenerateStageResu
     )
 
 
-def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> SolveStageResult:
-    _setup_logging(debug=config.debug)
-    task_paths = resolve_task_paths(config.tasks_root, task_name)
-    candidate = load_commit_candidate(task_paths)
-    task = load_generated_task(task_paths)
-    solution_paths = prepare_solution_workspace(task_paths, solution_name)
-
+def _choose_solver(config: RunConfig) -> Solver:
     if config.use_docker_solver:
-        solve_result = solve_task_in_docker(
-            repo_dir=solution_paths.repo_dir,
-            task=task,
-            model=config.solver_model,
-            timeout=config.agent_timeout,
-            config=config,
-            run_label=f"{task_name}-{solution_name}",
-            task_name=task_name,
-            solution_name=solution_name,
-            repo_full_name=candidate.repo_full_name,
-            commit_sha=candidate.commit_sha,
-        )
+        return DockerSolver(model=config.solver_model, timeout=config.agent_timeout, config=config)
     elif config.use_claw_solver:
-        solve_result = solve_task_claw(
-            repo_dir=solution_paths.repo_dir,
-            task=task,
-            model=config.solver_model,
-            timeout=config.agent_timeout,
-            config=config,
-        )
+        return ClawSolver(model=config.solver_model, timeout=config.agent_timeout, config=config)
     elif config.use_cursor_solver:
-        solve_result = solve_task_with_cursor_in_docker(
-            repo_dir=solution_paths.repo_dir,
-            task=task,
-            model=config.solver_model,
-            timeout=config.agent_timeout,
-            config=config,
-            run_label=f"{task_name}-{solution_name}",
-        )
+        return CursorSolver(model=config.solver_model, timeout=config.agent_timeout, config=config)
     else:
-        solve_result = solve_task(
-            repo_dir=solution_paths.repo_dir,
-            task=task,
-            model=config.solver_model,
-            timeout=config.agent_timeout,
-            config=config,
-        )
+        return ClaudeSolver(model=config.solver_model, timeout=config.agent_timeout, config=config)
 
+
+def _write_solve_result(*, solution_paths: SolutionPaths, solve_request: SolveRequest, solve_result: SolveResult, config: RunConfig) -> None:
     solution_paths.solution_diff_path.write_text(solve_result.solution_diff + "\n")
     if solve_result.rollout_output:
         solution_paths.rollout_jsonl_path.write_text(solve_result.rollout_output.rstrip("\n") + "\n")
@@ -198,10 +167,10 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
         solution_paths.solve_json_path,
         {
             "stage": "solve",
-            "task_name": task_name,
-            "solution_name": solution_name,
-            "repo_full_name": candidate.repo_full_name,
-            "commit_sha": candidate.commit_sha,
+            "task_name": solve_request.task_name,
+            "solution_name": solve_request.solution_name,
+            "repo_full_name": solve_request.repo_full_name,
+            "commit_sha": solve_request.commit_sha,
             "agent": _solve_agent_label(config),
             "agent_source": agent_source.to_dict() if agent_source else None,
             "agent_file_sha256": agent_file_sha256,
@@ -215,6 +184,37 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             "result": solve_result.to_dict(),
         },
     )
+
+
+def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> SolveStageResult:
+    _setup_logging(debug=config.debug)
+
+    task_paths = resolve_task_paths(config.tasks_root, task_name)
+    candidate = load_commit_candidate(task_paths)
+    task = load_generated_task(task_paths)
+    solution_paths = prepare_solution_workspace(task_paths, solution_name)
+
+    solver = _choose_solver(config)
+
+    solve_request = SolveRequest(
+        repo_dir=solution_paths.repo_dir,
+        task=task,
+        task_name=task_name,
+        solution_name=solution_name,
+        repo_full_name=candidate.repo_full_name,
+        commit_sha=candidate.commit_sha,
+        run_label=f"{task_name}-{solution_name}",
+    )
+
+    solve_result = solver.solve(solve_request)
+
+    _write_solve_result(
+        solution_paths=solution_paths,
+        solve_request=solve_request,
+        solve_result=solve_result,
+        config=config,
+    )
+
     return SolveStageResult(
         task_name=task_name,
         solution_name=solution_name,

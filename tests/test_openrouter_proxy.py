@@ -10,7 +10,7 @@ from docker_solver import (
     _resolve_exit_reason,
 )
 from openrouter_proxy import OpenRouterProxy, _upstream_base_url
-from solver_runner import COMPLETED_EXIT_REASON, PROVIDER_ACCOUNT_ERROR_EXIT_REASON
+from tau.solver import COMPLETED_EXIT_REASON, PROVIDER_ACCOUNT_ERROR_EXIT_REASON
 
 
 class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
