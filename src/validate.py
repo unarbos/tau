@@ -43,11 +43,11 @@ from r2 import (
     publish_round_data,
     publish_training_data,
 )
-from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
 from tau import bittensor as bt
 from tau.io.github import GitHubAuthRotatingClient, GitHubClient
 from tau.io.openrouter import CacheMissError
 from tau.rollouts.store import update_rollout
+from tau.solver import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
 from workspace import (
     build_compare_paths,
     build_solution_paths,
