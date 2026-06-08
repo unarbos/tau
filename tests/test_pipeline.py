@@ -8,7 +8,7 @@ from pathlib import Path
 
 from config import SolverAgentSource
 from cli import _resolve_agent_source
-from docker_solver import _harness_runner_script, _materialize_agent_source
+from tau.solver.docker_solver import _harness_runner_script, _materialize_agent_source
 from pipeline import _solver_agent_file_path, _solver_agent_file_sha256
 
 

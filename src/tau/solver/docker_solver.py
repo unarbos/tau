@@ -277,7 +277,7 @@ def solve_task_in_docker(
                         solution_diff = _redact_sensitive_text(solution_diff, sensitive_values)
                         _kill_container(container_id)
                         container_force_killed = True
-                        _apply_patch_to_repo(repo_dir=repo_dir, patch_text=solution_diff)
+                        _apply_patch_to_repo(repo_dir=repo_dir, patch_text=solution_diff or "")
             finally:
                 if container_id is not None:
                     if not container_force_killed:
@@ -334,9 +334,9 @@ def solve_task_in_docker(
     return SolveResult(
         success=success,
         elapsed_seconds=elapsed,
-        raw_output=_redact_sensitive_text(_build_solver_raw_output(solver_run), sensitive_values),
+        raw_output=_redact_sensitive_text(_build_solver_raw_output(solver_run), sensitive_values) or "",
         model=model,
-        solution_diff=solution_diff,
+        solution_diff=solution_diff or "",
         exit_reason=exit_reason,
         usage_summary=usage_summary,
         request_count=usage_summary.request_count,

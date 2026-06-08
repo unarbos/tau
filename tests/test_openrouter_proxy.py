@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from docker_solver import (
+from tau.solver.docker_solver import (
     _DockerSolverCommandResult,
     _proxy_request_is_provider_account_error,
     _proxy_request_is_provider_endpoint_error,

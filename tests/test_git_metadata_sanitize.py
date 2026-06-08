@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from docker_solver import _git_metadata_sanitize_script
+from tau.solver.utils_docker import _git_metadata_sanitize_script
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import docker_solver
+import tau.solver.docker_solver as docker_solver
 from tau.rollouts.export_dpo import dpo_row
 from tau.rollouts.export_grpo import grpo_row
 from tau.rollouts.export_hf import (
