@@ -12,7 +12,16 @@ from pathlib import Path
 from typing import Any
 
 from config import RunConfig
-from docker_solver import (
+from solver_runner import build_solver_prompt
+from task_generation import GeneratedTask
+from tau.solver import (
+    COMPLETED_EXIT_REASON,
+    SANDBOX_VIOLATION_EXIT_REASON,
+    SOLVER_ERROR_EXIT_REASON,
+    TIME_LIMIT_EXIT_REASON,
+    SolveResult,
+)
+from tau.solver.utils_docker import (
     _CONTAINER_REPO_DIR,
     _apply_patch_to_repo,
     _collect_repo_patch_from_container,
@@ -25,15 +34,6 @@ from docker_solver import (
     _run,
     _sanitize_repo_git_metadata_in_container,
     _write_text_to_container,
-)
-from solver_runner import build_solver_prompt
-from task_generation import GeneratedTask
-from tau.solver import (
-    COMPLETED_EXIT_REASON,
-    SANDBOX_VIOLATION_EXIT_REASON,
-    SOLVER_ERROR_EXIT_REASON,
-    TIME_LIMIT_EXIT_REASON,
-    SolveResult,
 )
 from workspace import git_diff
 

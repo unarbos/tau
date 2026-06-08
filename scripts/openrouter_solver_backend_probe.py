@@ -15,7 +15,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from config import RunConfig  # noqa: E402
-from docker_solver import _solver_model_id, _solver_provider_preferences  # noqa: E402
+from tau.solver.docker_solver import _solver_model_id, _solver_provider_preferences  # noqa: E402
 from tau.io.openrouter import normalize_base_url  # noqa: E402
 from openrouter_proxy import (  # noqa: E402
     _MINER_CONTROLLED_SAMPLING_PARAMS,
