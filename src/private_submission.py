@@ -13,6 +13,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from submission_bundle import (
+    DEFAULT_ENTRYPOINT,
+    build_manifest,
+    bundle_entrypoint_path,
+    bundle_signature_payload,
+    changed_file_statuses,
+    entrypoint_sha256,
+    is_multi_file_bundle,
+    load_bundle_directory,
+    unified_bundle_diff,
+    write_bundle_directory,
+)
+
 DEFAULT_OPENROUTER_MIN_SCORE = 65
 PRIVATE_SUBMISSION_ACCEPTANCE_LEDGER = "_accepted_submissions.json"
 PRIVATE_SUBMISSION_QUEUE_WAKEUP = "_queue_wakeup"
@@ -113,13 +126,26 @@ class PrivateSubmissionCheckResult:
     accepted: bool
     agent_sha256: str
     checks: dict[str, SubmissionCheck]
+    bundle_sha256: str | None = None
+    signature_version: str = "v1"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "accepted": self.accepted,
             "agent_sha256": self.agent_sha256,
             "checks": {key: value.to_dict() for key, value in self.checks.items()},
+            "signature_version": self.signature_version,
         }
+        if self.bundle_sha256 is not None:
+            payload["bundle_sha256"] = self.bundle_sha256
+        return payload
+
+
+def submission_content_sha256(payload: dict[str, Any]) -> str:
+    bundle_sha = str(payload.get("bundle_sha256") or "").lower()
+    if bundle_sha:
+        return bundle_sha
+    return str(payload.get("agent_sha256") or "").lower()
 
 
 JudgeFn = Callable[[dict[str, Any]], dict[str, Any]]
@@ -156,7 +182,123 @@ def run_private_submission_checks(
             summary=f"Skipped because {failed} failed.",
         )
     accepted = all(check.status == "passed" for check in checks.values())
-    return PrivateSubmissionCheckResult(accepted=accepted, agent_sha256=agent_sha, checks=checks)
+    return PrivateSubmissionCheckResult(
+        accepted=accepted,
+        agent_sha256=agent_sha,
+        checks=checks,
+        signature_version="v1",
+    )
+
+
+def run_private_bundle_submission_checks(
+    *,
+    hotkey: str,
+    submitted_files: dict[str, bytes],
+    base_files: dict[str, bytes],
+    openrouter_judge: JudgeFn | None = None,
+    min_score: int = DEFAULT_OPENROUTER_MIN_SCORE,
+) -> PrivateSubmissionCheckResult:
+    agent_sha = entrypoint_sha256(submitted_files)
+    patch = unified_bundle_diff(base_files=base_files, submitted_files=submitted_files)
+    submitted_agent_py = submitted_files[DEFAULT_ENTRYPOINT].decode("utf-8", errors="replace")
+    base_agent_py = base_files.get(DEFAULT_ENTRYPOINT, b"").decode("utf-8", errors="replace")
+    smoke = run_bundle_smoke_checks(files=submitted_files)
+    scope_guard = run_bundle_scope_guard(
+        hotkey=hotkey,
+        submitted_files=submitted_files,
+        base_files=base_files,
+        patch=patch,
+    )
+    checks = {"agent_smoke": smoke, "scope_guard": scope_guard}
+    if smoke.status == "passed" and scope_guard.status == "passed":
+        checks["openrouter_judge"] = run_openrouter_judge_gate(
+            hotkey=hotkey,
+            base_agent_py=base_agent_py,
+            submitted_agent_py=submitted_agent_py,
+            patch=patch,
+            judge=openrouter_judge,
+            min_score=min_score,
+            changed_files=changed_file_statuses(base_files=base_files, submitted_files=submitted_files),
+        )
+    else:
+        failed = "agent smoke" if smoke.status != "passed" else "scope guard"
+        checks["openrouter_judge"] = SubmissionCheck(
+            name="OpenRouter Submission Judge",
+            status="skipped",
+            summary=f"Skipped because {failed} failed.",
+        )
+    accepted = all(check.status == "passed" for check in checks.values())
+    manifest = build_manifest(files=submitted_files)
+    return PrivateSubmissionCheckResult(
+        accepted=accepted,
+        agent_sha256=agent_sha,
+        bundle_sha256=manifest.bundle_sha256,
+        signature_version="v2",
+        checks=checks,
+    )
+
+
+def run_bundle_smoke_checks(*, files: dict[str, bytes]) -> SubmissionCheck:
+    findings: list[str] = []
+    for path in sorted(files):
+        text = files[path].decode("utf-8", errors="replace")
+        result = run_agent_smoke_checks(agent_py=text)
+        if result.status != "passed":
+            findings.extend(f"{path}: {item}" for item in result.findings)
+    findings = _dedupe(findings)
+    if findings:
+        return SubmissionCheck(
+            name="Agent Smoke",
+            status="failed",
+            summary="One or more bundle files failed local smoke checks.",
+            findings=findings,
+        )
+    return SubmissionCheck(
+        name="Agent Smoke",
+        status="passed",
+        summary="All bundle Python files compile and have no new pyflakes findings.",
+    )
+
+
+def run_bundle_scope_guard(
+    *,
+    hotkey: str,
+    submitted_files: dict[str, bytes],
+    base_files: dict[str, bytes],
+    patch: str,
+) -> SubmissionCheck:
+    findings: list[str] = []
+    findings.extend(_agent_patch_violations(patch))
+    allowed_local_modules = frozenset(Path(path).stem for path in submitted_files)
+    for path, content in sorted(submitted_files.items()):
+        text = content.decode("utf-8", errors="replace")
+        if path == DEFAULT_ENTRYPOINT:
+            findings.extend(_agent_source_violations(text, allowed_local_modules=allowed_local_modules))
+        else:
+            findings.extend(
+                f"{path}: {item}"
+                for item in _module_source_violations(
+                    text,
+                    filename=path,
+                    require_solve_contract=False,
+                    allowed_local_modules=allowed_local_modules,
+                )
+            )
+    if DEFAULT_ENTRYPOINT not in submitted_files:
+        findings.append(f"bundle must include `{DEFAULT_ENTRYPOINT}`.")
+    findings = _dedupe(findings)
+    if findings:
+        return SubmissionCheck(
+            name="Submission Scope Guard",
+            status="failed",
+            summary="bundle failed the local submission contract checks.",
+            findings=findings,
+        )
+    return SubmissionCheck(
+        name="Submission Scope Guard",
+        status="passed",
+        summary="bundle satisfies the local submission contract checks.",
+    )
 
 
 def run_agent_smoke_checks(*, agent_py: str) -> SubmissionCheck:
@@ -218,6 +360,7 @@ def run_openrouter_judge_gate(
     patch: str,
     judge: JudgeFn | None,
     min_score: int,
+    changed_files: list[dict[str, str]] | None = None,
 ) -> SubmissionCheck:
     if judge is None:
         return SubmissionCheck(
@@ -228,12 +371,12 @@ def run_openrouter_judge_gate(
     payload = {
         "hotkey": hotkey,
         "title": f"{hotkey} private submission",
-        "changed_files": [{"filename": "agent.py", "status": "modified"}],
+        "changed_files": changed_files or [{"filename": "agent.py", "status": "modified"}],
         "static_findings": {
             "fail_reasons": [],
             "warnings": [],
             "findings": [],
-            "changed_files": ["agent.py"],
+            "changed_files": [item["filename"] for item in (changed_files or [{"filename": "agent.py"}])],
         },
         "patch": patch,
         "base_agent_py": base_agent_py,
@@ -379,8 +522,85 @@ def write_private_submission_bundle(
         raise FileExistsError(f"private submission already exists: {submission_id}")
     target.mkdir(parents=True, exist_ok=True)
     (target / "agent.py").write_text(agent_py, encoding="utf-8")
+    _write_check_result_json(
+        target=target,
+        submission_id=submission_id,
+        hotkey=hotkey,
+        check_result=check_result,
+        signature=signature,
+        registration_block=registration_block,
+        agent_username=agent_username,
+        coldkey=coldkey,
+        coldkey_signature=coldkey_signature,
+    )
+    return target
+
+
+def write_private_multi_file_submission_bundle(
+    *,
+    root: Path,
+    submission_id: str,
+    hotkey: str,
+    bundle_files: dict[str, bytes],
+    check_result: PrivateSubmissionCheckResult,
+    signature: str,
+    registration_block: int | None = None,
+    agent_username: str | None = None,
+    coldkey: str | None = None,
+    coldkey_signature: str | None = None,
+    overwrite: bool = False,
+) -> Path:
+    if not valid_submission_id(submission_id):
+        raise ValueError("submission_id must contain only letters, numbers, '.', '_' or '-'")
+    target = root / submission_id
+    if target.exists() and not overwrite:
+        raise FileExistsError(f"private submission already exists: {submission_id}")
+    bundle_target, _manifest = write_bundle_directory(
+        root=root,
+        submission_id=submission_id,
+        files=bundle_files,
+    )
+    _write_check_result_json(
+        target=bundle_target,
+        submission_id=submission_id,
+        hotkey=hotkey,
+        check_result=check_result,
+        signature=signature,
+        registration_block=registration_block,
+        agent_username=agent_username,
+        coldkey=coldkey,
+        coldkey_signature=coldkey_signature,
+    )
+    return bundle_target
+
+
+def _write_check_result_json(
+    *,
+    target: Path,
+    submission_id: str,
+    hotkey: str,
+    check_result: PrivateSubmissionCheckResult,
+    signature: str,
+    registration_block: int | None,
+    agent_username: str | None,
+    coldkey: str | None,
+    coldkey_signature: str | None,
+) -> None:
     check_payload = check_result.to_dict()
     ci_checks = check_payload["checks"]
+    content_sha = check_result.bundle_sha256 or check_result.agent_sha256
+    if check_result.signature_version == "v2" and check_result.bundle_sha256:
+        signature_payload = bundle_signature_payload(
+            hotkey=hotkey,
+            submission_id=submission_id,
+            bundle_sha256=check_result.bundle_sha256,
+        )
+    else:
+        signature_payload = private_submission_signature_payload(
+            hotkey=hotkey,
+            submission_id=submission_id,
+            agent_sha256=check_result.agent_sha256,
+        )
     (target / "check_result.json").write_text(
         json.dumps(
             _compact_none(
@@ -389,16 +609,14 @@ def write_private_submission_bundle(
                     "hotkey": hotkey,
                     "registration_block": registration_block,
                     "signature": signature,
+                    "signature_version": check_result.signature_version,
+                    "content_sha256": content_sha.lower(),
                     **_verified_identity_metadata(
                         agent_username=agent_username,
                         coldkey=coldkey,
                         coldkey_signature=coldkey_signature,
                     ),
-                    "signature_payload": private_submission_signature_payload(
-                        hotkey=hotkey,
-                        submission_id=submission_id,
-                        agent_sha256=check_result.agent_sha256,
-                    ).decode("utf-8"),
+                    "signature_payload": signature_payload.decode("utf-8"),
                     **check_payload,
                     "ci_checks": ci_checks,
                     "llm_judge": ci_checks.get("openrouter_judge"),
@@ -410,7 +628,6 @@ def write_private_submission_bundle(
         + "\n",
         encoding="utf-8",
     )
-    return target
 
 
 def private_submission_registration_check(
@@ -505,6 +722,7 @@ def record_private_submission_acceptance(
     agent_username: str | None = None,
     coldkey: str | None = None,
     coldkey_signature: str | None = None,
+    bundle_sha256: str | None = None,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
     ledger = _read_acceptance_ledger(root)
@@ -512,10 +730,11 @@ def record_private_submission_acceptance(
     hotkeys = ledger.setdefault("hotkeys", {})
     if not isinstance(hotkeys, dict):
         raise ValueError("private submission acceptance ledger has invalid `hotkeys`")
+    content_sha = (bundle_sha256 or agent_sha256).lower()
     hotkeys[hotkey] = {
         "registration_block": int(registration_block),
         "submission_id": submission_id,
-        "agent_sha256": agent_sha256.lower(),
+        "agent_sha256": content_sha,
         "accepted_at": datetime.now(UTC).isoformat(),
         **_verified_identity_metadata(
             agent_username=agent_username,
@@ -523,6 +742,9 @@ def record_private_submission_acceptance(
             coldkey_signature=coldkey_signature,
         ),
     }
+    if bundle_sha256:
+        hotkeys[hotkey]["bundle_sha256"] = bundle_sha256.lower()
+        hotkeys[hotkey]["entrypoint_sha256"] = agent_sha256.lower()
     _write_acceptance_ledger(root, ledger)
     touch_private_submission_queue_wakeup(root=root)
 
@@ -636,6 +858,8 @@ def accepted_private_submission_entries(*, root: Path) -> list[dict[str, Any]]:
                 "hotkey": str(hotkey),
                 "submission_id": str(entry.get("submission_id") or ""),
                 "agent_sha256": str(entry.get("agent_sha256") or "").lower(),
+                "bundle_sha256": str(entry.get("bundle_sha256") or "").lower() or None,
+                "entrypoint_sha256": str(entry.get("entrypoint_sha256") or "").lower() or None,
                 "registration_block": _optional_int(entry.get("registration_block")),
                 "accepted_at": entry.get("accepted_at"),
                 "agent_username": entry.get("agent_username") or entry.get("username"),
@@ -655,16 +879,18 @@ def _public_submission_from_ledger_entry(
     entry: dict[str, Any],
 ) -> dict[str, Any] | None:
     submission_id = str(entry.get("submission_id") or "")
-    agent_sha256 = str(entry.get("agent_sha256") or "").lower()
+    content_sha256 = str(entry.get("bundle_sha256") or entry.get("agent_sha256") or "").lower()
+    entrypoint_sha256 = str(entry.get("entrypoint_sha256") or entry.get("agent_sha256") or "").lower()
     check_result = _read_bundle_check_result(root=root, submission_id=submission_id)
-    if not submission_id or not agent_sha256:
+    if not submission_id or not content_sha256:
         return None
     return _compact_none(
         {
             "submission_id": submission_id,
             "hotkey": hotkey,
-            "agent_sha256": agent_sha256,
-            "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+            "agent_sha256": entrypoint_sha256,
+            "bundle_sha256": str(entry.get("bundle_sha256") or "").lower() or None,
+            "commitment": f"private-submission:{submission_id}:{content_sha256}",
             "registration_block": _optional_int(entry.get("registration_block")),
             "accepted_at": entry.get("accepted_at"),
             **_public_identity_metadata(entry),
@@ -770,29 +996,54 @@ def private_submission_check_passed(
     signature_verifier: SignatureVerifier,
 ) -> bool:
     bundle = root / submission_id
-    agent_path = bundle / "agent.py"
     result_path = bundle / "check_result.json"
-    if not agent_path.is_file() or not result_path.is_file():
-        return False
-    actual_sha = hashlib.sha256(agent_path.read_bytes()).hexdigest()
-    if actual_sha.lower() != expected_sha256.lower():
+    if not result_path.is_file():
         return False
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    if not bool(result.get("accepted")) or str(result.get("agent_sha256", "")).lower() != actual_sha:
+    if not bool(result.get("accepted")):
         return False
     if str(result.get("hotkey") or "") != str(hotkey):
         return False
+
+    if is_multi_file_bundle(bundle):
+        try:
+            manifest, _files = load_bundle_directory(bundle)
+        except (OSError, ValueError):
+            return False
+        actual_sha = manifest.bundle_sha256.lower()
+        stored_sha = str(result.get("bundle_sha256") or result.get("content_sha256") or "").lower()
+    else:
+        agent_path = bundle / "agent.py"
+        if not agent_path.is_file():
+            return False
+        actual_sha = hashlib.sha256(agent_path.read_bytes()).hexdigest().lower()
+        stored_sha = str(result.get("agent_sha256") or result.get("content_sha256") or "").lower()
+
+    if actual_sha != expected_sha256.lower() or stored_sha != actual_sha:
+        return False
+
     signature = str(result.get("signature") or "").strip()
     if not signature:
         return False
-    payload = private_submission_signature_payload(
-        hotkey=hotkey,
-        submission_id=submission_id,
-        agent_sha256=actual_sha,
-    )
+    signature_payload = str(result.get("signature_payload") or "").strip()
+    if not signature_payload:
+        if is_multi_file_bundle(bundle):
+            payload = bundle_signature_payload(
+                hotkey=hotkey,
+                submission_id=submission_id,
+                bundle_sha256=actual_sha,
+            )
+        else:
+            payload = private_submission_signature_payload(
+                hotkey=hotkey,
+                submission_id=submission_id,
+                agent_sha256=actual_sha,
+            )
+    else:
+        payload = signature_payload.encode("utf-8")
     return bool(signature_verifier(hotkey, payload, signature))
 
 
@@ -871,25 +1122,45 @@ def _pyflakes_findings(source: str) -> list[str]:
     ]
 
 
-def _agent_source_violations(source: str) -> list[str]:
+def _agent_source_violations(
+    source: str,
+    *,
+    allowed_local_modules: frozenset[str] = frozenset(),
+) -> list[str]:
+    return _module_source_violations(
+        source,
+        filename="agent.py",
+        require_solve_contract=True,
+        allowed_local_modules=allowed_local_modules,
+    )
+
+
+def _module_source_violations(
+    source: str,
+    *,
+    filename: str,
+    require_solve_contract: bool,
+    allowed_local_modules: frozenset[str] = frozenset(),
+) -> list[str]:
     try:
-        tree = ast.parse(source, filename="agent.py")
+        tree = ast.parse(source, filename=filename)
     except SyntaxError as exc:
-        return [f"agent.py must remain valid Python: {exc.msg} at line {exc.lineno}."]
+        return [f"{filename} must remain valid Python: {exc.msg} at line {exc.lineno}."]
 
     violations: list[str] = []
-    solve = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "solve"), None)
-    if solve is None:
-        violations.append("agent.py must define solve(...).")
-    else:
-        args = [arg.arg for arg in [*solve.args.posonlyargs, *solve.args.args]]
-        if tuple(args[: len(REQUIRED_SOLVE_ARGS)]) != REQUIRED_SOLVE_ARGS:
-            violations.append(
-                "solve() must keep leading arguments: " + ", ".join(REQUIRED_SOLVE_ARGS) + "."
-            )
-        sampling_args = sorted(name for name in args if name in FORBIDDEN_SAMPLING_NAMES)
-        if sampling_args:
-            violations.append("solve() must not expose sampling parameter(s): " + ", ".join(sampling_args) + ".")
+    if require_solve_contract:
+        solve = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "solve"), None)
+        if solve is None:
+            violations.append(f"{filename} must define solve(...).")
+        else:
+            args = [arg.arg for arg in [*solve.args.posonlyargs, *solve.args.args]]
+            if tuple(args[: len(REQUIRED_SOLVE_ARGS)]) != REQUIRED_SOLVE_ARGS:
+                violations.append(
+                    "solve() must keep leading arguments: " + ", ".join(REQUIRED_SOLVE_ARGS) + "."
+                )
+            sampling_args = sorted(name for name in args if name in FORBIDDEN_SAMPLING_NAMES)
+            if sampling_args:
+                violations.append("solve() must not expose sampling parameter(s): " + ", ".join(sampling_args) + ".")
 
     stdlib = set(getattr(__import__("sys"), "stdlib_module_names", ()))
     stdlib.update({"__future__"})
@@ -907,7 +1178,7 @@ def _agent_source_violations(source: str) -> list[str]:
             for key in node.keys:
                 if getattr(key, "value", None) in FORBIDDEN_SAMPLING_NAMES:
                     violations.append(
-                        f"agent.py must not set sampling request field `{key.value}`; validator proxy owns sampling."
+                        f"{filename} must not set sampling request field `{key.value}`; validator proxy owns sampling."
                     )
         roots: list[str] = []
         if isinstance(node, ast.Import):
@@ -915,8 +1186,8 @@ def _agent_source_violations(source: str) -> list[str]:
         elif isinstance(node, ast.ImportFrom):
             roots = [str(node.module or "").split(".", 1)[0]]
         for root in roots:
-            if root and root not in stdlib:
-                violations.append(f"agent.py imports non-stdlib module `{root}`.")
+            if root and root not in stdlib and root not in allowed_local_modules:
+                violations.append(f"{filename} imports non-stdlib module `{root}`.")
     return violations
 
 

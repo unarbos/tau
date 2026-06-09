@@ -411,12 +411,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     private_submit = subparsers.add_parser(
         "private-submit",
-        help="Validate and store a signed private miner agent.py submission bundle.",
+        help="Validate and store a signed private miner submission bundle.",
     )
     _add_shared_args(private_submit)
     private_submit.add_argument("--hotkey", required=True, help="Miner hotkey that signed this submission.")
-    private_submit.add_argument("--agent", required=True, type=Path, help="Private submitted agent.py file.")
-    private_submit.add_argument("--base-agent", required=True, type=Path, help="Current public base agent.py to diff against.")
+    source_group = private_submit.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--agent", type=Path, help="Private submitted agent.py file (v1).")
+    source_group.add_argument("--bundle", type=Path, help="Private submitted harness directory (v2).")
+    source_group.add_argument("--archive", type=Path, help="Private submitted harness archive .tar.gz or .zip (v2).")
+    private_submit.add_argument(
+        "--base-agent",
+        type=Path,
+        help="Current public base agent.py to diff against for v1 submissions. Defaults to ../ninja/agent.py.",
+    )
+    private_submit.add_argument(
+        "--base-harness-repo",
+        type=Path,
+        help="Local ninja repo used as the v2 base harness tree. Defaults to ../ninja.",
+    )
+    private_submit.add_argument("--base-harness-ref", default="main", help="Git ref for --base-harness-repo.")
     private_submit.add_argument("--signature", required=True, help="Hotkey signature over the printed signature payload.")
     private_submit.add_argument("--agent-username", help="Optional agent username signed by the owning coldkey.")
     private_submit.add_argument("--coldkey", help="Coldkey that owns the submitting hotkey.")
@@ -446,10 +459,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shared_args(serve_submissions_api)
     serve_submissions_api.add_argument("--host", default="127.0.0.1", help="Host to bind.")
     serve_submissions_api.add_argument("--port", type=int, default=8066, help="Port to bind.")
-    serve_submissions_api.add_argument("--base-agent", required=True, type=Path, help="Current public base agent.py.")
-    serve_submissions_api.add_argument("--base-agent-git-repo", type=Path, help="Fetch base agent.py from this repo before judging.")
+    serve_submissions_api.add_argument(
+        "--base-agent",
+        type=Path,
+        help="Current public base agent.py for v1 diffs. Defaults to ../ninja/agent.py.",
+    )
+    serve_submissions_api.add_argument("--base-agent-git-repo", type=Path, help="Fetch base agent.py from this repo before judging v1 submissions.")
     serve_submissions_api.add_argument("--base-agent-git-ref", default="main", help="Remote branch/ref to fetch for --base-agent-git-repo.")
     serve_submissions_api.add_argument("--base-agent-git-path", default="agent.py", help="Path to agent.py inside --base-agent-git-ref.")
+    serve_submissions_api.add_argument(
+        "--base-harness-git-repo",
+        type=Path,
+        help="Fetch the v2 base harness tree from this repo before judging multi-file submissions. Defaults to ../ninja.",
+    )
+    serve_submissions_api.add_argument("--base-harness-git-ref", default="main", help="Remote branch/ref for --base-harness-git-repo.")
     serve_submissions_api.add_argument("--private-submission-root", type=Path, help="Directory where private bundles are stored.")
     serve_submissions_api.add_argument("--netuid", type=int, default=66, help="Subnet netuid.")
     serve_submissions_api.add_argument("--network", help="Optional Bittensor network name or websocket endpoint.")
@@ -463,6 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_submissions_api.add_argument("--judge-min-score", type=int, default=65, help="Minimum OpenRouter judge score required.")
     serve_submissions_api.add_argument("--max-request-bytes", type=int, default=5_000_000, help="Maximum POST body size.")
     serve_submissions_api.add_argument("--max-agent-bytes", type=int, default=5_000_000, help="Maximum submitted agent.py size.")
+    serve_submissions_api.add_argument("--max-bundle-bytes", type=int, default=5_000_000, help="Maximum uncompressed multi-file bundle size.")
     serve_submissions_api.add_argument("--rate-limit-window-seconds", type=int, default=60, help="Per-IP rate-limit window.")
     serve_submissions_api.add_argument("--rate-limit-max-requests", type=int, default=6, help="Maximum submissions per IP per window.")
     serve_submissions_api.add_argument("--rate-limit-max-failures", type=int, default=3, help="Maximum failed submissions per IP per window.")
@@ -1122,6 +1146,16 @@ def _run_benchmarks(args: argparse.Namespace) -> None:
     print(report_path)
 
 
+def _default_ninja_repo_path() -> Path:
+    from submission_bundle import default_ninja_repo_path
+
+    return default_ninja_repo_path()
+
+
+def _default_base_agent_path() -> Path:
+    return _default_ninja_repo_path() / "agent.py"
+
+
 def _run_private_submit(args: argparse.Namespace) -> None:
     from private_submission import (
         SubmissionCheck,
@@ -1132,16 +1166,43 @@ def _run_private_submit(args: argparse.Namespace) -> None:
         private_submission_registration_check,
         registration_check_is_existing_acceptance,
         record_private_submission_acceptance,
+        run_private_bundle_submission_checks,
         run_private_submission_checks,
+        write_private_multi_file_submission_bundle,
         write_private_submission_bundle,
+    )
+    from submission_bundle import (
+        bundle_files_from_archive,
+        bundle_signature_payload,
+        canonical_bundle_sha256,
+        collect_harness_from_directory,
+        enforce_bundle_size_limit,
+        entrypoint_sha256,
+        read_harness_from_git_repo,
     )
     from validate import _verified_submission_identity_from_config, _verify_hotkey_signature
 
-    agent_py = args.agent.expanduser().read_text(encoding="utf-8")
-    agent_sha256 = hashlib.sha256(agent_py.encode("utf-8")).hexdigest()
+    is_multi_file = getattr(args, "bundle", None) is not None or getattr(args, "archive", None) is not None
+    bundle_files: dict[str, bytes] | None = None
+    agent_py: str | None = None
+    if getattr(args, "archive", None) is not None:
+        archive_bytes = args.archive.expanduser().read_bytes()
+        bundle_files = bundle_files_from_archive(archive_bytes, archive_name=args.archive.name)
+        enforce_bundle_size_limit(bundle_files)
+        agent_py = bundle_files["agent.py"].decode("utf-8", errors="replace")
+    elif getattr(args, "bundle", None) is not None:
+        bundle_files = collect_harness_from_directory(args.bundle.expanduser())
+        enforce_bundle_size_limit(bundle_files)
+        agent_py = bundle_files["agent.py"].decode("utf-8", errors="replace")
+    else:
+        agent_py = args.agent.expanduser().read_text(encoding="utf-8")
+
+    agent_sha256 = entrypoint_sha256(bundle_files) if bundle_files is not None else hashlib.sha256(agent_py.encode("utf-8")).hexdigest()
+    bundle_sha256 = canonical_bundle_sha256(bundle_files) if bundle_files is not None else None
+    content_sha256 = bundle_sha256 or agent_sha256
     submission_id = args.submission_id or derive_submission_id(
         hotkey=args.hotkey,
-        agent_sha256=agent_sha256,
+        agent_sha256=content_sha256,
     )
     root = (
         args.private_submission_root.expanduser()
@@ -1152,11 +1213,18 @@ def _run_private_submit(args: argparse.Namespace) -> None:
         ).validate_root
         / "private-submissions"
     )
-    signature_payload = private_submission_signature_payload(
-        hotkey=args.hotkey,
-        submission_id=submission_id,
-        agent_sha256=agent_sha256,
-    )
+    if is_multi_file and bundle_sha256 is not None:
+        signature_payload = bundle_signature_payload(
+            hotkey=args.hotkey,
+            submission_id=submission_id,
+            bundle_sha256=bundle_sha256,
+        )
+    else:
+        signature_payload = private_submission_signature_payload(
+            hotkey=args.hotkey,
+            submission_id=submission_id,
+            agent_sha256=agent_sha256,
+        )
     signature_valid = _verify_hotkey_signature(args.hotkey, signature_payload, args.signature)
     if not signature_valid:
         signature_check = SubmissionCheck(
@@ -1184,7 +1252,7 @@ def _run_private_submit(args: argparse.Namespace) -> None:
             root=root,
             hotkey=args.hotkey,
             submission_id=submission_id,
-            agent_sha256=agent_sha256,
+            agent_sha256=content_sha256,
             registration_block=registration_block,
         )
     else:
@@ -1235,15 +1303,28 @@ def _run_private_submit(args: argparse.Namespace) -> None:
         )
         return
 
-    base_agent_py = args.base_agent.expanduser().read_text(encoding="utf-8")
-    judge = None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args)
-    result = run_private_submission_checks(
-        hotkey=args.hotkey,
-        submitted_agent_py=agent_py,
-        base_agent_py=base_agent_py,
-        openrouter_judge=judge,
-        min_score=args.judge_min_score,
-    )
+    harness_repo = (getattr(args, "base_harness_repo", None) or _default_ninja_repo_path()).expanduser()
+    if is_multi_file:
+        base_files = read_harness_from_git_repo(repo=harness_repo, ref=args.base_harness_ref)
+        judge = None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args)
+        result = run_private_bundle_submission_checks(
+            hotkey=args.hotkey,
+            submitted_files=bundle_files or {},
+            base_files=base_files,
+            openrouter_judge=judge,
+            min_score=args.judge_min_score,
+        )
+    else:
+        base_agent_path = (args.base_agent or _default_base_agent_path()).expanduser()
+        base_agent_py = base_agent_path.read_text(encoding="utf-8")
+        judge = None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args)
+        result = run_private_submission_checks(
+            hotkey=args.hotkey,
+            submitted_agent_py=agent_py or "",
+            base_agent_py=base_agent_py,
+            openrouter_judge=judge,
+            min_score=args.judge_min_score,
+        )
     result.checks["registration_gate"] = registration_check
     result.accepted = result.accepted and registration_check.status == "passed"
     identity = (
@@ -1266,19 +1347,34 @@ def _run_private_submit(args: argparse.Namespace) -> None:
     )
     bundle_path = None
     if signature_valid and result.accepted:
-        bundle_path = write_private_submission_bundle(
-            root=root,
-            submission_id=submission_id,
-            hotkey=args.hotkey,
-            agent_py=agent_py,
-            check_result=result,
-            signature=args.signature,
-            registration_block=registration_block,
-            agent_username=identity["agent_username"] if identity else None,
-            coldkey=identity["coldkey"] if identity else None,
-            coldkey_signature=identity["coldkey_signature"] if identity else None,
-            overwrite=args.overwrite,
-        )
+        if bundle_files is not None:
+            bundle_path = write_private_multi_file_submission_bundle(
+                root=root,
+                submission_id=submission_id,
+                hotkey=args.hotkey,
+                bundle_files=bundle_files,
+                check_result=result,
+                signature=args.signature,
+                registration_block=registration_block,
+                agent_username=identity["agent_username"] if identity else None,
+                coldkey=identity["coldkey"] if identity else None,
+                coldkey_signature=identity["coldkey_signature"] if identity else None,
+                overwrite=args.overwrite,
+            )
+        else:
+            bundle_path = write_private_submission_bundle(
+                root=root,
+                submission_id=submission_id,
+                hotkey=args.hotkey,
+                agent_py=agent_py or "",
+                check_result=result,
+                signature=args.signature,
+                registration_block=registration_block,
+                agent_username=identity["agent_username"] if identity else None,
+                coldkey=identity["coldkey"] if identity else None,
+                coldkey_signature=identity["coldkey_signature"] if identity else None,
+                overwrite=args.overwrite,
+            )
         if registration_block is not None:
             record_private_submission_acceptance(
                 root=root,
@@ -1289,6 +1385,7 @@ def _run_private_submit(args: argparse.Namespace) -> None:
                 agent_username=identity["agent_username"] if identity else None,
                 coldkey=identity["coldkey"] if identity else None,
                 coldkey_signature=identity["coldkey_signature"] if identity else None,
+                bundle_sha256=result.bundle_sha256,
             )
         try:
             from r2 import publish_submissions_api_data
@@ -1303,6 +1400,7 @@ def _run_private_submit(args: argparse.Namespace) -> None:
         signature_valid=signature_valid,
         submission_id=submission_id,
         agent_sha256=result.agent_sha256,
+        bundle_sha256=result.bundle_sha256,
         signature_payload=signature_payload,
         bundle_path=bundle_path,
         uid=uid,
@@ -1328,16 +1426,18 @@ def _print_private_submit_payload(
     ci_checks: dict[str, object],
     agent_username: str | None = None,
     coldkey: str | None = None,
+    bundle_sha256: str | None = None,
     already_accepted: bool = False,
     message: str | None = None,
 ) -> dict[str, object]:
+    content_sha = bundle_sha256 or agent_sha256
     payload = {
         "accepted": accepted,
         "already_accepted": already_accepted,
         "signature_valid": signature_valid,
         "submission_id": submission_id,
         "agent_sha256": agent_sha256,
-        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+        "commitment": f"private-submission:{submission_id}:{content_sha}",
         "agent_username": agent_username,
         "coldkey": coldkey,
         "signature_payload": signature_payload.decode("utf-8"),
@@ -1350,6 +1450,11 @@ def _print_private_submit_payload(
         "llm_judge": ci_checks.get("openrouter_judge"),
         "checks": ci_checks,
     }
+    if bundle_sha256:
+        payload["bundle_sha256"] = bundle_sha256
+        payload["signature_version"] = "v2"
+    else:
+        payload["signature_version"] = "v1"
     if message is not None:
         payload["message"] = message
     print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1407,16 +1512,19 @@ def _run_serve_submissions_api(args: argparse.Namespace) -> None:
     )
     config = SubmissionApiConfig(
         private_submission_root=root,
-        base_agent=args.base_agent.expanduser(),
+        base_agent=(args.base_agent or _default_base_agent_path()).expanduser(),
         run_config=run_config,
         judge=None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args),
         judge_min_score=args.judge_min_score,
         base_agent_git_repo=args.base_agent_git_repo.expanduser() if args.base_agent_git_repo else None,
         base_agent_git_ref=args.base_agent_git_ref,
         base_agent_git_path=args.base_agent_git_path,
+        base_harness_git_repo=(args.base_harness_git_repo or _default_ninja_repo_path()).expanduser(),
+        base_harness_git_ref=args.base_harness_git_ref,
         overwrite=args.overwrite,
         max_request_bytes=args.max_request_bytes,
         max_agent_bytes=args.max_agent_bytes,
+        max_bundle_bytes=args.max_bundle_bytes,
         rate_limit_window_seconds=args.rate_limit_window_seconds,
         rate_limit_max_requests=args.rate_limit_max_requests,
         rate_limit_max_failures=args.rate_limit_max_failures,
