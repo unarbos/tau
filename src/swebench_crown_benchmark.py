@@ -16,9 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from config import RunConfig, SolverAgentSource
-from docker_solver import solve_task_in_docker
 from openrouter_proxy import SolveUsageSummary
 from task_generation import GeneratedTask
+from tau.solver.docker_solver import solve_task_in_docker
 from workspace import git_diff
 
 log = logging.getLogger("swe-eval.swebench_crown_benchmark")
