@@ -18,10 +18,10 @@ def _usage_summary_from_dict(d: dict) -> SolveUsageSummary:
     return SolveUsageSummary(**d, requests=requests)
 
 
-def _result_from_dict(d: dict) -> SolveResult:
+def _result_from_dict(d: dict, rollout_output: str | None = None) -> SolveResult:
     usage_raw = d.pop("usage_summary", None)
     usage = _usage_summary_from_dict(usage_raw) if usage_raw else None
-    return SolveResult(**d, usage_summary=usage)
+    return SolveResult(**d, usage_summary=usage, rollout_output=rollout_output)
 
 
 class CachingSolver(Solver):
@@ -53,16 +53,24 @@ class CachingSolver(Solver):
     def _cache_path(self, key: str) -> Path:
         return self._cache_dir / f"{key}.json"
 
+    def _rollout_cache_path(self, key: str) -> Path:
+        return self._cache_dir / f"{key}.jsonl"
+
     def load(self, request: SolveRequest) -> SolveResult | None:
-        path = self._cache_path(self._cache_key(request))
+        key = self._cache_key(request)
+        path = self._cache_path(key)
         if not path.exists():
             return None
-        return _result_from_dict(json.loads(path.read_text(encoding="utf-8")))
+        rollout_path = self._rollout_cache_path(key)
+        rollout_output = rollout_path.read_text(encoding="utf-8") if rollout_path.exists() else None
+        return _result_from_dict(json.loads(path.read_text(encoding="utf-8")), rollout_output)
 
     def save(self, request: SolveRequest, result: SolveResult) -> None:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        path = self._cache_path(self._cache_key(request))
-        path.write_text(json.dumps(result.to_dict()), encoding="utf-8")
+        key = self._cache_key(request)
+        self._cache_path(key).write_text(json.dumps(result.to_dict()), encoding="utf-8")
+        if result.rollout_output:
+            self._rollout_cache_path(key).write_text(result.rollout_output, encoding="utf-8")
 
     def solve(self, request: SolveRequest) -> SolveResult:
         if self._read:
