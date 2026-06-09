@@ -7,6 +7,7 @@ from pathlib import Path
 from openrouter_proxy import ProxyRequestRecord, SolveUsageSummary
 
 from .base import Solver, SolveRequest, SolveResult
+from .utils_docker import _apply_patch_to_repo
 
 
 class CacheMissError(Exception):
@@ -44,15 +45,22 @@ class CachingSolver(Solver):
         self._read = read
         self._write = write
 
+    def _agent_identity(self) -> str:
+        if self.config.solver_agent_source is not None:
+            return json.dumps(self.config.solver_agent_source.to_dict(), sort_keys=True)
+        return self.config.solve_agent or ""
+
     def _cache_key(self, request: SolveRequest) -> str:
-        parts = "|".join([
-            request.task_name or "",
-            request.solution_name or "",
-            request.commit_sha or "",
-            self.model or "",
-            self._solver_type,
-        ])
-        return hashlib.sha256(parts.encode()).hexdigest()
+        payload = {
+            "task_name": request.task_name or "",
+            "solution_name": request.solution_name or "",
+            "commit_sha": request.commit_sha or "",
+            "model": self.model or "",
+            "solver_type": self._solver_type,
+            "agent_identity": self._agent_identity(),
+        }
+        serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(serialized.encode()).hexdigest()
 
     def _cache_path(self, key: str) -> Path:
         return self._cache_dir / f"{key}.json"
@@ -80,6 +88,8 @@ class CachingSolver(Solver):
         if self._read:
             cached = self.load(request)
             if cached is not None:
+                if request.repo_dir.is_dir():
+                    _apply_patch_to_repo(repo_dir=request.repo_dir, patch_text=cached.solution_diff)
                 return cached
         if self._inner is None:
             key = self._cache_key(request)
