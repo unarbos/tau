@@ -33,12 +33,14 @@ class CachingSolver(Solver):
         config,
         inner: Solver | None,
         cache_dir: Path,
+        solver_type: str = "",
         read: bool = True,
         write: bool = True,
     ) -> None:
         super().__init__(model, timeout, config)
         self._inner = inner
         self._cache_dir = cache_dir
+        self._solver_type = solver_type
         self._read = read
         self._write = write
 
@@ -48,6 +50,7 @@ class CachingSolver(Solver):
             request.solution_name or "",
             request.commit_sha or "",
             self.model or "",
+            self._solver_type,
         ])
         return hashlib.sha256(parts.encode()).hexdigest()
 

@@ -167,6 +167,7 @@ def _maybe_wrap_with_cache(solver: Solver, config: RunConfig) -> Solver:
         config=config,
         inner=solver,
         cache_dir=config.solver_result_cache_dir,
+        solver_type=type(solver).__name__,
         read=config.solver_result_cache_read,
         write=config.solver_result_cache_write,
     )
