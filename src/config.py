@@ -104,7 +104,7 @@ def _github_read_token_env() -> str | None:
 
 def _github_read_tokens_env() -> str | None:
     reserved = _github_merge_token_env()
-    tokens = [token for token in _split_env_list(os.environ.get("GITHUB_TOKENS")) if token != reserved]
+    tokens = [token for token in _split_env_list(_env_str("GITHUB_TOKENS")) if token != reserved]
     return ",".join(tokens) or None
 
 
@@ -151,8 +151,8 @@ class RunConfig:
     github_merge_token: str | None = field(
         default_factory=_github_merge_token_env,
     )
-    openrouter_api_key: str | None = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY"))
-    cursor_api_key: str | None = field(default_factory=lambda: os.environ.get("CURSOR_API_KEY"))
+    openrouter_api_key: str | None = field(default_factory=lambda: _env_str("OPENROUTER_API_KEY"))
+    cursor_api_key: str | None = field(default_factory=lambda: _env_str("CURSOR_API_KEY"))
     baseline_model: str | None = field(default_factory=lambda: _env_str("BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"))
     generator_model: str | None = field(default_factory=lambda: _env_str("GENERATOR_MODEL", "OPENROUTER_GENERATOR_MODEL"))
     solver_model: str | None = None
@@ -177,12 +177,12 @@ class RunConfig:
     )
     solver_proxy_cache_dir: Path | None = field(
         default_factory=lambda: (
-            Path(value).expanduser() if (value := os.environ.get("PROXY_CACHE_DIR")) else None
+            Path(value).expanduser() if (value := _env_str("PROXY_CACHE_DIR")) else None
         ),
     )
     solver_proxy_replay_dir: Path | None = field(
         default_factory=lambda: (
-            Path(value).expanduser() if (value := os.environ.get("PROXY_REPLAY_DIR")) else None
+            Path(value).expanduser() if (value := _env_str("PROXY_REPLAY_DIR")) else None
         ),
     )
     random_seed: int | None = None
@@ -244,7 +244,7 @@ class RunConfig:
     rollout_root: Path | None = field(
         default_factory=lambda: (
             Path(value).expanduser()
-            if (value := os.environ.get("TAU_ROLLOUT_ROOT"))
+            if (value := _env_str("TAU_ROLLOUT_ROOT"))
             else None
         ),
     )
@@ -275,8 +275,28 @@ class RunConfig:
     validate_private_submission_root: Path | None = field(
         default_factory=lambda: (
             Path(value).expanduser()
-            if (value := os.environ.get("VALIDATE_PRIVATE_SUBMISSION_ROOT"))
+            if (value := _env_str("VALIDATE_PRIVATE_SUBMISSION_ROOT"))
             else None
+        ),
+    )
+    validate_judge_model: str | None = field(
+        default_factory=lambda: _env_str("VALIDATE_JUDGE_MODEL")
+    )
+    # Offline dry-run: mock the chain (bittensor), serve the king/challenger
+    # ninja repo from a local clone, and keep R2/HF/TMC off. See
+    # scripts/dry_run_validator.py.
+    dry_run: bool = field(default_factory=lambda: _env_bool("VALIDATE_DRY_RUN"))
+    validate_chain_mode: str = field(
+        default_factory=lambda: _env_str("VALIDATE_CHAIN_MODE") or "live"
+    )
+    validate_chain_snapshot: Path | None = field(
+        default_factory=lambda: (
+            Path(value).expanduser() if (value := _env_str("VALIDATE_CHAIN_SNAPSHOT")) else None
+        ),
+    )
+    validate_ninja_repo_local_path: Path | None = field(
+        default_factory=lambda: (
+            Path(value).expanduser() if (value := _env_str("VALIDATE_NINJA_REPO")) else None
         ),
     )
     debug: bool = False

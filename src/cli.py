@@ -496,7 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep primary and retest pools as static fixed task sets for the current king; stale tasks are flushed instead of being refreshed in place.",
     )
     validate.add_argument("--weight-interval-blocks", type=int, default=360, help="Blocks between weight sets.")
-    validate.add_argument("--king-window-size", type=int, default=5, help="Number of king emission slots; default distribution is 40% current king plus 15% for each prior king slot.")
+    validate.add_argument("--king-window-size", type=int, default=5, help="Number of king emission slots; default distribution is 40%% current king plus 15%% for each prior king slot.")
     validate.add_argument("--poll-interval-seconds", type=int, default=600, help="Seconds between chain submission refreshes.")
     validate.add_argument(
         "--min-free-disk-bytes",
@@ -523,6 +523,35 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--wallet-name", required=True, help="Wallet coldkey name.")
     validate.add_argument("--wallet-hotkey", required=True, help="Wallet hotkey name.")
     validate.add_argument("--wallet-path", help="Wallet path override.")
+    validate.add_argument(
+        "--judge-model",
+        default=None,
+        help="OpenRouter model used as the LLM diff judge (overrides the default production model). Also settable via VALIDATE_JUDGE_MODEL.",
+    )
+    validate.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=None,
+        help="Offline dry-run: mock the chain (no bittensor), serve the king/challenger ninja repo from --ninja-repo, keep R2/HF off. See scripts/dry_run_validator.py.",
+    )
+    validate.add_argument(
+        "--chain-mode",
+        choices=["live", "test", "debug"],
+        default=None,
+        help="bittensor mock mode for --dry-run: 'test' (silent) or 'debug' (log chain ops). Defaults to 'test' under --dry-run.",
+    )
+    validate.add_argument(
+        "--chain-snapshot",
+        type=Path,
+        default=None,
+        help="JSON snapshot seeding the mock chain (block, validator, miners) for --dry-run.",
+    )
+    validate.add_argument(
+        "--ninja-repo",
+        type=Path,
+        default=None,
+        help="Local clone of the miner ninja repo used as the king/challenger source in --dry-run.",
+    )
 
     pool_manager = subparsers.add_parser(
         "pool-manager",
@@ -1582,6 +1611,22 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
             args.private_submission_root
             if args.private_submission_root is not None
             else defaults.validate_private_submission_root
+        ),
+        validate_judge_model=args.judge_model or defaults.validate_judge_model,
+        dry_run=bool(args.dry_run) if args.dry_run is not None else defaults.dry_run,
+        validate_chain_mode=(
+            args.chain_mode
+            or ("test" if (args.dry_run or defaults.dry_run) else defaults.validate_chain_mode)
+        ),
+        validate_chain_snapshot=(
+            args.chain_snapshot.resolve()
+            if args.chain_snapshot is not None
+            else defaults.validate_chain_snapshot
+        ),
+        validate_ninja_repo_local_path=(
+            args.ninja_repo.resolve()
+            if args.ninja_repo is not None
+            else defaults.validate_ninja_repo_local_path
         ),
         debug=args.debug,
     )

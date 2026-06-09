@@ -45,7 +45,7 @@ from r2 import (
 )
 from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
 from tau import bittensor as bt
-from tau.io.github import GitHubAuthRotatingClient, GitHubClient
+from tau.io.github import GitHubAuthRotatingClient, GitHubClient, LocalGitHubClient
 from tau.io.openrouter import CacheMissError
 from tau.rollouts.store import update_rollout
 from workspace import (
@@ -3949,6 +3949,14 @@ def _kill_stale_containers() -> None:
 
 def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
+    if config.dry_run:
+        log.warning(
+            "DRY-RUN: mocking the chain (mode=%s); no bittensor/R2/HF connections. "
+            "King/challenger served from %s",
+            config.validate_chain_mode,
+            config.validate_ninja_repo_local_path,
+        )
+        bt.init(mode=config.validate_chain_mode, snapshot=config.validate_chain_snapshot)
     _kill_stale_containers()
     log.info(
         "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s); patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
@@ -5554,7 +5562,24 @@ def _confirmed_transition_timestamp(
 # Chain + queue management (preserved from original)
 # ---------------------------------------------------------------------------
 
-def _build_github_client(config: RunConfig) -> GitHubAuthRotatingClient:
+def _dry_run_github_client(config: RunConfig) -> LocalGitHubClient | None:
+    """In dry-run, serve the miner ninja repo from a local clone (no network)."""
+    if not config.dry_run or config.validate_ninja_repo_local_path is None:
+        return None
+    return LocalGitHubClient({_MINER_AGENT_REPO_FULL_NAME: config.validate_ninja_repo_local_path})
+
+
+def _repo_url_for(repo: str, config: RunConfig) -> str:
+    """Repo clone URL: a local file:// path in dry-run, else GitHub HTTPS."""
+    if config.dry_run and config.validate_ninja_repo_local_path is not None and repo == _MINER_AGENT_REPO_FULL_NAME:
+        return f"file://{config.validate_ninja_repo_local_path}"
+    return f"https://github.com/{repo}.git"
+
+
+def _build_github_client(config: RunConfig) -> GitHubClient:
+    local = _dry_run_github_client(config)
+    if local is not None:
+        return local
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -5572,7 +5597,10 @@ def _build_github_client(config: RunConfig) -> GitHubAuthRotatingClient:
     )
 
 
-def _build_github_merge_client(config: RunConfig) -> GitHubAuthRotatingClient:
+def _build_github_merge_client(config: RunConfig) -> GitHubClient:
+    local = _dry_run_github_client(config)
+    if local is not None:
+        return local
     # Owner-scoped client used for publishing promoted private submissions. Prefers github_merge_token
     # (typically GITHUB_TOKEN_UNARBOS) so we never accidentally use a rotation
     # token that lacks write access to the public base repo.
@@ -6767,7 +6795,7 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
         )
         return None
     return _submission_with_identity(
-        ValidatorSubmission(hotkey=hotkey, uid=int(uid), repo_full_name=repo, repo_url=f"https://github.com/{repo}.git", commit_sha=full_sha, commitment=commitment, commitment_block=commitment_block),
+        ValidatorSubmission(hotkey=hotkey, uid=int(uid), repo_full_name=repo, repo_url=_repo_url_for(repo, config), commit_sha=full_sha, commitment=commitment, commitment_block=commitment_block),
         identity,
     )
 

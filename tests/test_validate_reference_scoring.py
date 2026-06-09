@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import validate
+import validate
 from config import RunConfig
 from validate import (
     DiffJudgeResult,
@@ -13,6 +14,7 @@ from validate import (
     ValidatorSubmission,
     _challenger_wins,
     _diff_judge_prompt_injection_result,
+    _duel_speed_stop_reason,
     _duel_speed_stop_reason,
     _solve_and_compare_round,
 )
@@ -93,6 +95,7 @@ class ReferenceScoringTest(unittest.TestCase):
             patch("validate.compare_task_run", side_effect=fake_compare_task_run),
             patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate.publish_round_data"),
+            patch("validate._build_agent_config", side_effect=lambda config, sub: config),
             patch("validate._build_agent_config", side_effect=lambda config, sub: config),
         ):
             result = _solve_and_compare_round(
@@ -268,6 +271,22 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertAlmostEqual(result.king_score, 0.01)
         self.assertAlmostEqual(result.challenger_score, 0.02)
 
+    def test_diff_judge_parser_treats_one_as_one_percent(self):
+        result = validate._parse_diff_judge_payload(
+            {
+                "winner": "candidate_b",
+                "candidate_a_score": 1,
+                "candidate_b_score": 2,
+                "rationale": "both scores are near zero",
+            },
+            candidate_mapping={"king": "candidate_a", "challenger": "candidate_b"},
+            model="test-model",
+        )
+
+        self.assertEqual(result.winner, "challenger")
+        self.assertAlmostEqual(result.king_score, 0.01)
+        self.assertAlmostEqual(result.challenger_score, 0.02)
+
     def test_diff_judge_total_timeout_returns_neutral_score(self):
         task_paths = SimpleNamespace(
             task_txt_path=SimpleNamespace(read_text=lambda: "fix the bug"),
@@ -384,6 +403,7 @@ class ReferenceScoringTest(unittest.TestCase):
             patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate._judge_round_diffs", return_value=judge),
             patch("validate.publish_round_data"),
+            patch("validate._build_agent_config", side_effect=lambda config, sub: config),
             patch("validate._build_agent_config", side_effect=lambda config, sub: config),
         ):
             return _solve_and_compare_round(
