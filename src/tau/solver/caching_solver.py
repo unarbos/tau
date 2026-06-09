@@ -47,6 +47,7 @@ class CachingSolver(Solver):
             request.task_name or "",
             request.solution_name or "",
             request.commit_sha or "",
+            self.model or "",
         ])
         return hashlib.sha256(parts.encode()).hexdigest()
 
