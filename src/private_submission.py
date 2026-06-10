@@ -19,6 +19,11 @@ PRIVATE_SUBMISSION_ACCEPTANCE_LEDGER = "_accepted_submissions.json"
 PRIVATE_SUBMISSION_QUEUE_WAKEUP = "_queue_wakeup"
 PRIVATE_SUBMISSION_ATTEMPT_LEDGER = "_submission_attempts.json"
 MINER_HOTKEY_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}$")
+AGENT_ENTRYPOINT_FILENAME = "agent.py"
+MAX_AGENT_FILES = 32
+MAX_AGENT_FILE_PATH_SEGMENTS = 8
+_AGENT_FILE_DIR_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$")
+_AGENT_FILE_BASENAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}\.py$")
 REQUIRED_SOLVE_ARGS = ("repo_path", "issue", "model", "api_base", "api_key")
 ALLOWED_ENV_NAMES = {
     "AGENT_MAX_STEPS",
@@ -127,27 +132,119 @@ JudgeFn = Callable[[dict[str, Any]], dict[str, Any]]
 SignatureVerifier = Callable[[str, bytes, str], bool]
 
 
+def normalize_agent_files(
+    *,
+    agent_py: str | None = None,
+    files: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Merge a legacy single-file submission with optional extra module files."""
+    merged: dict[str, str] = {}
+    for raw_path, raw_content in (files or {}).items():
+        merged[str(raw_path).strip()] = str(raw_content)
+    if agent_py is not None:
+        existing = merged.get(AGENT_ENTRYPOINT_FILENAME)
+        if existing is not None and existing != agent_py:
+            raise ValueError(
+                f"`{AGENT_ENTRYPOINT_FILENAME}` was provided twice with different contents"
+            )
+        merged[AGENT_ENTRYPOINT_FILENAME] = agent_py
+    if not merged:
+        raise ValueError("a submission requires at least one agent file")
+    return merged
+
+
+def agent_files_violations(files: dict[str, str]) -> list[str]:
+    violations: list[str] = []
+    if AGENT_ENTRYPOINT_FILENAME not in files:
+        violations.append(
+            f"submission must include `{AGENT_ENTRYPOINT_FILENAME}` as the agent entrypoint."
+        )
+    if len(files) > MAX_AGENT_FILES:
+        violations.append(
+            f"submission has {len(files)} files; the maximum is {MAX_AGENT_FILES}."
+        )
+    for path in sorted(files):
+        violations.extend(agent_file_path_violations(path))
+    return _dedupe(violations)
+
+
+def agent_file_path_violations(path: str) -> list[str]:
+    if not path or path != path.strip():
+        return [f"agent file path `{path}` must not be empty or padded with whitespace."]
+    if path.startswith("/") or "\\" in path:
+        return [f"agent file path `{path}` must be a relative POSIX path."]
+    segments = path.split("/")
+    if any(segment in {"", ".", ".."} for segment in segments):
+        return [f"agent file path `{path}` must not contain empty, `.` or `..` segments."]
+    if len(segments) > MAX_AGENT_FILE_PATH_SEGMENTS:
+        return [f"agent file path `{path}` is nested deeper than {MAX_AGENT_FILE_PATH_SEGMENTS} segments."]
+    violations: list[str] = []
+    for segment in segments[:-1]:
+        if not _AGENT_FILE_DIR_SEGMENT_RE.fullmatch(segment):
+            violations.append(f"agent file path `{path}` has an invalid directory segment `{segment}`.")
+    if not _AGENT_FILE_BASENAME_RE.fullmatch(segments[-1]):
+        violations.append(f"agent file `{path}` must be a Python module named like `module.py`.")
+    return violations
+
+
+def agent_bundle_sha256(files: dict[str, str]) -> str:
+    """Deterministic submission hash.
+
+    Single-file submissions keep the historical sha256-of-agent.py value so
+    existing commitments, signatures, and ledgers stay valid.
+    """
+    if set(files) == {AGENT_ENTRYPOINT_FILENAME}:
+        return hashlib.sha256(files[AGENT_ENTRYPOINT_FILENAME].encode("utf-8")).hexdigest()
+    digest = hashlib.sha256()
+    for path in sorted(files):
+        content_sha = hashlib.sha256(files[path].encode("utf-8")).hexdigest()
+        digest.update(f"{path}\0{content_sha}\n".encode())
+    return digest.hexdigest()
+
+
+def agent_files_manifest(files: dict[str, str]) -> dict[str, str]:
+    return {
+        path: hashlib.sha256(files[path].encode("utf-8")).hexdigest()
+        for path in sorted(files)
+    }
+
+
+def _agent_local_module_roots(files: dict[str, str]) -> frozenset[str]:
+    roots: set[str] = set()
+    for path in files:
+        root = path.split("/", 1)[0]
+        if root.endswith(".py"):
+            root = root[: -len(".py")]
+        if root:
+            roots.add(root)
+    return frozenset(roots)
+
+
 def run_private_submission_checks(
     *,
     hotkey: str,
-    submitted_agent_py: str,
+    submitted_agent_py: str | None = None,
     base_agent_py: str,
     openrouter_judge: JudgeFn | None = None,
     min_score: int = DEFAULT_OPENROUTER_MIN_SCORE,
+    submitted_files: dict[str, str] | None = None,
 ) -> PrivateSubmissionCheckResult:
-    agent_sha = hashlib.sha256(submitted_agent_py.encode("utf-8")).hexdigest()
-    patch = _agent_diff(base_agent_py, submitted_agent_py)
-    smoke = run_agent_smoke_checks(agent_py=submitted_agent_py)
-    scope_guard = run_scope_guard(hotkey=hotkey, agent_py=submitted_agent_py, patch=patch)
+    files = normalize_agent_files(agent_py=submitted_agent_py, files=submitted_files)
+    agent_sha = agent_bundle_sha256(files)
+    base_files = {AGENT_ENTRYPOINT_FILENAME: base_agent_py}
+    patch = _files_patch(base_files=base_files, submitted_files=files)
+    smoke = run_agent_smoke_checks(files=files)
+    scope_guard = run_scope_guard(hotkey=hotkey, files=files, patch=patch)
     checks = {"agent_smoke": smoke, "scope_guard": scope_guard}
     if smoke.status == "passed" and scope_guard.status == "passed":
         checks["openrouter_judge"] = run_openrouter_judge_gate(
             hotkey=hotkey,
             base_agent_py=base_agent_py,
-            submitted_agent_py=submitted_agent_py,
+            submitted_agent_py=files.get(AGENT_ENTRYPOINT_FILENAME, ""),
             patch=patch,
             judge=openrouter_judge,
             min_score=min_score,
+            submitted_files=files,
         )
     else:
         failed = "agent smoke" if smoke.status != "passed" else "scope guard"
@@ -160,54 +257,82 @@ def run_private_submission_checks(
     return PrivateSubmissionCheckResult(accepted=accepted, agent_sha256=agent_sha, checks=checks)
 
 
-def run_agent_smoke_checks(*, agent_py: str) -> SubmissionCheck:
+def run_agent_smoke_checks(
+    *,
+    agent_py: str | None = None,
+    files: dict[str, str] | None = None,
+) -> SubmissionCheck:
+    files = normalize_agent_files(agent_py=agent_py, files=files)
+    findings: list[str] = []
+    for path in sorted(files):
+        findings.extend(_agent_file_smoke_findings(path=path, source=files[path]))
+    findings = _dedupe(findings)
+    if findings:
+        return SubmissionCheck(
+            name="Agent Smoke",
+            status="failed",
+            summary="submitted agent files failed local smoke checks.",
+            findings=findings,
+        )
+    return SubmissionCheck(
+        name="Agent Smoke",
+        status="passed",
+        summary="submitted agent files compile and have no new pyflakes findings.",
+    )
+
+
+def _agent_file_smoke_findings(*, path: str, source: str) -> list[str]:
     findings: list[str] = []
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".py", encoding="utf-8", delete=False) as tmp:
-            tmp.write(agent_py)
+            tmp.write(source)
             tmp_path = Path(tmp.name)
         try:
             py_compile.compile(str(tmp_path), doraise=True)
         finally:
             tmp_path.unlink(missing_ok=True)
     except py_compile.PyCompileError as exc:
-        findings.append(f"agent.py failed py_compile: {exc.msg}")
+        findings.append(f"{path} failed py_compile: {exc.msg}")
     except OSError as exc:
-        findings.append(f"agent.py smoke check could not create temp file: {exc}")
-
-    pyflakes_findings = _pyflakes_findings(agent_py)
-    findings.extend(pyflakes_findings)
-    findings = _dedupe(findings)
-    if findings:
-        return SubmissionCheck(
-            name="Agent Smoke",
-            status="failed",
-            summary="agent.py failed local smoke checks.",
-            findings=findings,
-        )
-    return SubmissionCheck(
-        name="Agent Smoke",
-        status="passed",
-        summary="agent.py compiles and has no new pyflakes findings.",
-    )
+        findings.append(f"{path} smoke check could not create temp file: {exc}")
+    findings.extend(_pyflakes_findings(source, filename=path))
+    return findings
 
 
-def run_scope_guard(*, hotkey: str, agent_py: str, patch: str) -> SubmissionCheck:
+def run_scope_guard(
+    *,
+    hotkey: str,
+    agent_py: str | None = None,
+    patch: str | None = None,
+    files: dict[str, str] | None = None,
+) -> SubmissionCheck:
+    files = normalize_agent_files(agent_py=agent_py, files=files)
+    local_modules = _agent_local_module_roots(files)
     findings: list[str] = []
-    findings.extend(_agent_patch_violations(patch))
-    findings.extend(_agent_source_violations(agent_py))
+    findings.extend(agent_files_violations(files))
+    if patch is not None:
+        findings.extend(_agent_patch_violations(patch))
+    for path in sorted(files):
+        findings.extend(
+            _agent_source_violations(
+                files[path],
+                filename=path,
+                require_solve=path == AGENT_ENTRYPOINT_FILENAME,
+                local_modules=local_modules,
+            )
+        )
     findings = _dedupe(findings)
     if findings:
         return SubmissionCheck(
             name="Submission Scope Guard",
             status="failed",
-            summary="agent.py failed the local submission contract checks.",
+            summary="submitted agent files failed the local submission contract checks.",
             findings=findings,
         )
     return SubmissionCheck(
         name="Submission Scope Guard",
         status="passed",
-        summary="agent.py satisfies the local submission contract checks.",
+        summary="submitted agent files satisfy the local submission contract checks.",
     )
 
 
@@ -219,6 +344,7 @@ def run_openrouter_judge_gate(
     patch: str,
     judge: JudgeFn | None,
     min_score: int,
+    submitted_files: dict[str, str] | None = None,
 ) -> SubmissionCheck:
     if judge is None:
         return SubmissionCheck(
@@ -226,19 +352,28 @@ def run_openrouter_judge_gate(
             status="skipped",
             summary="No local OpenRouter judge function was configured.",
         )
+    files = normalize_agent_files(agent_py=submitted_agent_py, files=submitted_files)
+    changed_files = [
+        {
+            "filename": path,
+            "status": "modified" if path == AGENT_ENTRYPOINT_FILENAME else "added",
+        }
+        for path in sorted(files)
+    ]
     payload = {
         "hotkey": hotkey,
         "title": f"{hotkey} private submission",
-        "changed_files": [{"filename": "agent.py", "status": "modified"}],
+        "changed_files": changed_files,
         "static_findings": {
             "fail_reasons": [],
             "warnings": [],
             "findings": [],
-            "changed_files": ["agent.py"],
+            "changed_files": sorted(files),
         },
         "patch": patch,
         "base_agent_py": base_agent_py,
         "submitted_agent_py": submitted_agent_py,
+        "submitted_files": files,
     }
     try:
         judgment = judge(payload)
@@ -364,7 +499,7 @@ def write_private_submission_bundle(
     root: Path,
     submission_id: str,
     hotkey: str,
-    agent_py: str,
+    agent_py: str | None = None,
     check_result: PrivateSubmissionCheckResult,
     signature: str,
     registration_block: int | None = None,
@@ -372,14 +507,22 @@ def write_private_submission_bundle(
     coldkey: str | None = None,
     coldkey_signature: str | None = None,
     overwrite: bool = False,
+    agent_files: dict[str, str] | None = None,
 ) -> Path:
     if not valid_submission_id(submission_id):
         raise ValueError("submission_id must contain only letters, numbers, '.', '_' or '-'")
+    files = normalize_agent_files(agent_py=agent_py, files=agent_files)
+    path_violations = agent_files_violations(files)
+    if path_violations:
+        raise ValueError(f"private submission has invalid agent files: {path_violations[0]}")
     target = root / submission_id
     if target.exists() and not overwrite:
         raise FileExistsError(f"private submission already exists: {submission_id}")
     target.mkdir(parents=True, exist_ok=True)
-    (target / "agent.py").write_text(agent_py, encoding="utf-8")
+    for path in sorted(files):
+        file_path = target / path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(files[path], encoding="utf-8")
     check_payload = check_result.to_dict()
     ci_checks = check_payload["checks"]
     (target / "check_result.json").write_text(
@@ -390,6 +533,7 @@ def write_private_submission_bundle(
                     "hotkey": hotkey,
                     "registration_block": registration_block,
                     "signature": signature,
+                    "agent_files": agent_files_manifest(files),
                     **_verified_identity_metadata(
                         agent_username=agent_username,
                         coldkey=coldkey,
@@ -762,6 +906,49 @@ def derive_submission_id(*, hotkey: str, agent_sha256: str) -> str:
     return f"{safe_hotkey}-{agent_sha256.lower()[:16]}"
 
 
+def private_submission_bundle_files(*, root: Path, submission_id: str) -> dict[str, str] | None:
+    """Return the verified agent files recorded in a bundle's manifest.
+
+    Returns None when the bundle, its manifest, or any per-file hash does not
+    line up with what is on disk. Legacy bundles without a manifest report
+    just their agent.py.
+    """
+    if not valid_submission_id(submission_id):
+        return None
+    bundle = root / submission_id
+    result = _read_bundle_check_result(root=root, submission_id=submission_id)
+    manifest = result.get("agent_files")
+    if not isinstance(manifest, dict) or not manifest:
+        agent_path = bundle / AGENT_ENTRYPOINT_FILENAME
+        if not agent_path.is_file():
+            return None
+        try:
+            return {AGENT_ENTRYPOINT_FILENAME: agent_path.read_bytes().decode("utf-8")}
+        except (OSError, UnicodeDecodeError):
+            return None
+    files: dict[str, str] = {}
+    for raw_path, expected_file_sha in manifest.items():
+        path = str(raw_path)
+        if agent_file_path_violations(path):
+            return None
+        file_path = bundle / path
+        if not file_path.is_file():
+            return None
+        try:
+            content = file_path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        if hashlib.sha256(content.encode("utf-8")).hexdigest() != str(expected_file_sha).lower():
+            return None
+        files[path] = content
+    if AGENT_ENTRYPOINT_FILENAME not in files:
+        return None
+    for stray in bundle.rglob("*.py"):
+        if stray.relative_to(bundle).as_posix() not in files:
+            return None
+    return files
+
+
 def private_submission_check_passed(
     root: Path,
     submission_id: str,
@@ -775,7 +962,10 @@ def private_submission_check_passed(
     result_path = bundle / "check_result.json"
     if not agent_path.is_file() or not result_path.is_file():
         return False
-    actual_sha = hashlib.sha256(agent_path.read_bytes()).hexdigest()
+    files = private_submission_bundle_files(root=root, submission_id=submission_id)
+    if files is None:
+        return False
+    actual_sha = agent_bundle_sha256(files)
     if actual_sha.lower() != expected_sha256.lower():
         return False
     try:
@@ -816,6 +1006,24 @@ def _agent_diff(base_agent_py: str, submitted_agent_py: str) -> str:
     )
 
 
+def _files_patch(*, base_files: dict[str, str], submitted_files: dict[str, str]) -> str:
+    chunks: list[str] = []
+    for path in sorted(set(base_files) | set(submitted_files)):
+        base_text = base_files.get(path)
+        new_text = submitted_files.get(path)
+        chunks.append(
+            "".join(
+                difflib.unified_diff(
+                    (base_text or "").splitlines(keepends=True),
+                    (new_text or "").splitlines(keepends=True),
+                    fromfile=f"a/{path}" if base_text is not None else "/dev/null",
+                    tofile=f"b/{path}" if new_text is not None else "/dev/null",
+                )
+            )
+        )
+    return "".join(chunks)
+
+
 def _agent_patch_violations(patch: str) -> list[str]:
     violations: list[str] = []
     current_hunk = ""
@@ -852,7 +1060,7 @@ def _agent_patch_violations(patch: str) -> list[str]:
     return violations
 
 
-def _pyflakes_findings(source: str) -> list[str]:
+def _pyflakes_findings(source: str, *, filename: str = "agent.py") -> list[str]:
     try:
         from pyflakes.api import check
         from pyflakes.reporter import Reporter
@@ -861,7 +1069,7 @@ def _pyflakes_findings(source: str) -> list[str]:
 
     stdout = io.StringIO()
     stderr = io.StringIO()
-    warnings = check(source, "agent.py", Reporter(stdout, stderr))
+    warnings = check(source, filename, Reporter(stdout, stderr))
     if not warnings:
         return []
     findings = [line.strip() for line in (stdout.getvalue() + stderr.getvalue()).splitlines() if line.strip()]
@@ -872,16 +1080,23 @@ def _pyflakes_findings(source: str) -> list[str]:
     ]
 
 
-def _agent_source_violations(source: str) -> list[str]:
+def _agent_source_violations(
+    source: str,
+    *,
+    filename: str = "agent.py",
+    require_solve: bool = True,
+    local_modules: frozenset[str] = frozenset(),
+) -> list[str]:
     try:
-        tree = ast.parse(source, filename="agent.py")
+        tree = ast.parse(source, filename=filename)
     except SyntaxError as exc:
-        return [f"agent.py must remain valid Python: {exc.msg} at line {exc.lineno}."]
+        return [f"{filename} must remain valid Python: {exc.msg} at line {exc.lineno}."]
 
     violations: list[str] = []
     solve = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "solve"), None)
     if solve is None:
-        violations.append("agent.py must define solve(...).")
+        if require_solve:
+            violations.append(f"{filename} must define solve(...).")
     else:
         args = [arg.arg for arg in [*solve.args.posonlyargs, *solve.args.args]]
         if tuple(args[: len(REQUIRED_SOLVE_ARGS)]) != REQUIRED_SOLVE_ARGS:
@@ -908,16 +1123,18 @@ def _agent_source_violations(source: str) -> list[str]:
             for key in node.keys:
                 if getattr(key, "value", None) in FORBIDDEN_SAMPLING_NAMES:
                     violations.append(
-                        f"agent.py must not set sampling request field `{key.value}`; validator proxy owns sampling."
+                        f"{filename} must not set sampling request field `{key.value}`; validator proxy owns sampling."
                     )
         roots: list[str] = []
         if isinstance(node, ast.Import):
             roots = [str(alias.name).split(".", 1)[0] for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                continue
             roots = [str(node.module or "").split(".", 1)[0]]
         for root in roots:
-            if root and root not in stdlib:
-                violations.append(f"agent.py imports non-stdlib module `{root}`.")
+            if root and root not in stdlib and root not in local_modules:
+                violations.append(f"{filename} imports non-stdlib module `{root}`.")
     return violations
 
 

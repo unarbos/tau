@@ -10,7 +10,7 @@ from pathlib import Path
 from compare import compare_solution_repos
 from config import RunConfig
 from cursor_runner import solve_task_with_cursor_in_docker
-from docker_solver import solve_task_in_docker
+from docker_solver import _agent_source_sha256, solve_task_in_docker
 from eval import evaluate_candidate_pair
 from github_miner import GitHubMiner, GitHubTokenRotator
 from solver_runner import solve_task, solve_task_claw
@@ -244,6 +244,9 @@ def _solver_agent_file_sha256(agent_source) -> str | None:
     path = _solver_agent_file_path(agent_source)
     if path is None or not path.is_file():
         return None
+    root = Path(agent_source.local_path)
+    if root.is_dir():
+        return _agent_source_sha256(agent_root=root, agent_file=path)
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 

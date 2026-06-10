@@ -28,8 +28,12 @@ from config import RunConfig, SolverAgentSource
 from openrouter_client import complete_text
 from pipeline import _setup_logging, compare_task_run, solve_task_run
 from private_submission import (
+    MAX_AGENT_FILES,
     PRIVATE_SUBMISSION_QUEUE_WAKEUP,
     accepted_private_submission_entries,
+    agent_bundle_sha256,
+    agent_file_path_violations,
+    private_submission_bundle_files,
     private_submission_check_passed,
 )
 from r2 import (
@@ -61,6 +65,7 @@ from workspace import (
 
 log = logging.getLogger("swe-eval.validate")
 _DEFAULT_GITHUB_AGENT_FILE = "agent.py"
+_GITHUB_AGENT_MANIFEST_FILENAME = "tau_agent_files.json"
 _MINER_AGENT_REPO_FULL_NAME = "unarbos/ninja"
 _MINER_AGENT_BRANCH = "main"
 _GITHUB_COMMIT_RE = re.compile(
@@ -5667,6 +5672,19 @@ def _publish_promoted_private_submission(
     if not _is_private_submission(submission):
         return submission
 
+    try:
+        winning_files = _private_submission_agent_files(config, submission)
+    except Exception as exc:
+        log.warning("Promoted private submission %s could not load agent files: %s", submission.commitment, exc)
+        return submission
+    if len(winning_files) > 1:
+        log.warning(
+            "Promoted private submission %s is multi-file; the public base repo publication "
+            "is single-file only, so the king keeps running from the private bundle.",
+            submission.commitment,
+        )
+        return submission
+
     base_repo = (config.validate_publish_repo or _MINER_AGENT_REPO_FULL_NAME).strip() or _MINER_AGENT_REPO_FULL_NAME
     base_ref = (config.validate_publish_base or _MINER_AGENT_BRANCH).strip() or _MINER_AGENT_BRANCH
     agent_path = _private_submission_agent_path(config, submission)
@@ -7144,6 +7162,16 @@ def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfi
 def _cached_agent_source(config: RunConfig, sub: ValidatorSubmission) -> SolverAgentSource:
     if _is_private_submission(sub):
         agent_path = _private_submission_agent_path(config, sub)
+        files = _private_submission_agent_files(config, sub)
+        if len(files) > 1:
+            agent_dir = _materialize_private_submission_agent_dir(config, sub, files)
+            return SolverAgentSource(
+                raw=sub.agent_ref,
+                kind="local_path",
+                local_path=str(agent_dir),
+                agent_file=_DEFAULT_GITHUB_AGENT_FILE,
+                commit_sha=sub.commit_sha,
+            )
         return SolverAgentSource(
             raw=sub.agent_ref,
             kind="local_file",
@@ -7152,7 +7180,7 @@ def _cached_agent_source(config: RunConfig, sub: ValidatorSubmission) -> SolverA
             commit_sha=sub.commit_sha,
         )
     try:
-        agent_path = _materialize_agent_cache(config, sub)
+        agent_path, multi_file = _materialize_agent_cache(config, sub)
     except Exception as exc:
         log.warning(
             "Agent cache: falling back to per-solve fetch for %s@%s: %s",
@@ -7164,6 +7192,14 @@ def _cached_agent_source(config: RunConfig, sub: ValidatorSubmission) -> SolverA
             raw=sub.agent_ref,
             kind="github_repo",
             repo_url=sub.repo_url,
+            agent_file=_DEFAULT_GITHUB_AGENT_FILE,
+            commit_sha=sub.commit_sha,
+        )
+    if multi_file:
+        return SolverAgentSource(
+            raw=sub.agent_ref,
+            kind="local_path",
+            local_path=str(agent_path.parent),
             agent_file=_DEFAULT_GITHUB_AGENT_FILE,
             commit_sha=sub.commit_sha,
         )
@@ -7197,18 +7233,99 @@ def _private_submission_agent_path(config: RunConfig, sub: ValidatorSubmission) 
     return agent_path
 
 
-def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> Path:
+def _private_submission_agent_files(config: RunConfig, sub: ValidatorSubmission) -> dict[str, str]:
+    submission_id = _private_submission_id(sub)
+    if not submission_id:
+        raise RuntimeError(f"private submission {sub.commitment} has no submission id")
+    root = _private_submission_root(config)
+    if root is None:
+        raise RuntimeError("private submission root is not configured")
+    files = private_submission_bundle_files(root=root, submission_id=submission_id)
+    if files is None:
+        raise RuntimeError(f"private submission {submission_id} agent files failed manifest verification")
+    if agent_bundle_sha256(files).lower() != sub.commit_sha.lower():
+        raise RuntimeError(f"private submission {submission_id} agent files do not match the committed hash")
+    return files
+
+
+def _materialize_private_submission_agent_dir(
+    config: RunConfig,
+    sub: ValidatorSubmission,
+    files: dict[str, str],
+) -> Path:
+    """Stage a verified multi-file private submission into the agent cache.
+
+    The staged directory contains only the manifest agent files, so bundle
+    metadata such as check_result.json never reaches the solver container.
+    """
+    submission_id = _private_submission_id(sub)
+    cache_root = config.validate_root / "agent-cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_dir = cache_root / f"private--{submission_id}--{sub.commit_sha[:12]}"
+    agent_dir = cache_dir / "agent"
+    if _private_agent_dir_valid(agent_dir=agent_dir, files=files):
+        return agent_dir
+
+    with _AGENT_CACHE_LOCK:
+        if _private_agent_dir_valid(agent_dir=agent_dir, files=files):
+            return agent_dir
+        tmp_dir = cache_root / f".{cache_dir.name}.tmp-{os.getpid()}-{time.time_ns()}"
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            staged_agent_dir = tmp_dir / "agent"
+            for path in sorted(files):
+                file_path = staged_agent_dir / path
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(files[path], encoding="utf-8")
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            tmp_dir.rename(cache_dir)
+            log.info(
+                "Agent cache: staged %d-file private submission %s",
+                len(files),
+                submission_id,
+            )
+            return agent_dir
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _private_agent_dir_valid(*, agent_dir: Path, files: dict[str, str]) -> bool:
+    if not agent_dir.is_dir():
+        return False
+    for path, content in files.items():
+        file_path = agent_dir / path
+        if not file_path.is_file():
+            return False
+        try:
+            if file_path.read_bytes().decode("utf-8") != content:
+                return False
+        except (OSError, UnicodeDecodeError):
+            return False
+    staged = {p.relative_to(agent_dir).as_posix() for p in agent_dir.rglob("*.py")}
+    return staged == set(files)
+
+
+def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> tuple[Path, bool]:
+    """Materialize a GitHub-committed agent into the local cache.
+
+    Returns the cached entrypoint path and whether the agent is multi-file.
+    Repos opt in to multi-file agents by committing a manifest named
+    `tau_agent_files.json`: a JSON array of relative Python file paths that
+    must include agent.py. Repos without the manifest keep the legacy
+    single-file agent.py extraction.
+    """
     cache_root = config.validate_root / "agent-cache"
     cache_root.mkdir(parents=True, exist_ok=True)
     cache_key = _agent_cache_key(sub)
     cache_dir = cache_root / cache_key
-    agent_path = cache_dir / _DEFAULT_GITHUB_AGENT_FILE
-    if _agent_cache_entry_valid(cache_dir=cache_dir, agent_path=agent_path, sub=sub):
-        return agent_path
+    cached = _valid_cached_agent_entry(cache_dir=cache_dir, sub=sub)
+    if cached is not None:
+        return cached
 
     with _AGENT_CACHE_LOCK:
-        if _agent_cache_entry_valid(cache_dir=cache_dir, agent_path=agent_path, sub=sub):
-            return agent_path
+        cached = _valid_cached_agent_entry(cache_dir=cache_dir, sub=sub)
+        if cached is not None:
+            return cached
 
         tmp_dir = cache_root / f".{cache_key}.tmp-{os.getpid()}-{time.time_ns()}"
         repo_dir = tmp_dir / "repo"
@@ -7222,14 +7339,29 @@ def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> Pat
             head = _run_git(["rev-parse", "FETCH_HEAD"], cwd=repo_dir, timeout=30).stdout.strip()
             if not head.startswith(sub.commit_sha):
                 raise RuntimeError(f"fetched {head}, expected {sub.commit_sha}")
-            show = _run_git(
-                ["show", f"FETCH_HEAD:{_DEFAULT_GITHUB_AGENT_FILE}"],
-                cwd=repo_dir,
-                timeout=60,
-            )
 
-            staged_agent = tmp_dir / _DEFAULT_GITHUB_AGENT_FILE
-            staged_agent.write_text(show.stdout, encoding="utf-8")
+            manifest_paths = _github_agent_manifest_paths(repo_dir)
+            multi_file = manifest_paths is not None
+            if manifest_paths is not None:
+                agent_dir = tmp_dir / "agent"
+                for relative_path in manifest_paths:
+                    shown = _run_git(
+                        ["show", f"FETCH_HEAD:{relative_path}"],
+                        cwd=repo_dir,
+                        timeout=60,
+                    )
+                    file_path = agent_dir / relative_path
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    file_path.write_text(shown.stdout, encoding="utf-8")
+                staged_agent = agent_dir / _DEFAULT_GITHUB_AGENT_FILE
+            else:
+                show = _run_git(
+                    ["show", f"FETCH_HEAD:{_DEFAULT_GITHUB_AGENT_FILE}"],
+                    cwd=repo_dir,
+                    timeout=60,
+                )
+                staged_agent = tmp_dir / _DEFAULT_GITHUB_AGENT_FILE
+                staged_agent.write_text(show.stdout, encoding="utf-8")
             if not staged_agent.read_text(encoding="utf-8").strip():
                 raise RuntimeError("cached agent.py is empty")
             _write_agent_cache_metadata(cache_dir=tmp_dir, agent_path=staged_agent, sub=sub)
@@ -7237,9 +7369,63 @@ def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> Pat
             shutil.rmtree(cache_dir, ignore_errors=True)
             tmp_dir.rename(cache_dir)
             log.info("Agent cache: materialized %s@%s", sub.repo_full_name, sub.commit_sha[:12])
-            return agent_path
+            return _cached_agent_entrypoint(cache_dir, multi_file=multi_file), multi_file
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _cached_agent_entrypoint(cache_dir: Path, *, multi_file: bool) -> Path:
+    if multi_file:
+        return cache_dir / "agent" / _DEFAULT_GITHUB_AGENT_FILE
+    return cache_dir / _DEFAULT_GITHUB_AGENT_FILE
+
+
+def _valid_cached_agent_entry(*, cache_dir: Path, sub: ValidatorSubmission) -> tuple[Path, bool] | None:
+    for multi_file in (False, True):
+        agent_path = _cached_agent_entrypoint(cache_dir, multi_file=multi_file)
+        if _agent_cache_entry_valid(cache_dir=cache_dir, agent_path=agent_path, sub=sub):
+            return agent_path, multi_file
+    return None
+
+
+def _github_agent_manifest_paths(repo_dir: Path) -> list[str] | None:
+    shown = _run_git_allow_failure(
+        ["show", f"FETCH_HEAD:{_GITHUB_AGENT_MANIFEST_FILENAME}"],
+        cwd=repo_dir,
+        timeout=60,
+    )
+    if shown is None:
+        return None
+    try:
+        payload = json.loads(shown)
+    except ValueError as exc:
+        raise RuntimeError(f"{_GITHUB_AGENT_MANIFEST_FILENAME} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
+        raise RuntimeError(f"{_GITHUB_AGENT_MANIFEST_FILENAME} must be a JSON array of relative paths")
+    paths = sorted({item.strip() for item in payload})
+    if _DEFAULT_GITHUB_AGENT_FILE not in paths:
+        raise RuntimeError(f"{_GITHUB_AGENT_MANIFEST_FILENAME} must include {_DEFAULT_GITHUB_AGENT_FILE}")
+    if len(paths) > MAX_AGENT_FILES:
+        raise RuntimeError(f"{_GITHUB_AGENT_MANIFEST_FILENAME} lists more than {MAX_AGENT_FILES} files")
+    for path in paths:
+        violations = agent_file_path_violations(path)
+        if violations:
+            raise RuntimeError(f"{_GITHUB_AGENT_MANIFEST_FILENAME}: {violations[0]}")
+    return paths
+
+
+def _run_git_allow_failure(cmd: list[str], *, cwd: Path, timeout: int) -> str | None:
+    result = subprocess.run(
+        ["git", *cmd],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
 
 
 def _agent_cache_key(sub: ValidatorSubmission) -> str:
@@ -7256,6 +7442,19 @@ def _agent_cache_metadata_path(cache_dir: Path) -> Path:
 
 def _agent_file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _agent_cache_source_sha256(agent_path: Path) -> str:
+    """Hash a cached agent: file hash for legacy entries, bundle hash for
+    multi-file entries staged under an `agent/` directory."""
+    agent_dir = agent_path.parent
+    if agent_dir.name != "agent":
+        return _agent_file_sha256(agent_path)
+    files = {
+        path.relative_to(agent_dir).as_posix(): path.read_bytes().decode("utf-8")
+        for path in sorted(agent_dir.rglob("*.py"))
+    }
+    return agent_bundle_sha256(files)
 
 
 def _expected_agent_cache_metadata(sub: ValidatorSubmission, agent_sha256: str) -> dict[str, str]:
@@ -7276,7 +7475,7 @@ def _write_agent_cache_metadata(
 ) -> None:
     write_json(
         _agent_cache_metadata_path(cache_dir),
-        _expected_agent_cache_metadata(sub, _agent_file_sha256(agent_path)),
+        _expected_agent_cache_metadata(sub, _agent_cache_source_sha256(agent_path)),
     )
 
 
@@ -7293,7 +7492,7 @@ def _agent_cache_entry_valid(
         return False
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        actual_sha = _agent_file_sha256(agent_path)
+        actual_sha = _agent_cache_source_sha256(agent_path)
     except (OSError, ValueError):
         return False
     expected = _expected_agent_cache_metadata(sub, actual_sha)

@@ -64,6 +64,10 @@ py-modules = [
 target-version = "py311"
 line-length = 100
 src = ["src"]
+# Miner harness agents must keep validator-owned contract lines byte-identical
+# to the public base agent (e.g. `Optional[str]` annotations), so style
+# rewrites are not safe there.
+extend-exclude = ["agents"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]

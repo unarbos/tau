@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import cgi
-import hashlib
 import json
 import logging
 import subprocess
@@ -15,11 +14,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from private_submission import (
+    AGENT_ENTRYPOINT_FILENAME,
     SubmissionCheck,
     accepted_private_submission_identity,
+    agent_bundle_sha256,
     build_public_submissions_api_payload,
     check_and_record_private_submission_attempt,
     derive_submission_id,
+    normalize_agent_files,
     private_submission_check_passed,
     private_submission_registration_check,
     private_submission_signature_payload,
@@ -163,11 +165,25 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
         }
         submitted_id = form_value(form, "submission_id")
         agent_py = form_file_text(form, "agent")
+        try:
+            extra_files = submitted_extra_files(form)
+            agent_files = (
+                normalize_agent_files(agent_py=agent_py or None, files=extra_files)
+                if agent_py or extra_files
+                else {}
+            )
+        except ValueError as exc:
+            return 400, {"accepted": False, "error": f"invalid agent files: {exc}"}
+        agent_py = agent_files.get(AGENT_ENTRYPOINT_FILENAME, "")
         if not hotkey or not signature or not agent_py:
             return 400, {"accepted": False, "error": "hotkey, signature, and agent file are required"}
-        if len(agent_py.encode("utf-8")) > config.max_agent_bytes:
+        total_agent_bytes = sum(
+            len(path.encode("utf-8")) + len(content.encode("utf-8"))
+            for path, content in agent_files.items()
+        )
+        if total_agent_bytes > config.max_agent_bytes:
             return 413, {"accepted": False, "error": "agent_too_large"}
-        agent_sha256 = hashlib.sha256(agent_py.encode("utf-8")).hexdigest()
+        agent_sha256 = agent_bundle_sha256(agent_files)
         submission_id = submitted_id or derive_submission_id(
             hotkey=hotkey,
             agent_sha256=agent_sha256,
@@ -259,10 +275,10 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
         base_agent_py = read_base_agent_py(config=config)
         result = run_private_submission_checks(
             hotkey=hotkey,
-            submitted_agent_py=agent_py,
             base_agent_py=base_agent_py,
             openrouter_judge=config.judge,
             min_score=config.judge_min_score,
+            submitted_files=agent_files,
         )
         result.checks["registration_gate"] = registration_check
         bundle_path = None
@@ -281,7 +297,7 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 root=config.private_submission_root,
                 submission_id=submission_id,
                 hotkey=hotkey,
-                agent_py=agent_py,
+                agent_files=agent_files,
                 result=result,
                 signature=signature,
                 registration_block=registration_block,
@@ -361,7 +377,6 @@ def persist_accepted_submission(
     root: Path,
     submission_id: str,
     hotkey: str,
-    agent_py: str,
     result: Any,
     signature: str,
     registration_block: int | None,
@@ -369,6 +384,8 @@ def persist_accepted_submission(
     coldkey: str | None,
     coldkey_signature: str | None,
     overwrite: bool,
+    agent_py: str | None = None,
+    agent_files: dict[str, str] | None = None,
 ) -> Path:
     existing_bundle = root / submission_id
     if (
@@ -388,6 +405,7 @@ def persist_accepted_submission(
         submission_id=submission_id,
         hotkey=hotkey,
         agent_py=agent_py,
+        agent_files=agent_files,
         check_result=result,
         signature=signature,
         registration_block=registration_block,
@@ -596,6 +614,25 @@ def form_file_text(form: cgi.FieldStorage, name: str) -> str:
     if isinstance(data, str):
         return data
     return data.decode("utf-8")
+
+
+def submitted_extra_files(form: cgi.FieldStorage) -> dict[str, str]:
+    """Parse the optional `files` field: a JSON object of path -> file content."""
+    raw = form_file_text(form, "files") or form_value(form, "files")
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"`files` must be valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("`files` must be a JSON object mapping relative paths to file contents")
+    files: dict[str, str] = {}
+    for path, content in payload.items():
+        if not isinstance(content, str):
+            raise ValueError(f"`files` entry `{path}` must map to a string file content")
+        files[str(path)] = content
+    return files
 
 
 def request_too_large(headers: Any, *, max_request_bytes: int) -> bool:

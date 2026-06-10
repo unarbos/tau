@@ -110,6 +110,28 @@ and should return `patch`, `logs`, `steps`, `cost`, and `success`.
 `model`, `api_base`, and `api_key` are always provided by the validator and must
 be treated as read-only invocation parameters.
 
+### Multi-file agents
+
+A submission may also be a set of Python files with `agent.py` as the
+entrypoint (for example `agent.py` plus a support package). All files must be
+relative `*.py` paths without traversal, are subject to the same scope-guard
+checks as `agent.py`, and may import each other (the harness puts the agent
+directory on `sys.path`). Submission routes:
+
+- API: pass the extra modules in a `files` form field containing a JSON object
+  of `{relative_path: content}` alongside the usual `agent` field.
+- CLI: `tau private-submit --agent <directory>` collects every `*.py` under the
+  directory.
+- GitHub commitments: commit a `tau_agent_files.json` manifest (a JSON array of
+  relative paths including `agent.py`) at the pinned commit; repos without the
+  manifest keep the legacy single-file `agent.py` extraction.
+
+Single-file submissions keep their historical sha256-of-`agent.py` hash;
+multi-file submissions hash the whole file set, and the same hash is used in
+the commitment and signature payloads below. A working multi-file example,
+ported from the full [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)
+default agent, lives in `agents/mini_swe_multifile/`.
+
 ### Private miner submission rules
 
 In production, miners do not submit code through public GitHub PRs. They submit

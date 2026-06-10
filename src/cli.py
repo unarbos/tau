@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -411,11 +410,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     private_submit = subparsers.add_parser(
         "private-submit",
-        help="Validate and store a signed private miner agent.py submission bundle.",
+        help="Validate and store a signed private miner agent submission bundle.",
     )
     _add_shared_args(private_submit)
     private_submit.add_argument("--hotkey", required=True, help="Miner hotkey that signed this submission.")
-    private_submit.add_argument("--agent", required=True, type=Path, help="Private submitted agent.py file.")
+    private_submit.add_argument(
+        "--agent",
+        required=True,
+        type=Path,
+        help="Private submitted agent.py file, or a directory of Python files with agent.py as the entrypoint.",
+    )
     private_submit.add_argument("--base-agent", required=True, type=Path, help="Current public base agent.py to diff against.")
     private_submit.add_argument("--signature", required=True, help="Hotkey signature over the printed signature payload.")
     private_submit.add_argument("--agent-username", help="Optional agent username signed by the owning coldkey.")
@@ -1126,6 +1130,7 @@ def _run_private_submit(args: argparse.Namespace) -> None:
     from private_submission import (
         SubmissionCheck,
         accepted_private_submission_identity,
+        agent_bundle_sha256,
         build_public_submissions_api_payload,
         derive_submission_id,
         private_submission_registration_check,
@@ -1137,8 +1142,8 @@ def _run_private_submit(args: argparse.Namespace) -> None:
     )
     from validate import _verified_submission_identity_from_config, _verify_hotkey_signature
 
-    agent_py = args.agent.expanduser().read_text(encoding="utf-8")
-    agent_sha256 = hashlib.sha256(agent_py.encode("utf-8")).hexdigest()
+    submitted_files = _collect_submitted_agent_files(args.agent.expanduser())
+    agent_sha256 = agent_bundle_sha256(submitted_files)
     submission_id = args.submission_id or derive_submission_id(
         hotkey=args.hotkey,
         agent_sha256=agent_sha256,
@@ -1239,10 +1244,10 @@ def _run_private_submit(args: argparse.Namespace) -> None:
     judge = None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args)
     result = run_private_submission_checks(
         hotkey=args.hotkey,
-        submitted_agent_py=agent_py,
         base_agent_py=base_agent_py,
         openrouter_judge=judge,
         min_score=args.judge_min_score,
+        submitted_files=submitted_files,
     )
     result.checks["registration_gate"] = registration_check
     result.accepted = result.accepted and registration_check.status == "passed"
@@ -1270,7 +1275,7 @@ def _run_private_submit(args: argparse.Namespace) -> None:
             root=root,
             submission_id=submission_id,
             hotkey=args.hotkey,
-            agent_py=agent_py,
+            agent_files=submitted_files,
             check_result=result,
             signature=args.signature,
             registration_block=registration_block,
@@ -1841,6 +1846,30 @@ def _resolve_local_agent_file(candidate: Path) -> Path:
             return agent_file
         raise ValueError(f"--agent local directory must contain {_DEFAULT_AGENT_FILE}: {candidate}")
     raise ValueError(f"--agent local path must be a Python file or directory: {candidate}")
+
+
+def _collect_submitted_agent_files(candidate: Path) -> dict[str, str]:
+    """Read a private submission as {relative path: content}.
+
+    Accepts the legacy single agent.py file or a directory of Python files
+    with agent.py at its root as the entrypoint.
+    """
+    from private_submission import agent_files_violations
+
+    if candidate.is_file():
+        return {_DEFAULT_AGENT_FILE: candidate.read_text(encoding="utf-8")}
+    if not candidate.is_dir():
+        raise ValueError(f"--agent must be a Python file or a directory: {candidate}")
+    files: dict[str, str] = {}
+    for path in sorted(candidate.rglob("*.py")):
+        relative = path.relative_to(candidate)
+        if any(part == "__pycache__" or part.startswith(".") for part in relative.parts):
+            continue
+        files[relative.as_posix()] = path.read_text(encoding="utf-8")
+    violations = agent_files_violations(files)
+    if violations:
+        raise ValueError(f"--agent directory is not a valid submission: {violations[0]}")
+    return files
 
 
 def _add_solver_args(parser: argparse.ArgumentParser) -> None:

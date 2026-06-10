@@ -157,7 +157,7 @@ def solve_task_in_docker(
         agent_src_path = Path(agent_src_dir)
         agent_root, agent_file = _materialize_agent_source(config=config, target_dir=agent_src_path)
         rollout_started_at = utc_now()
-        agent_hash = _file_sha256(agent_file)
+        agent_hash = _agent_source_sha256(agent_root=agent_root, agent_file=agent_file)
         rollout_id_value = make_rollout_id(
             task_name=task_name or run_label or "unknown-task",
             solution_name=solution_name or run_label or "solution",
@@ -764,6 +764,27 @@ def _file_sha256(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _agent_source_sha256(*, agent_root: Path, agent_file: Path) -> str:
+    """Hash the agent source set for rollout identity.
+
+    A lone agent.py keeps the historical single-file hash; multi-file agents
+    hash every Python file so module edits change the agent identity.
+    """
+    py_files = sorted(
+        path
+        for path in agent_root.rglob("*.py")
+        if not any(part in {"__pycache__", ".git"} for part in path.relative_to(agent_root).parts)
+    )
+    if py_files == [agent_file]:
+        return _file_sha256(agent_file)
+    digest = hashlib.sha256()
+    for path in py_files:
+        relative = path.relative_to(agent_root).as_posix()
+        content_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest.update(f"{relative}\0{content_sha}\n".encode())
     return digest.hexdigest()
 
 
