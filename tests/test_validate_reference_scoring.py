@@ -59,17 +59,11 @@ class ReferenceScoringTest(unittest.TestCase):
             "challenger cannot catch king",
         )
 
-    def test_parallel_round_compares_challenger_to_reference(self):
+    def test_round_compares_king_to_challenger_only(self):
         calls: list[tuple[str, ...]] = []
 
         def fake_compare_task_run(*, task_name, solution_names, config):
             calls.append(tuple(solution_names))
-            if solution_names[1] == "reference":
-                return SimpleNamespace(
-                    matched_changed_lines=123,
-                    similarity_ratio=0.82,
-                    comparison_root="/tmp/challenger-vs-reference",
-                )
             return SimpleNamespace(
                 matched_changed_lines=77,
                 similarity_ratio=0.31,
@@ -103,18 +97,15 @@ class ReferenceScoringTest(unittest.TestCase):
                 duel_id=3,
             )
 
-        self.assertIn(("challenger-7-d3", "reference"), calls)
-        self.assertIn(("king", "challenger-7-d3"), calls)
-        self.assertNotIn(("challenger-7-d3", "baseline"), calls)
+        self.assertEqual(calls, [("king", "challenger-7-d3")])
+        self.assertNotIn(("challenger-7-d3", "reference"), calls)
         self.assertEqual(result.winner, "tie")
-        self.assertEqual(result.challenger_lines, 123)
+        self.assertAlmostEqual(result.king_challenger_similarity, 0.31)
         self.assertAlmostEqual(result.king_score, 0.5)
         self.assertAlmostEqual(result.challenger_score, 0.5)
 
     def test_llm_diff_judge_is_the_round_score(self):
         result = self._run_round_with_judge(
-            king_similarity=0.90,
-            challenger_similarity=0.80,
             judge=DiffJudgeResult(
                 winner="challenger",
                 king_score=0.0,
@@ -128,21 +119,20 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertAlmostEqual(result.challenger_score, 1.0)
         self.assertEqual(result.llm_judge_winner, "challenger")
 
-    def test_patch_similarity_does_not_offset_llm_judge(self):
+    def test_king_challenger_similarity_is_copy_telemetry_only(self):
         result = self._run_round_with_judge(
-            king_similarity=1.0,
-            challenger_similarity=0.0,
             judge=DiffJudgeResult(
-                winner="challenger",
-                king_score=0.0,
-                challenger_score=1.0,
-                rationale="challenger patch is better",
+                winner="king",
+                king_score=0.9,
+                challenger_score=0.2,
+                rationale="king patch is better",
             ),
         )
 
-        self.assertEqual(result.winner, "challenger")
-        self.assertAlmostEqual(result.king_score, 0.0)
-        self.assertAlmostEqual(result.challenger_score, 1.0)
+        self.assertEqual(result.winner, "king")
+        self.assertAlmostEqual(result.king_score, 0.9)
+        self.assertAlmostEqual(result.challenger_score, 0.2)
+        self.assertAlmostEqual(result.king_challenger_similarity, 0.31)
 
     def test_diff_judge_static_prompt_injection_loses_round_score(self):
         result = _diff_judge_prompt_injection_result(
@@ -346,20 +336,8 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertEqual(result.winner, "error")
         self.assertIn("failed", result.error or "")
 
-    def _run_round_with_judge(
-        self,
-        *,
-        king_similarity: float,
-        challenger_similarity: float,
-        judge: DiffJudgeResult,
-    ):
+    def _run_round_with_judge(self, *, judge: DiffJudgeResult):
         def fake_compare_task_run(*, task_name, solution_names, config):
-            if solution_names[1] == "reference":
-                return SimpleNamespace(
-                    matched_changed_lines=int(challenger_similarity * 10_000),
-                    similarity_ratio=challenger_similarity,
-                    comparison_root="/tmp/challenger-vs-reference",
-                )
             return SimpleNamespace(
                 matched_changed_lines=77,
                 similarity_ratio=0.31,
@@ -371,8 +349,8 @@ class ReferenceScoringTest(unittest.TestCase):
             task_root="/tmp/task-judge",
             creation_block=10,
             cursor_elapsed=1.0,
-            king_lines=int(king_similarity * 10_000),
-            king_similarity=king_similarity,
+            king_lines=9_000,
+            king_similarity=0.9,
             baseline_lines=10_000,
         )
         king = _submission(hotkey="king-hk", uid=6, sha="b" * 40)

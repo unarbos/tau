@@ -202,26 +202,26 @@ def build_solver_prompt(task: GeneratedTask) -> str:
     return textwrap.dedent(
         f"""\
         You are solving a software engineering task. Your diff will be scored by
-        positional line-level exact matching against a reference solution.
-        Score = matched_lines / max(your_lines, reference_lines).
+        an LLM judge for correctness, completeness, and alignment with the task;
+        unrelated churn, incomplete fixes, and empty diffs are penalized.
 
         Task:
         {task.prompt_text}
 
         Strategy:
-        1. Read the files that need to change IN FULL before editing.
-        2. Identify the MINIMAL set of changes — every extra line hurts your score.
-        3. Make precise, targeted edits. Match existing code style exactly.
-        4. Stop. Do not summarize, verify, or re-read files.
+        1. Read the ENTIRE task and identify every requirement; your patch must
+           satisfy all of them.
+        2. Read the files that need to change IN FULL before editing.
+        3. Fix the root cause with the smallest complete set of edits, matching
+           the existing code style.
+        4. Stop. Do not summarize or re-read files.
 
         Critical rules:
         - Change ONLY what the task requires. No cosmetic changes, no refactoring.
-        - Match indentation, quotes, semicolons, naming, and spacing character-for-character.
-        - Do not add comments, docstrings, type annotations, or error handling.
+        - Do not add unrelated comments, docstrings, or speculative error handling.
         - Do not reorder imports, rename variables, or fix unrelated issues.
-        - Process files in alphabetical path order. Edit top-to-bottom within each file.
         - Do not run tests, builds, or linters.
-        - Do not create new files unless the task explicitly requires it.
+        - Do not create new files unless the task requires it.
         - When unsure about a change, leave the code as-is.
         """,
     )

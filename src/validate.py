@@ -81,7 +81,6 @@ _REFERENCE_SOLUTION_NAME = "reference"
 _LEGACY_BASELINE_SOLUTION_NAME = "baseline"
 _DIFF_JUDGE_MODEL = "anthropic/claude-sonnet-4.6"
 _DIFF_JUDGE_FALLBACK_MODELS = ("moonshotai/kimi-k2.6",)
-_DIFF_JUDGE_WEIGHT = 1.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_MAX_TOKENS = 16_000
@@ -449,15 +448,10 @@ class DiffJudgeResult:
 class ValidationRoundResult:
     task_name: str
     winner: str
-    king_lines: int
-    challenger_lines: int
-    king_similarity_ratio: float
-    challenger_similarity_ratio: float
+    # King-vs-challenger patch similarity is kept only to detect challengers
+    # that copy the king's patches; it has no weight in round scoring.
     king_challenger_similarity: float
     task_root: str
-    king_compare_root: str
-    challenger_compare_root: str
-    baseline_lines: int = 0
     king_score: float = 0.0
     challenger_score: float = 0.0
     king_llm_score: float = 0.5
@@ -466,7 +460,6 @@ class ValidationRoundResult:
     llm_judge_model: str = _DIFF_JUDGE_MODEL
     llm_judge_rationale: str = ""
     llm_judge_error: str | None = None
-    llm_judge_weight: float = _DIFF_JUDGE_WEIGHT
     king_exit_reason: str | None = None
     king_agent_timeout_seconds: int | None = None
     challenger_exit_reason: str | None = None
@@ -1032,15 +1025,11 @@ def _active_duel_dashboard_info_from_state(
             {
                 "task_name": r.task_name,
                 "winner": r.winner,
-                "king_lines": r.king_lines,
-                "challenger_lines": r.challenger_lines,
                 "king_score": r.king_score,
                 "challenger_score": r.challenger_score,
                 "king_llm_score": r.king_llm_score,
                 "challenger_llm_score": r.challenger_llm_score,
                 "llm_judge_winner": r.llm_judge_winner,
-                "king_similarity_ratio": r.king_similarity_ratio,
-                "challenger_similarity_ratio": r.challenger_similarity_ratio,
                 "king_challenger_similarity": r.king_challenger_similarity,
             }
             for r in lease.rounds
@@ -1396,10 +1385,6 @@ def _neutral_diff_judge(reason: str | None = None) -> DiffJudgeResult:
     )
 
 
-def _combined_round_score(cursor_similarity: float, llm_score: float) -> float:
-    return _clamp01(llm_score)
-
-
 def _round_winner_from_scores(king_score: float, challenger_score: float) -> str:
     if challenger_score > king_score:
         return "challenger"
@@ -1457,14 +1442,8 @@ def _provider_endpoint_round_error(
     return ValidationRoundResult(
         task_name=task.task_name,
         winner="error",
-        king_lines=0,
-        challenger_lines=0,
-        king_similarity_ratio=0.0,
-        challenger_similarity_ratio=0.0,
         king_challenger_similarity=0.0,
         task_root=task.task_root,
-        king_compare_root="",
-        challenger_compare_root="",
         king_exit_reason=king_exit_reason,
         king_agent_timeout_seconds=agent_timeout,
         challenger_exit_reason=challenger_exit_reason,
@@ -2996,8 +2975,6 @@ def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]
     return {
         "task_name": round_result.task_name,
         "winner": round_result.winner,
-        "king_lines": round_result.king_lines,
-        "challenger_lines": round_result.challenger_lines,
         "king_score": round_result.king_score,
         "challenger_score": round_result.challenger_score,
         "king_llm_score": round_result.king_llm_score,
@@ -3007,8 +2984,6 @@ def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]
         "challenger_exit_reason": round_result.challenger_exit_reason,
         "king_agent_timeout_seconds": round_result.king_agent_timeout_seconds,
         "challenger_agent_timeout_seconds": round_result.challenger_agent_timeout_seconds,
-        "king_similarity_ratio": round_result.king_similarity_ratio,
-        "challenger_similarity_ratio": round_result.challenger_similarity_ratio,
         "king_challenger_similarity": round_result.king_challenger_similarity,
     }
 
@@ -3131,11 +3106,6 @@ def _solve_and_compare_round(
         )
         _remove_compare_artifacts(
             task_name=task.task_name,
-            solution_names=_reference_compare_solution_names(solution_label),
-            config=config,
-        )
-        _remove_compare_artifacts(
-            task_name=task.task_name,
             solution_names=["king", solution_label],
             config=config,
         )
@@ -3183,34 +3153,27 @@ def _solve_and_compare_round(
                 chall_has_patch,
             )
 
-        cmp_exec = ThreadPoolExecutor(max_workers=2)
+        # King-vs-challenger similarity is computed only to detect challengers
+        # copying the king's patches. Bound compare time so a wedged comparator
+        # can't pin a round forever.
+        cmp_exec = ThreadPoolExecutor(max_workers=1)
         try:
-            chall_fut = cmp_exec.submit(
-                compare_task_run, task_name=task.task_name,
-                solution_names=_reference_compare_solution_names(solution_label), config=config,
-            )
             kc_fut = cmp_exec.submit(
                 compare_task_run, task_name=task.task_name,
                 solution_names=["king", solution_label], config=config,
             )
-            # Bound compare time so a wedged comparator can't pin a round forever.
-            chall_compare = chall_fut.result(timeout=_PARALLEL_DUEL_COMPARE_TIMEOUT)
             kc_compare = kc_fut.result(timeout=_PARALLEL_DUEL_COMPARE_TIMEOUT)
         finally:
             # Never block on hung compare workers after result timeouts.
             cmp_exec.shutdown(wait=False, cancel_futures=True)
 
-        zero_challenger = chall_timed_out and not chall_has_patch
-        c_lines = 0 if zero_challenger else chall_compare.matched_changed_lines
-        k_lines = task.king_lines
-        challenger_similarity = 0.0 if zero_challenger else chall_compare.similarity_ratio
         diff_judge = _judge_round_diffs(
             task_name=task.task_name,
             challenger_solution_name=solution_label,
             config=config,
         )
-        king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
-        challenger_score = _combined_round_score(challenger_similarity, diff_judge.challenger_score)
+        king_score = _clamp01(diff_judge.king_score)
+        challenger_score = _clamp01(diff_judge.challenger_score)
 
         winner = _round_winner_from_scores(king_score, challenger_score)
 
@@ -3226,14 +3189,8 @@ def _solve_and_compare_round(
         )
         result = ValidationRoundResult(
             task_name=task.task_name, winner=winner,
-            king_lines=k_lines, challenger_lines=c_lines,
-            king_similarity_ratio=task.king_similarity,
-            challenger_similarity_ratio=challenger_similarity,
             king_challenger_similarity=kc_compare.similarity_ratio,
             task_root=task.task_root,
-            king_compare_root="",
-            challenger_compare_root=chall_compare.comparison_root,
-            baseline_lines=task.baseline_lines,
             king_score=king_score,
             challenger_score=challenger_score,
             king_llm_score=diff_judge.king_score,
@@ -3255,11 +3212,8 @@ def _solve_and_compare_round(
     except Exception as exc:
         return ValidationRoundResult(
             task_name=task.task_name, winner="error",
-            king_lines=0, challenger_lines=0,
-            king_similarity_ratio=0.0, challenger_similarity_ratio=0.0,
             king_challenger_similarity=0.0,
-            task_root=task.task_root, king_compare_root="",
-            challenger_compare_root="",
+            task_root=task.task_root,
             error=f"duel {duel_id} task {task.task_name} failed: {exc}",
         )
 
@@ -3691,12 +3645,8 @@ def _run_parallel_duel(
                         log.exception("Duel %d: round %s raised", duel_id, task.task_name)
                         result = ValidationRoundResult(
                             task_name=task.task_name, winner="error",
-                            king_lines=0, challenger_lines=0,
-                            king_similarity_ratio=0.0,
-                            challenger_similarity_ratio=0.0,
                             king_challenger_similarity=0.0,
-                            task_root=task.task_root, king_compare_root="",
-                            challenger_compare_root="",
+                            task_root=task.task_root,
                             error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
                         )
                     rounds.append(result)
@@ -3796,12 +3746,8 @@ def _run_parallel_duel(
                     rounds.append(
                         ValidationRoundResult(
                             task_name=task.task_name, winner="error",
-                            king_lines=0, challenger_lines=0,
-                            king_similarity_ratio=0.0,
-                            challenger_similarity_ratio=0.0,
                             king_challenger_similarity=0.0,
-                            task_root=task.task_root, king_compare_root="",
-                            challenger_compare_root="",
+                            task_root=task.task_root,
                             error=f"duel {duel_id} task {task.task_name} timed out ({reason})",
                         )
                     )
@@ -3809,12 +3755,8 @@ def _run_parallel_duel(
                     rounds.append(
                         ValidationRoundResult(
                             task_name=task.task_name, winner="error",
-                            king_lines=0, challenger_lines=0,
-                            king_similarity_ratio=0.0,
-                            challenger_similarity_ratio=0.0,
                             king_challenger_similarity=0.0,
-                            task_root=task.task_root, king_compare_root="",
-                            challenger_compare_root="",
+                            task_root=task.task_root,
                             error=f"duel {duel_id} task {task.task_name} not started ({reason})",
                         )
                     )
@@ -3951,9 +3893,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
     _kill_stale_containers()
     log.info(
-        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s); patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
+        "Scoring: %d rounds per duel, round score is the LLM diff judge (%s); king-challenger patch similarity is used only for copy detection, ties ignored, challenger must beat king by >%d decisive round(s)",
         config.validate_duel_rounds,
-        _DIFF_JUDGE_WEIGHT * 100,
         _DIFF_JUDGE_MODEL,
         config.validate_win_margin,
     )
@@ -5111,12 +5052,9 @@ def _publish_dashboard(
             "method": "race",
             "duel_rounds": config.validate_duel_rounds,
             "win_margin": config.validate_win_margin,
-            "patch_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
-            "cursor_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
-            "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT,
             "llm_diff_judge_model": _DIFF_JUDGE_MODEL,
             "ties_count": False,
-            "description": "Round score is based only on the LLM diff judgment; patch similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
+            "description": "Round score is the LLM diff judgment. King-challenger patch similarity is computed only for copy detection; reference patch similarity is used only for task pool integrity. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
         },
         "queue": [
             {

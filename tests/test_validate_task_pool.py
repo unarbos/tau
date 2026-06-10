@@ -31,14 +31,8 @@ class TaskPoolTest(unittest.TestCase):
         scored = validate.ValidationRoundResult(
             task_name="task-scored",
             winner="king",
-            king_lines=3,
-            challenger_lines=1,
-            king_similarity_ratio=0.8,
-            challenger_similarity_ratio=0.4,
             king_challenger_similarity=0.2,
             task_root="/tmp/task-scored",
-            king_compare_root="",
-            challenger_compare_root="",
         )
 
         payload = validate._active_rounds_payload([scored])
@@ -1764,14 +1758,8 @@ class TaskPoolTest(unittest.TestCase):
                 validate.ValidationRoundResult(
                     task_name="task-a",
                     winner="error",
-                    king_lines=0,
-                    challenger_lines=0,
-                    king_similarity_ratio=0.0,
-                    challenger_similarity_ratio=0.0,
                     king_challenger_similarity=0.0,
                     task_root="/tmp/task-a",
-                    king_compare_root="",
-                    challenger_compare_root="",
                     error="OPENROUTER_API_KEY is not set",
                 )
             ],
@@ -1839,14 +1827,8 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="king",
-                    king_lines=1,
-                    challenger_lines=1,
-                    king_similarity_ratio=1.0,
-                    challenger_similarity_ratio=0.0,
                     king_challenger_similarity=0.0,
                     task_root=task.task_root,
-                    king_compare_root="",
-                    challenger_compare_root="",
                 )
 
             with patch("validate._solve_and_compare_round", side_effect=king_round) as solve_round:
@@ -1918,14 +1900,8 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="king",
-                    king_lines=1,
-                    challenger_lines=1,
-                    king_similarity_ratio=1.0,
-                    challenger_similarity_ratio=0.0,
                     king_challenger_similarity=0.0,
                     task_root=task.task_root,
-                    king_compare_root="",
-                    challenger_compare_root="",
                 )
 
             with (
@@ -2001,14 +1977,8 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner=winner,
-                    king_lines=1,
-                    challenger_lines=1,
-                    king_similarity_ratio=1.0,
-                    challenger_similarity_ratio=0.0,
                     king_challenger_similarity=0.0,
                     task_root=task.task_root,
-                    king_compare_root="",
-                    challenger_compare_root="",
                 )
 
             def drain_losing_prefix_first(pending, timeout=None, return_when=None):
@@ -2088,14 +2058,8 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="challenger",
-                    king_lines=1,
-                    challenger_lines=1,
-                    king_similarity_ratio=0.0,
-                    challenger_similarity_ratio=1.0,
                     king_challenger_similarity=0.95,
                     task_root=task.task_root,
-                    king_compare_root="",
-                    challenger_compare_root="",
                 )
 
             with patch("validate._solve_and_compare_round", side_effect=copied_round) as solve_round:
@@ -2167,14 +2131,8 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="tie",
-                    king_lines=1,
-                    challenger_lines=1,
-                    king_similarity_ratio=0.0,
-                    challenger_similarity_ratio=1.0,
                     king_challenger_similarity=1.0,
                     task_root=task.task_root,
-                    king_compare_root="",
-                    challenger_compare_root="",
                 )
 
             with (
@@ -2249,14 +2207,8 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="challenger",
-                    king_lines=1,
-                    challenger_lines=1,
-                    king_similarity_ratio=0.0,
-                    challenger_similarity_ratio=1.0,
                     king_challenger_similarity=0.0,
                     task_root=task.task_root,
-                    king_compare_root="",
-                    challenger_compare_root="",
                 )
 
             def wait_for_submitted_round(pending, timeout=None, return_when=None):
@@ -2337,14 +2289,8 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="challenger",
-                    king_lines=1,
-                    challenger_lines=1,
-                    king_similarity_ratio=0.0,
-                    challenger_similarity_ratio=1.0,
                     king_challenger_similarity=0.0,
                     task_root=task.task_root,
-                    king_compare_root="",
-                    challenger_compare_root="",
                 )
 
             def wait_for_submitted_round(pending, timeout=None, return_when=None):
