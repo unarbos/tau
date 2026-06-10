@@ -29,18 +29,20 @@ Please solve this issue:
 {task_text}
 </task>
 {extra_context}
-Your final patch is scored by positional line-level exact matching against a
-hidden reference solution written by the upstream maintainers:
-score = matched_lines / max(your_changed_lines, reference_changed_lines).
+Your final patch is scored by an LLM judge that uses the upstream maintainers'
+actual fix as privileged reference context. The judge rewards correct,
+complete fixes aligned with the task, and penalizes unrelated churn,
+incomplete solutions, and empty diffs.
 
 ## Workflow
 
-1. Find and read the files that need to change IN FULL before editing.
-2. Identify the MINIMAL set of edits; every extra changed line lowers the score.
-3. Apply precise edits that match the existing code style character for
-   character (indentation, quotes, naming, spacing).
-4. Re-read the edited region to confirm the change is exact and syntactically
-   valid.
+1. Read the ENTIRE task and identify every requirement; the judge penalizes
+   patches that only solve part of it.
+2. Find and read the files that need to change IN FULL before editing.
+3. Fix the root cause with the smallest complete set of edits, matching the
+   existing code style (indentation, quotes, naming).
+4. Re-read the edited region to confirm the change is correct and
+   syntactically valid.
 5. Finish by running exactly:
 
 ```bash
@@ -50,7 +52,7 @@ echo {sentinel}
 ## Hard rules
 
 - Change ONLY what the task requires. No refactoring, no cosmetic changes.
-- Do not add comments, docstrings, type annotations, or extra error handling.
+- Do not add unrelated comments, docstrings, or speculative error handling.
 - Do not reorder imports, rename variables, or fix unrelated problems.
 - Do not run test suites, builds, or linters; a quick `python -c` syntax check
   is the most you should do.
