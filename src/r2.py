@@ -673,8 +673,6 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
     rounds = duel_dict.get("rounds", [])
 
     scored_rounds = [r for r in rounds if r.get("error") is None]
-    king_ratios = [r["king_similarity_ratio"] for r in scored_rounds if "king_similarity_ratio" in r]
-    challenger_ratios = [r["challenger_similarity_ratio"] for r in scored_rounds if "challenger_similarity_ratio" in r]
     king_scores = [r["king_score"] for r in scored_rounds if "king_score" in r]
     challenger_scores = [r["challenger_score"] for r in scored_rounds if "challenger_score" in r]
     king_llm_scores = [r["king_llm_score"] for r in scored_rounds if "king_llm_score" in r]
@@ -710,8 +708,6 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
         "challenger_commit_sha": challenger.get("commit_sha"),
         "challenger_display_commit_sha": challenger.get("display_commit_sha"),
         "challenger_commitment_block": challenger.get("commitment_block"),
-        "king_similarity_ratio_mean": (sum(king_ratios) / len(king_ratios)) if king_ratios else 0.0,
-        "challenger_similarity_ratio_mean": (sum(challenger_ratios) / len(challenger_ratios)) if challenger_ratios else 0.0,
         "king_score_mean": (sum(king_scores) / len(king_scores)) if king_scores else 0.0,
         "challenger_score_mean": (sum(challenger_scores) / len(challenger_scores)) if challenger_scores else 0.0,
         "king_llm_score_mean": (sum(king_llm_scores) / len(king_llm_scores)) if king_llm_scores else 0.0,
@@ -735,18 +731,12 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
             {
                 "task_name": r.get("task_name"),
                 "winner": r.get("winner"),
-                "king_similarity_ratio": r.get("king_similarity_ratio", 0.0),
-                "challenger_similarity_ratio": r.get("challenger_similarity_ratio", 0.0),
-                "king_challenger_similarity": r.get("king_challenger_similarity", 0.0),
                 "king_score": r.get("king_score", 0.0),
                 "challenger_score": r.get("challenger_score", 0.0),
                 "king_llm_score": r.get("king_llm_score", 0.5),
                 "challenger_llm_score": r.get("challenger_llm_score", 0.5),
                 "llm_judge_winner": r.get("llm_judge_winner", "tie"),
                 "llm_judge_rationale": r.get("llm_judge_rationale"),
-                "king_lines": r.get("king_lines", 0),
-                "challenger_lines": r.get("challenger_lines", 0),
-                "baseline_lines": r.get("baseline_lines", 0),
             }
             for r in scored_rounds
         ],

@@ -81,7 +81,6 @@ _REFERENCE_SOLUTION_NAME = "reference"
 _LEGACY_BASELINE_SOLUTION_NAME = "baseline"
 _DIFF_JUDGE_MODEL = "anthropic/claude-sonnet-4.6"
 _DIFF_JUDGE_FALLBACK_MODELS = ("moonshotai/kimi-k2.6",)
-_DIFF_JUDGE_WEIGHT = 1.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_MAX_TOKENS = 16_000
@@ -120,14 +119,8 @@ _DIFF_JUDGE_ASSERTION_TARGETS = (
 )
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 50
-_COPY_MEAN_SIMILARITY_THRESHOLD = 0.90
-_COPY_NEAR_EXACT_SIMILARITY_THRESHOLD = 0.98
-_COPY_SUSPICIOUS_SIMILARITY_THRESHOLD = 0.92
-_COPY_NEAR_EXACT_MIN_ROUNDS = 10
-_COPY_SUSPICIOUS_FRACTION_THRESHOLD = 0.60
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
-_PARALLEL_DUEL_COMPARE_TIMEOUT = 600.0
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 300.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _GRACEFUL_DUEL_SHUTDOWN_SECONDS = 300.0
@@ -231,41 +224,6 @@ def _duel_math_stop_reason(wins: int, losses: int, remaining_rounds: int, margin
 
 def _duel_speed_stop_reason(wins: int, losses: int, remaining_rounds: int, margin: int) -> str | None:
     return _duel_math_stop_reason(wins, losses, remaining_rounds, margin)
-
-
-def _copy_detection_reason(
-    rounds: Sequence[ValidationRoundResult],
-    *,
-    include_mean_similarity: bool = True,
-    include_suspicious_fraction: bool = True,
-) -> str | None:
-    scored_sim = [r.king_challenger_similarity for r in rounds if r.scored and r.king_challenger_similarity > 0]
-    if not scored_sim:
-        return None
-
-    mean_sim = sum(scored_sim) / len(scored_sim)
-    if include_mean_similarity and mean_sim >= _COPY_MEAN_SIMILARITY_THRESHOLD:
-        return (
-            "copy detected "
-            f"(mean similarity {mean_sim:.3f} >= {_COPY_MEAN_SIMILARITY_THRESHOLD:.2f})"
-        )
-
-    near_exact = [sim for sim in scored_sim if sim >= _COPY_NEAR_EXACT_SIMILARITY_THRESHOLD]
-    if len(near_exact) >= _COPY_NEAR_EXACT_MIN_ROUNDS:
-        return (
-            "copy detected "
-            f"({len(near_exact)} near-exact rounds >= {_COPY_NEAR_EXACT_SIMILARITY_THRESHOLD:.2f})"
-        )
-
-    suspicious = [sim for sim in scored_sim if sim >= _COPY_SUSPICIOUS_SIMILARITY_THRESHOLD]
-    suspicious_fraction = len(suspicious) / len(scored_sim)
-    if include_suspicious_fraction and suspicious_fraction >= _COPY_SUSPICIOUS_FRACTION_THRESHOLD:
-        return (
-            "copy detected "
-            f"({len(suspicious)}/{len(scored_sim)} rounds >= {_COPY_SUSPICIOUS_SIMILARITY_THRESHOLD:.2f})"
-        )
-
-    return None
 
 
 def _required_duel_tasks(n_rounds: int) -> int:
@@ -449,15 +407,7 @@ class DiffJudgeResult:
 class ValidationRoundResult:
     task_name: str
     winner: str
-    king_lines: int
-    challenger_lines: int
-    king_similarity_ratio: float
-    challenger_similarity_ratio: float
-    king_challenger_similarity: float
     task_root: str
-    king_compare_root: str
-    challenger_compare_root: str
-    baseline_lines: int = 0
     king_score: float = 0.0
     challenger_score: float = 0.0
     king_llm_score: float = 0.5
@@ -466,7 +416,6 @@ class ValidationRoundResult:
     llm_judge_model: str = _DIFF_JUDGE_MODEL
     llm_judge_rationale: str = ""
     llm_judge_error: str | None = None
-    llm_judge_weight: float = _DIFF_JUDGE_WEIGHT
     king_exit_reason: str | None = None
     king_agent_timeout_seconds: int | None = None
     challenger_exit_reason: str | None = None
@@ -1032,16 +981,11 @@ def _active_duel_dashboard_info_from_state(
             {
                 "task_name": r.task_name,
                 "winner": r.winner,
-                "king_lines": r.king_lines,
-                "challenger_lines": r.challenger_lines,
                 "king_score": r.king_score,
                 "challenger_score": r.challenger_score,
                 "king_llm_score": r.king_llm_score,
                 "challenger_llm_score": r.challenger_llm_score,
                 "llm_judge_winner": r.llm_judge_winner,
-                "king_similarity_ratio": r.king_similarity_ratio,
-                "challenger_similarity_ratio": r.challenger_similarity_ratio,
-                "king_challenger_similarity": r.king_challenger_similarity,
             }
             for r in lease.rounds
             if r.scored
@@ -1396,10 +1340,6 @@ def _neutral_diff_judge(reason: str | None = None) -> DiffJudgeResult:
     )
 
 
-def _combined_round_score(cursor_similarity: float, llm_score: float) -> float:
-    return _clamp01(llm_score)
-
-
 def _round_winner_from_scores(king_score: float, challenger_score: float) -> str:
     if challenger_score > king_score:
         return "challenger"
@@ -1457,14 +1397,7 @@ def _provider_endpoint_round_error(
     return ValidationRoundResult(
         task_name=task.task_name,
         winner="error",
-        king_lines=0,
-        challenger_lines=0,
-        king_similarity_ratio=0.0,
-        challenger_similarity_ratio=0.0,
-        king_challenger_similarity=0.0,
         task_root=task.task_root,
-        king_compare_root="",
-        challenger_compare_root="",
         king_exit_reason=king_exit_reason,
         king_agent_timeout_seconds=agent_timeout,
         challenger_exit_reason=challenger_exit_reason,
@@ -2996,8 +2929,6 @@ def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]
     return {
         "task_name": round_result.task_name,
         "winner": round_result.winner,
-        "king_lines": round_result.king_lines,
-        "challenger_lines": round_result.challenger_lines,
         "king_score": round_result.king_score,
         "challenger_score": round_result.challenger_score,
         "king_llm_score": round_result.king_llm_score,
@@ -3007,9 +2938,6 @@ def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]
         "challenger_exit_reason": round_result.challenger_exit_reason,
         "king_agent_timeout_seconds": round_result.king_agent_timeout_seconds,
         "challenger_agent_timeout_seconds": round_result.challenger_agent_timeout_seconds,
-        "king_similarity_ratio": round_result.king_similarity_ratio,
-        "challenger_similarity_ratio": round_result.challenger_similarity_ratio,
-        "king_challenger_similarity": round_result.king_challenger_similarity,
     }
 
 
@@ -3129,16 +3057,6 @@ def _solve_and_compare_round(
             solution_name=solution_label,
             config=config,
         )
-        _remove_compare_artifacts(
-            task_name=task.task_name,
-            solution_names=_reference_compare_solution_names(solution_label),
-            config=config,
-        )
-        _remove_compare_artifacts(
-            task_name=task.task_name,
-            solution_names=["king", solution_label],
-            config=config,
-        )
         agent_timeout = _duel_agent_timeout(task)
         king_exit_reason, _ = _cached_solution_summary(
             task_name=task.task_name,
@@ -3183,34 +3101,13 @@ def _solve_and_compare_round(
                 chall_has_patch,
             )
 
-        cmp_exec = ThreadPoolExecutor(max_workers=2)
-        try:
-            chall_fut = cmp_exec.submit(
-                compare_task_run, task_name=task.task_name,
-                solution_names=_reference_compare_solution_names(solution_label), config=config,
-            )
-            kc_fut = cmp_exec.submit(
-                compare_task_run, task_name=task.task_name,
-                solution_names=["king", solution_label], config=config,
-            )
-            # Bound compare time so a wedged comparator can't pin a round forever.
-            chall_compare = chall_fut.result(timeout=_PARALLEL_DUEL_COMPARE_TIMEOUT)
-            kc_compare = kc_fut.result(timeout=_PARALLEL_DUEL_COMPARE_TIMEOUT)
-        finally:
-            # Never block on hung compare workers after result timeouts.
-            cmp_exec.shutdown(wait=False, cancel_futures=True)
-
-        zero_challenger = chall_timed_out and not chall_has_patch
-        c_lines = 0 if zero_challenger else chall_compare.matched_changed_lines
-        k_lines = task.king_lines
-        challenger_similarity = 0.0 if zero_challenger else chall_compare.similarity_ratio
         diff_judge = _judge_round_diffs(
             task_name=task.task_name,
             challenger_solution_name=solution_label,
             config=config,
         )
-        king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
-        challenger_score = _combined_round_score(challenger_similarity, diff_judge.challenger_score)
+        king_score = _clamp01(diff_judge.king_score)
+        challenger_score = _clamp01(diff_judge.challenger_score)
 
         winner = _round_winner_from_scores(king_score, challenger_score)
 
@@ -3226,14 +3123,7 @@ def _solve_and_compare_round(
         )
         result = ValidationRoundResult(
             task_name=task.task_name, winner=winner,
-            king_lines=k_lines, challenger_lines=c_lines,
-            king_similarity_ratio=task.king_similarity,
-            challenger_similarity_ratio=challenger_similarity,
-            king_challenger_similarity=kc_compare.similarity_ratio,
             task_root=task.task_root,
-            king_compare_root="",
-            challenger_compare_root=chall_compare.comparison_root,
-            baseline_lines=task.baseline_lines,
             king_score=king_score,
             challenger_score=challenger_score,
             king_llm_score=diff_judge.king_score,
@@ -3255,11 +3145,7 @@ def _solve_and_compare_round(
     except Exception as exc:
         return ValidationRoundResult(
             task_name=task.task_name, winner="error",
-            king_lines=0, challenger_lines=0,
-            king_similarity_ratio=0.0, challenger_similarity_ratio=0.0,
-            king_challenger_similarity=0.0,
-            task_root=task.task_root, king_compare_root="",
-            challenger_compare_root="",
+            task_root=task.task_root,
             error=f"duel {duel_id} task {task.task_name} failed: {exc}",
         )
 
@@ -3452,7 +3338,6 @@ def _run_parallel_duel(
     partial_shutdown_interrupt = False
     provider_account_pause_reason: str | None = None
     math_stop_reason: str | None = None
-    dq_stop_reason: str | None = None
 
     def _emit_progress() -> None:
         if on_round_complete is None:
@@ -3587,28 +3472,6 @@ def _run_parallel_duel(
             )
             thread.start()
 
-        def _stop_for_dq_if_detected() -> bool:
-            nonlocal dq_stop_reason
-            if stop_submitting_reason is not None:
-                return False
-            reason = _copy_detection_reason(
-                rounds,
-                include_mean_similarity=False,
-                include_suspicious_fraction=False,
-            )
-            if reason is None:
-                return False
-            dq_stop_reason = reason
-            log.warning(
-                "Duel %d: challenger uid=%s disqualified early: %s",
-                duel_id,
-                challenger.uid,
-                reason,
-            )
-            _stop_submitting(reason)
-            _cancel_pending_rounds(reason)
-            return True
-
         def _stop_for_math_if_decided(extra_unresolved: int = 0) -> bool:
             nonlocal math_stop_reason
             if stop_submitting_reason is not None:
@@ -3649,7 +3512,7 @@ def _run_parallel_duel(
                 len(task_queue),
             )
             _emit_progress()
-        if not _stop_for_dq_if_detected() and not _stop_for_math_if_decided():
+        if not _stop_for_math_if_decided():
             _submit_available()
         while pending:
             now = time.monotonic()
@@ -3691,12 +3554,7 @@ def _run_parallel_duel(
                         log.exception("Duel %d: round %s raised", duel_id, task.task_name)
                         result = ValidationRoundResult(
                             task_name=task.task_name, winner="error",
-                            king_lines=0, challenger_lines=0,
-                            king_similarity_ratio=0.0,
-                            challenger_similarity_ratio=0.0,
-                            king_challenger_similarity=0.0,
-                            task_root=task.task_root, king_compare_root="",
-                            challenger_compare_root="",
+                            task_root=task.task_root,
                             error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
                         )
                     rounds.append(result)
@@ -3746,7 +3604,6 @@ def _run_parallel_duel(
 
                     progress_changed = True
                     results_since_progress_emit += 1
-                    _stop_for_dq_if_detected()
                     undrained_done = len(done_list) - done_index - 1
                     math_stopped = _stop_for_math_if_decided(extra_unresolved=undrained_done)
                     if math_stopped:
@@ -3796,12 +3653,7 @@ def _run_parallel_duel(
                     rounds.append(
                         ValidationRoundResult(
                             task_name=task.task_name, winner="error",
-                            king_lines=0, challenger_lines=0,
-                            king_similarity_ratio=0.0,
-                            challenger_similarity_ratio=0.0,
-                            king_challenger_similarity=0.0,
-                            task_root=task.task_root, king_compare_root="",
-                            challenger_compare_root="",
+                            task_root=task.task_root,
                             error=f"duel {duel_id} task {task.task_name} timed out ({reason})",
                         )
                     )
@@ -3809,12 +3661,7 @@ def _run_parallel_duel(
                     rounds.append(
                         ValidationRoundResult(
                             task_name=task.task_name, winner="error",
-                            king_lines=0, challenger_lines=0,
-                            king_similarity_ratio=0.0,
-                            challenger_similarity_ratio=0.0,
-                            king_challenger_similarity=0.0,
-                            task_root=task.task_root, king_compare_root="",
-                            challenger_compare_root="",
+                            task_root=task.task_root,
                             error=f"duel {duel_id} task {task.task_name} not started ({reason})",
                         )
                     )
@@ -3854,16 +3701,7 @@ def _run_parallel_duel(
         raise RuntimeError(provider_account_pause_reason)
 
     solve_elapsed = time.monotonic() - solve_start
-    if dq_stop_reason:
-        log.info(
-            "Duel %d: stopped after %d/%d selected round(s) in %.1fs due to challenger DQ (%s)",
-            duel_id,
-            len(rounds),
-            len(tasks),
-            solve_elapsed,
-            dq_stop_reason,
-        )
-    elif math_stop_reason:
+    if math_stop_reason:
         log.info(
             "Duel %d: mathematically stopped after %d/%d selected round(s) in %.1fs (%s)",
             duel_id,
@@ -3889,19 +3727,12 @@ def _run_parallel_duel(
              duel_id, wins, losses, ties, decisive, challenger_won)
 
     king_replaced = False
-    dq_reason = dq_stop_reason
     king_after = king
 
-    if dq_reason is not None:
-        log.warning("Duel %d: %s", duel_id, dq_reason)
-    elif challenger_won:
-        dq_reason = _copy_detection_reason(rounds)
-        if dq_reason is not None:
-            log.warning("Duel %d: %s", duel_id, dq_reason)
-        else:
-            king_replaced = True
-            log.info("Duel %d: challenger uid=%s WINS (%d/%d decisive)",
-                     duel_id, challenger.uid, wins, decisive)
+    if challenger_won:
+        king_replaced = True
+        log.info("Duel %d: challenger uid=%s WINS (%d/%d decisive)",
+                 duel_id, challenger.uid, wins, decisive)
     else:
         log.info(
             "Duel %d: king defends (challenger uid=%s got %dW/%dL, needed >%dW)",
@@ -3917,7 +3748,6 @@ def _run_parallel_duel(
         king_before=king, challenger=challenger, rounds=rounds,
         wins=wins, losses=losses, ties=ties,
         king_after=king_after, king_replaced=king_replaced,
-        disqualification_reason=dq_reason,
     )
 
 
@@ -3951,9 +3781,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
     _kill_stale_containers()
     log.info(
-        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s); patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
+        "Scoring: %d rounds per duel, round score is the LLM diff judge (%s); ties ignored, challenger must beat king by >%d decisive round(s)",
         config.validate_duel_rounds,
-        _DIFF_JUDGE_WEIGHT * 100,
         _DIFF_JUDGE_MODEL,
         config.validate_win_margin,
     )
@@ -5111,12 +4940,9 @@ def _publish_dashboard(
             "method": "race",
             "duel_rounds": config.validate_duel_rounds,
             "win_margin": config.validate_win_margin,
-            "patch_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
-            "cursor_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
-            "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT,
             "llm_diff_judge_model": _DIFF_JUDGE_MODEL,
             "ties_count": False,
-            "description": "Round score is based only on the LLM diff judgment; patch similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
+            "description": "Round score is the LLM diff judgment; reference patch similarity is used only for task pool integrity. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
         },
         "queue": [
             {
