@@ -1,12 +1,14 @@
 #!/bin/bash
 exec doppler run -p arbos -c dev -- \
+  env \
+    OPENROUTER_UPSTREAM_BASE_URL="${OPENROUTER_UPSTREAM_BASE_URL:?Set OPENROUTER_UPSTREAM_BASE_URL to the det endpoint base URL}" \
+    OPENROUTER_API_KEY="${OPENROUTER_API_KEY:?Set OPENROUTER_API_KEY for the det endpoint}" \
+    PRIVATE_SUBMISSION_JUDGE_MODEL=deepseek-ai/DeepSeek-V4-Flash \
   /home/const/subnet66/.venv/bin/python -m cli validate \
   --workspace-root /home/const/subnet66/tau \
   --wallet-name sn66_owner \
   --wallet-hotkey default \
-  --solver-model minimax/minimax-m2.7 \
-  --solver-provider-only minimax/fp8 \
-  --solver-provider-disable-fallbacks \
+  --solver-model deepseek-ai/DeepSeek-V4-Flash \
   --max-concurrency 1 \
   --round-concurrency 50 \
   --docker-solver-start-concurrency 32 \

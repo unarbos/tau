@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from datetime import UTC, datetime
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from tau.rollouts.redaction import public_rollout
-from tau.rollouts.store import load_task_rollouts, write_gzip_jsonl
+from tau.rollouts.store import load_task_rollouts, write_gzip_jsonl, write_json_atomic
 
 log = logging.getLogger("swe-eval.rollouts.export-hf")
 
@@ -37,21 +38,66 @@ def rollout_export_manifest_path(root: Path) -> Path:
     return root / "hf-exported-rollouts.json"
 
 
+_MANIFEST_ENTRY_RE = re.compile(
+    r'"(?P<name>[^"]+)"\s*:\s*\{\s*'
+    r'"exported_at"\s*:\s*"(?P<exported_at>[^"]+)"\s*,\s*'
+    r'"hf_path"\s*:\s*"(?P<hf_path>[^"]+)"\s*,\s*'
+    r'"task_name"\s*:\s*"(?P<task_name>[^"]+)"\s*\}'
+)
+
+
+def _salvage_export_manifest(path: Path, raw: str) -> dict[str, Any]:
+    """Recover entries from a corrupt manifest instead of dropping history.
+
+    A truncated manifest (e.g. ENOSPC mid-write) must not read as empty:
+    the next mark_task_rollouts_exported() would persist that empty view,
+    the exporter would re-upload every local bundle, and the uploaded-dir
+    pruner would stop recognizing anything as uploaded.
+    """
+    tasks: dict[str, Any] = {}
+    for match in _MANIFEST_ENTRY_RE.finditer(raw):
+        tasks[match.group("name")] = {
+            "task_name": match.group("task_name"),
+            "hf_path": match.group("hf_path"),
+            "exported_at": match.group("exported_at"),
+        }
+    backup = path.with_suffix(path.suffix + ".corrupt.bak")
+    try:
+        shutil.copyfile(path, backup)
+    except OSError:
+        log.exception("Could not back up corrupt rollout export manifest %s", path)
+    manifest = {"tasks": tasks}
+    try:
+        write_json_atomic(path, manifest)
+    except OSError:
+        log.exception("Could not rewrite salvaged rollout export manifest %s", path)
+    log.warning(
+        "Rollout export manifest %s was corrupt; salvaged %d entries (backup at %s)",
+        path,
+        len(tasks),
+        backup,
+    )
+    return manifest
+
+
 def load_export_manifest(root: Path) -> dict[str, Any]:
     path = rollout_export_manifest_path(root)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {"tasks": {}}
+    try:
+        payload = json.loads(raw)
     except Exception:
-        return {"tasks": {}}
+        return _salvage_export_manifest(path, raw)
     if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), dict):
-        return {"tasks": {}}
+        return _salvage_export_manifest(path, raw)
     return {"tasks": dict(payload["tasks"])}
 
 
 def write_export_manifest(root: Path, manifest: dict[str, Any]) -> None:
     path = rollout_export_manifest_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_atomic(path, manifest)
 
 
 def exported_task_hf_path(manifest: dict[str, Any], task_name: str) -> str | None:

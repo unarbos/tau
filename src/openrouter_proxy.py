@@ -50,6 +50,8 @@ _MINER_CONTROLLED_SAMPLING_PARAMS = {
 _ESTIMATED_CHARS_PER_TOKEN = 3
 _ESTIMATED_MESSAGE_OVERHEAD_TOKENS = 8
 _ESTIMATED_TOOL_OVERHEAD_TOKENS = 24
+_GENERATION_LOOKUP_ATTEMPTS = 3
+_GENERATION_LOOKUP_RETRY_DELAY = 0.5
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "content-length",
@@ -728,7 +730,9 @@ class OpenRouterProxy:
             )
             return
         body, rejection_reason = self._prepare_request_body(
-            body=body, request_payload=request_payload
+            body=body,
+            request_payload=request_payload,
+            request_path=request_path,
         )
         if rejection_reason:
             self._reject_request(
@@ -831,6 +835,12 @@ class OpenRouterProxy:
             cost=_extract_cost(upstream.payload),
             error=_extract_response_error(upstream.payload) if upstream.status >= 400 else None,
         )
+        if (
+            upstream.status < 400
+            and request_record.cost is None
+            and request_record.generation_id
+        ):
+            self._backfill_usage_from_generation(request_record)
         self._record_request(request_record)
         self._emit_rollout_llm_event(
             method=handler.command,
@@ -927,12 +937,55 @@ class OpenRouterProxy:
             headers[key] = value
         return headers
 
+    def _backfill_usage_from_generation(self, request_record: ProxyRequestRecord) -> None:
+        """Best-effort: fetch cost/token accounting from OpenRouter's generation
+        endpoint when the completion response omitted it. The endpoint is
+        eventually consistent, so we retry a couple of times with a short delay
+        and silently give up on failure rather than slow down or fail the solve.
+        """
+        generation_id = request_record.generation_id
+        if not generation_id:
+            return
+        url = f"{_upstream_base_url()}/v1/generation"
+        headers = {"Authorization": f"Bearer {self.openrouter_api_key}"}
+        timeout = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                for attempt in range(_GENERATION_LOOKUP_ATTEMPTS):
+                    if attempt:
+                        time.sleep(_GENERATION_LOOKUP_RETRY_DELAY)
+                    try:
+                        response = client.get(url, headers=headers, params={"id": generation_id})
+                    except httpx.HTTPError:
+                        continue
+                    if response.status_code == 404:
+                        # Not yet available; retry after a short delay.
+                        continue
+                    if response.status_code >= 400:
+                        return
+                    payload = _loads_json_bytes(response.content)
+                    if _apply_generation_usage(request_record, payload):
+                        return
+        except Exception:  # pragma: no cover - defensive, never break a solve
+            log.debug("generation usage backfill failed for %s", generation_id, exc_info=True)
+
     def _prepare_request_body(
         self,
         *,
         body: bytes | None,
         request_payload: Any,
+        request_path: str = "/v1/chat/completions",
     ) -> tuple[bytes | None, str | None]:
+        if isinstance(request_payload, dict) and request_path == "/v1/chat/completions":
+            # Ask OpenRouter to return cost + normalized token accounting inline
+            # with the completion. Without this flag some providers (e.g. minimax)
+            # stream no usage block, leaving cost/tokens null in the rollout.
+            existing_usage = request_payload.get("usage")
+            usage_accounting = dict(existing_usage) if isinstance(existing_usage, dict) else {}
+            if usage_accounting.get("include") is not True:
+                usage_accounting["include"] = True
+                request_payload["usage"] = usage_accounting
+                body = json.dumps(request_payload).encode("utf-8")
         if isinstance(request_payload, dict) and self.enforced_model:
             request_payload["model"] = self.enforced_model
             body = json.dumps(request_payload).encode("utf-8")
@@ -1351,6 +1404,65 @@ def _extract_response_error(payload: Any) -> str | None:
         return error
     message = payload.get("message")
     return str(message) if message else None
+
+
+def _generation_data(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return data
+    # Some responses return the generation object at the top level.
+    return payload if "total_cost" in payload else None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _apply_generation_usage(request_record: ProxyRequestRecord, payload: Any) -> bool:
+    """Backfill a request record from an OpenRouter generation lookup payload.
+
+    Returns True when a cost value was found (the caller can stop retrying).
+    """
+    data = _generation_data(payload)
+    if data is None:
+        return False
+    cost = data.get("total_cost")
+    if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+        return False
+    request_record.cost = float(cost)
+
+    if request_record.prompt_tokens is None:
+        prompt_tokens = _coerce_int(data.get("native_tokens_prompt"))
+        if prompt_tokens is None:
+            prompt_tokens = _coerce_int(data.get("tokens_prompt"))
+        request_record.prompt_tokens = prompt_tokens
+    if request_record.completion_tokens is None:
+        completion_tokens = _coerce_int(data.get("native_tokens_completion"))
+        if completion_tokens is None:
+            completion_tokens = _coerce_int(data.get("tokens_completion"))
+        request_record.completion_tokens = completion_tokens
+    if request_record.reasoning_tokens is None:
+        request_record.reasoning_tokens = _coerce_int(data.get("native_tokens_reasoning"))
+    if request_record.cached_tokens is None:
+        request_record.cached_tokens = _coerce_int(data.get("native_tokens_cached"))
+    if request_record.total_tokens is None:
+        prompt = request_record.prompt_tokens
+        completion = request_record.completion_tokens
+        if prompt is not None or completion is not None:
+            request_record.total_tokens = int(prompt or 0) + int(completion or 0)
+    if request_record.response_model is None:
+        model = data.get("model")
+        if isinstance(model, str) and model:
+            request_record.response_model = model
+    return True
 
 
 def _extract_cost(payload: Any) -> float | None:

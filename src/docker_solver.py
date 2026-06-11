@@ -56,6 +56,108 @@ WORKDIR /work
 CMD ["bash"]
 """
 
+# Per-language solver images. The harness runner and miner agent are always
+# Python, so each non-Python image is a language runtime base with a Python
+# layer added on top (plus bash/git for the agent's shell tool). Python tasks
+# keep the original slim image byte-for-byte so their build cache is preserved.
+# Image builds run on the host (with network); only the *running* solver
+# container is network-isolated, so apt at build time is fine.
+_LANGUAGE_BASE_IMAGES = {
+    "node": "node:20-bookworm-slim",
+    "go": "golang:1.22-bookworm",
+    "rust": "rust:1-slim-bookworm",
+    "java": "eclipse-temurin:21-jdk-jammy",
+    "php": "php:8.3-cli-bookworm",
+    "ruby": "ruby:3.3-slim-bookworm",
+    "csharp": "mcr.microsoft.com/dotnet/sdk:8.0",
+}
+
+_HARNESS_LAYER = """\
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    bash git ca-certificates python3 python3-pip \\
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir --break-system-packages mini-swe-agent \\
+    || python3 -m pip install --no-cache-dir mini-swe-agent \\
+    || true
+
+WORKDIR /work
+CMD ["bash"]
+"""
+
+_LANGUAGE_MANIFEST_FILES = (
+    ("node", ("package.json",)),
+    ("go", ("go.mod",)),
+    ("rust", ("Cargo.toml",)),
+    ("java", ("pom.xml", "build.gradle", "build.gradle.kts")),
+    ("php", ("composer.json",)),
+    ("ruby", ("Gemfile",)),
+    ("python", ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile")),
+)
+
+_EXTENSION_LANGUAGE = {
+    ".py": "python",
+    ".js": "node", ".jsx": "node", ".mjs": "node", ".cjs": "node",
+    ".ts": "node", ".tsx": "node", ".vue": "node", ".svelte": "node",
+    ".go": "go", ".rs": "rust", ".java": "java", ".kt": "java",
+    ".php": "php", ".rb": "ruby", ".cs": "csharp",
+}
+
+
+def _dockerfile_for_language(language: str) -> str:
+    base = _LANGUAGE_BASE_IMAGES.get(language)
+    if base is None:
+        # python / unknown -> the original slim Python image (cache-preserving).
+        return _DOCKERFILE_TEMPLATE
+    return f"FROM {base}\n\n{_HARNESS_LAYER}"
+
+
+def _list_repo_files(repo_dir: Path, *, cap: int = 4000) -> list[str]:
+    result = _run_best_effort(
+        ["git", "-C", str(repo_dir), "ls-files"],
+        timeout=15,
+        action="list repo files for language detection",
+    )
+    if result is not None and result.returncode == 0 and result.stdout.strip():
+        return result.stdout.splitlines()[:cap]
+    files: list[str] = []
+    for path in repo_dir.rglob("*"):
+        if path.is_file():
+            files.append(str(path.relative_to(repo_dir)))
+            if len(files) >= cap:
+                break
+    return files
+
+
+def _detect_repo_language(repo_dir: Path) -> str:
+    """Pick the runtime a task's repo needs, from manifests + source extensions.
+
+    Manifest files (package.json, go.mod, ...) are strong signals; source-file
+    extensions break ties for full-stack repos toward where the code lives.
+    Defaults to python, where the harness always runs.
+    """
+    try:
+        files = _list_repo_files(repo_dir)
+    except Exception:
+        return "python"
+    if not files:
+        return "python"
+    basenames = {f.rsplit("/", 1)[-1] for f in files}
+    scores: dict[str, float] = {}
+    for lang, manifests in _LANGUAGE_MANIFEST_FILES:
+        if any(manifest in basenames for manifest in manifests):
+            scores[lang] = scores.get(lang, 0.0) + 50.0
+    if any(f.endswith((".csproj", ".sln")) for f in files):
+        scores["csharp"] = scores.get("csharp", 0.0) + 50.0
+    for f in files:
+        lang = _EXTENSION_LANGUAGE.get(os.path.splitext(f)[1].lower())
+        if lang:
+            scores[lang] = scores.get(lang, 0.0) + 1.0
+    if not scores:
+        return "python"
+    return max(scores.items(), key=lambda item: item[1])[0]
+
+
 _CONTAINER_ROOT = "/work"
 _CONTAINER_REPO_DIR = f"{_CONTAINER_ROOT}/repo"
 _CONTAINER_AGENT_DIR = f"{_CONTAINER_ROOT}/agent-src"
@@ -135,9 +237,10 @@ def solve_task_in_docker(
         )
 
     issue = task.prompt_text
-    image_tag = _resolve_image_tag(config)
+    language = _detect_repo_language(repo_dir)
+    image_tag = _resolve_image_tag(config, language)
     model_id = _solver_model_id(config.solver_model)
-    log.debug("Prepared Docker file solver issue for task %r", task.title)
+    log.info("Docker solver: task %r detected language=%s image=%s", task.title, language, image_tag)
 
     start = time.monotonic()
     container_id: str | None = None
@@ -189,7 +292,20 @@ def solve_task_in_docker(
                     _create_proxy_relay_network(network_name=proxy_transport.relay_network_name)
                 if proxy_transport.relay_container_name:
                     _start_proxy_relay_container(proxy_transport=proxy_transport, proxy=proxy)
-                _build_image(image_tag=image_tag, config=config)
+                try:
+                    _build_image(image_tag=image_tag, config=config, language=language)
+                except RuntimeError:
+                    if language == "python":
+                        raise
+                    # A missing/broken language base must not fail the task: fall
+                    # back to the Python image (agent just can't run that runtime,
+                    # i.e. no worse than before polyglot support).
+                    log.warning(
+                        "Language image build failed for %s; falling back to python image", language,
+                    )
+                    language = "python"
+                    image_tag = _resolve_image_tag(config, "python")
+                    _build_image(image_tag=image_tag, config=config, language="python")
                 container_id = _start_container(
                     image_tag=image_tag,
                     config=config,
@@ -324,19 +440,52 @@ def solve_task_in_docker(
     )
 
 
-def _build_image(*, image_tag: str, config: RunConfig) -> None:
+def _image_exists(image_tag: str) -> bool:
     inspect_result = _run(
         ["docker", "image", "inspect", image_tag],
         timeout=30,
         check=False,
     )
-    if inspect_result.returncode == 0 and not config.docker_solver_no_cache:
+    return inspect_result.returncode == 0
+
+
+@contextlib.contextmanager
+def _image_build_lock(image_tag: str):
+    """Serialize concurrent builds of the same image tag.
+
+    Without this, a language's first duel fans out N rounds that each rebuild
+    the same uncached image (thundering herd). With it, one round builds while
+    the rest block, then hit the cache.
+    """
+    _DOCKER_START_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(image_tag.encode("utf-8")).hexdigest()[:16]
+    lock_path = _DOCKER_START_LOCK_DIR / f"tau-image-build-{digest}.lock"
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _build_image(*, image_tag: str, config: RunConfig, language: str = "python") -> None:
+    if _image_exists(image_tag) and not config.docker_solver_no_cache:
         log.debug("Reusing existing Docker solver image %s", image_tag)
         return
 
+    with _image_build_lock(image_tag):
+        # Double-checked: another worker may have built it while we waited.
+        if _image_exists(image_tag) and not config.docker_solver_no_cache:
+            log.debug("Reusing existing Docker solver image %s (built concurrently)", image_tag)
+            return
+        _build_image_locked(image_tag=image_tag, config=config, language=language)
+
+
+def _build_image_locked(*, image_tag: str, config: RunConfig, language: str = "python") -> None:
     with tempfile.TemporaryDirectory(prefix="swe-eval-docker-build-") as build_dir:
         build_path = Path(build_dir)
-        dockerfile = _DOCKERFILE_TEMPLATE
+        dockerfile = _dockerfile_for_language(language)
         (build_path / "Dockerfile").write_text(dockerfile)
 
         cmd = ["docker", "build", "-t", image_tag]
@@ -623,6 +772,8 @@ def _run_solver_command(
         "-e",
         f"TAU_PROMPT_FILE={_CONTAINER_PROMPT_FILE}",
         "-e",
+        f"TAU_AGENT_TIMEOUT_SECONDS={int(timeout)}",
+        "-e",
         f"TAU_AGENT_FILE={container_agent_file}",
         "-e",
         f"TAU_HARNESS_RUNNER={_CONTAINER_RUNNER_FILE}",
@@ -885,11 +1036,11 @@ def _stop_solver_processes(*, container_id: str) -> None:
     )
 
 
-def _resolve_image_tag(config: RunConfig) -> str:
+def _resolve_image_tag(config: RunConfig, language: str = "python") -> str:
     if config.docker_solver_image:
         return config.docker_solver_image
     digest = hashlib.sha256()
-    digest.update(_DOCKERFILE_TEMPLATE.encode("utf-8"))
+    digest.update(_dockerfile_for_language(language).encode("utf-8"))
     digest.update(_harness_runner_script().encode("utf-8"))
     return f"swe-eval/file-solver:{digest.hexdigest()[:12]}"
 
@@ -1024,6 +1175,7 @@ def _clean_harness_command() -> str:
         'TAU_REPO_DIR="$TAU_REPO_DIR" '
         'TAU_PROMPT_FILE="$TAU_PROMPT_FILE" '
         'TAU_AGENT_FILE="$TAU_AGENT_FILE" '
+        'TAU_AGENT_TIMEOUT_SECONDS="$TAU_AGENT_TIMEOUT_SECONDS" '
         'TAU_HARNESS_RUNNER="$TAU_HARNESS_RUNNER" '
         'OPENAI_BASE_URL="$OPENAI_BASE_URL" '
         'OPENAI_API_KEY="$OPENAI_API_KEY" '

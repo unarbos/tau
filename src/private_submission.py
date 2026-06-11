@@ -39,6 +39,9 @@ ALLOWED_ENV_NAMES = {
     "AGENT_MAX_TOKENS",
     "AGENT_MAX_OBSERVATION_CHARS",
     "AGENT_MAX_TOTAL_LOG_CHARS",
+    # Validator-provided per-round budget, exported into the solver container
+    # by docker_solver so agents can pace themselves against the real timeout.
+    "TAU_AGENT_TIMEOUT_SECONDS",
 }
 FORBIDDEN_SAMPLING_NAMES = {
     "temperature",

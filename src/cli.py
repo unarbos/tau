@@ -551,6 +551,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pool_manager.add_argument("--pool-filler-concurrency", type=int, default=25, help="Parallel pool-filler workers per pool.")
     pool_manager.add_argument(
+        "--pool-fill-during-duel",
+        action="store_true",
+        help="Keep rebuilding task pools while a duel is in flight instead of pausing the pool fillers.",
+    )
+    pool_manager.add_argument(
         "--task-pool-fill-from-saved",
         action="store_true",
         help="Fill pools by round-robin reusing saved task workspaces instead of fetching new tasks.",
@@ -1654,6 +1659,9 @@ def _build_pool_manager_config(args: argparse.Namespace) -> RunConfig:
         validate_task_pool_target=args.task_pool_target,
         validate_task_pool_static=args.task_pool_static,
         validate_pool_filler_concurrency=args.pool_filler_concurrency,
+        validate_pool_fill_during_duel=(
+            args.pool_fill_during_duel or defaults.validate_pool_fill_during_duel
+        ),
         validate_task_pool_fill_from_saved=(
             args.task_pool_fill_from_saved or defaults.validate_task_pool_fill_from_saved
         ),

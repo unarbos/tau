@@ -169,6 +169,35 @@ class RolloutHelpersTest(unittest.TestCase):
             self.assertEqual(len(uploads), 1)
             self.assertTrue(uploads[0].endswith("/retired-task.jsonl.gz"))
 
+    def test_load_export_manifest_salvages_truncated_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for idx in (1, 2):
+                mark_task_rollouts_exported(
+                    root,
+                    task_name=f"validate-2026060100000{idx}-00000{idx}",
+                    path_in_repo=f"rollouts/2026-06-01-00/validate-2026060100000{idx}-00000{idx}.jsonl.gz",
+                )
+            path = root / "hf-exported-rollouts.json"
+            raw = path.read_text()
+            path.write_text(raw[:-30])  # simulate ENOSPC truncation mid-write
+
+            manifest = load_export_manifest(root)
+            self.assertIn("validate-20260601000001-000001", manifest["tasks"])
+            # corrupt original preserved, manifest rewritten as valid JSON
+            self.assertTrue((root / "hf-exported-rollouts.json.corrupt.bak").exists())
+            self.assertEqual(json.loads(path.read_text())["tasks"], manifest["tasks"])
+
+            # a subsequent mark must not wipe the salvaged history
+            mark_task_rollouts_exported(
+                root,
+                task_name="validate-20260601000003-000003",
+                path_in_repo="rollouts/2026-06-01-00/validate-20260601000003-000003.jsonl.gz",
+            )
+            tasks = load_export_manifest(root)["tasks"]
+            self.assertIn("validate-20260601000001-000001", tasks)
+            self.assertIn("validate-20260601000003-000003", tasks)
+
     def test_retired_export_continues_after_task_upload_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "rollouts"

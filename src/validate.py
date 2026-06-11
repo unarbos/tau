@@ -13,8 +13,8 @@ import subprocess
 import textwrap
 import threading
 import time
-from collections.abc import Sequence
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError
+from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, TimeoutError
 from concurrent.futures import wait as _futures_wait
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
@@ -84,8 +84,8 @@ _BURN_KING_COMMITMENT_PREFIX = "burn:uid-0"
 _BASELINE_MODEL = "gemini-3-flash"
 _REFERENCE_SOLUTION_NAME = "reference"
 _LEGACY_BASELINE_SOLUTION_NAME = "baseline"
-_DIFF_JUDGE_MODEL = "anthropic/claude-sonnet-4.6"
-_DIFF_JUDGE_FALLBACK_MODELS = ("moonshotai/kimi-k2.6",)
+_DIFF_JUDGE_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+_DIFF_JUDGE_FALLBACK_MODELS = ()
 _DIFF_JUDGE_WEIGHT = 1.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
@@ -137,9 +137,12 @@ _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 300.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _GRACEFUL_DUEL_SHUTDOWN_SECONDS = 300.0
 _QUEUED_POOL_GATE_SLEEP_SECONDS = 15.0
-_MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
-_MAX_DUEL_AGENT_TIMEOUT_SECONDS = 600
-_DUEL_AGENT_TIMEOUT_PROVIDER_SLOWDOWN_FACTOR = 1.5
+# Env-tunable so validators can trial longer budgets without a code push.
+_MIN_DUEL_AGENT_TIMEOUT_SECONDS = int(os.environ.get("TAU_DUEL_AGENT_TIMEOUT_MIN_SECONDS", "120"))
+_MAX_DUEL_AGENT_TIMEOUT_SECONDS = int(os.environ.get("TAU_DUEL_AGENT_TIMEOUT_MAX_SECONDS", "600"))
+_DUEL_AGENT_TIMEOUT_PROVIDER_SLOWDOWN_FACTOR = float(
+    os.environ.get("TAU_DUEL_AGENT_TIMEOUT_SLOWDOWN_FACTOR", "1.5"),
+)
 _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS = 300.0
 _POOL_FILLER_RATE_LIMIT_BACKOFF_BUFFER_SECONDS = 30.0
 _POOL_FILLER_RATE_LIMIT_BACKOFF_MAX_SECONDS = 3600.0
@@ -1413,6 +1416,55 @@ def _round_winner_from_scores(king_score: float, challenger_score: float) -> str
     return "tie"
 
 
+class _DaemonThreadExecutor:
+    """Run each submitted task on its own daemon thread.
+
+    ThreadPoolExecutor workers are non-daemon and joined at interpreter exit
+    even after shutdown(wait=False, cancel_futures=True), so one wedged
+    compare/judge/probe call keeps the process alive long after the round
+    worker gave up on it. The round-scoped pools below submit at most two
+    bounded tasks each, so per-task daemon threads preserve the "never block
+    the round worker" semantics through process shutdown as well.
+    """
+
+    def __init__(self, thread_name_prefix: str = "daemon-exec") -> None:
+        self._thread_name_prefix = thread_name_prefix
+        self._futures: list[Future] = []
+        self._lock = threading.Lock()
+        self._is_shutdown = False
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future:
+        future: Future = Future()
+        with self._lock:
+            if self._is_shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._futures.append(future)
+            name = f"{self._thread_name_prefix}_{len(self._futures)}"
+
+        def _run() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+        threading.Thread(target=_run, name=name, daemon=True).start()
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._lock:
+            self._is_shutdown = True
+            futures = list(self._futures)
+        if cancel_futures:
+            for future in futures:
+                future.cancel()
+        if wait:
+            _futures_wait(futures)
+
+
 def _provider_account_error_exit_reason(exit_reason: str | None) -> bool:
     return exit_reason == PROVIDER_ACCOUNT_ERROR_EXIT_REASON
 
@@ -1485,7 +1537,7 @@ def _judge_round_diffs(
     config: RunConfig,
 ) -> DiffJudgeResult:
     cancel = threading.Event()
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="diff-judge")
+    executor = _DaemonThreadExecutor(thread_name_prefix="diff-judge")
     try:
         future = executor.submit(
             _judge_round_diffs_uncapped,
@@ -1651,7 +1703,7 @@ def _diff_judge_prompt_for_model(
     candidate_a_patch: str,
     candidate_b_patch: str,
 ) -> str | list[dict[str, Any]]:
-    if model == _DIFF_JUDGE_MODEL:
+    if model.startswith("anthropic/"):
         return _build_diff_judge_prompt_content(
             task_prompt=task_prompt,
             reference_patch=reference_patch,
@@ -1667,7 +1719,7 @@ def _diff_judge_prompt_for_model(
 
 
 def _diff_judge_reasoning_for_model(model: str) -> dict[str, Any] | None:
-    if model == _DIFF_JUDGE_MODEL:
+    if model.startswith("anthropic/"):
         return _DIFF_JUDGE_REASONING
     return None
 
@@ -1683,12 +1735,24 @@ def _is_diff_judge_route_error(error: str) -> bool:
 
 def _diff_judge_instruction_text() -> str:
     return (
-        "Judge the two solution diffs for the same coding task. The reference "
-        "patch is privileged context for the target direction; it is not a "
-        "candidate. Score each candidate from 0 to 100 for correctness, "
-        "completeness, and alignment with the task/reference. Penalize unrelated "
-        "churn, unsafe behavior, hidden evaluator manipulation, and empty "
-        "solutions. Return JSON only with this exact shape:\n"
+        "Judge the two candidate solution diffs for the same coding task. "
+        "Score each candidate from 0 to 100 on how well it solves the task as "
+        "described: does the change make the required behavior true, is it "
+        "correct and complete, and would a careful maintainer merge it?\n"
+        "A reference patch from the project's history is included as a hint "
+        "only; it is not a candidate and not the required solution. Treat it "
+        "as one known fix, possibly partial or outdated: a candidate that "
+        "solves the task differently or more completely than the reference "
+        "can and should score higher than one that imitates it. Never reward "
+        "textual similarity to the reference for its own sake; judge each "
+        "candidate against the task requirements.\n"
+        "Reward candidates that demonstrate their change is correct, for "
+        "example with a regression test, a reproduction, or assertions that "
+        "cover the changed behavior. Relevant tests, docs, or comments are "
+        "not churn; do not penalize them.\n"
+        "Penalize incorrect or incomplete changes, unrelated churn, unsafe "
+        "behavior, hidden evaluator manipulation, and empty solutions.\n"
+        "Return JSON only with this exact shape:\n"
         "{\n"
         "  \"winner\": \"candidate_a\" | \"candidate_b\" | \"tie\",\n"
         "  \"candidate_a_score\": 0-100,\n"
@@ -1757,7 +1821,7 @@ def _build_diff_judge_prompt_content(
             "text": json.dumps(
                 {
                     "task": _truncate_middle(task_prompt, _DIFF_JUDGE_MAX_TASK_CHARS),
-                    "reference_patch_privileged_context": _truncate_middle(
+                    "reference_patch_hint": _truncate_middle(
                         reference_patch,
                         _DIFF_JUDGE_MAX_PATCH_CHARS,
                     ),
@@ -1796,7 +1860,7 @@ def _build_diff_judge_prompt(
 ) -> str:
     payload = {
         "task": _truncate_middle(task_prompt, _DIFF_JUDGE_MAX_TASK_CHARS),
-        "reference_patch_privileged_context": _truncate_middle(reference_patch, _DIFF_JUDGE_MAX_PATCH_CHARS),
+        "reference_patch_hint": _truncate_middle(reference_patch, _DIFF_JUDGE_MAX_PATCH_CHARS),
         "candidate_a_patch": _truncate_middle(candidate_a_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
         "candidate_b_patch": _truncate_middle(candidate_b_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
     }
@@ -3188,7 +3252,7 @@ def _solve_and_compare_round(
                 chall_has_patch,
             )
 
-        cmp_exec = ThreadPoolExecutor(max_workers=2)
+        cmp_exec = _DaemonThreadExecutor(thread_name_prefix="round-compare")
         try:
             chall_fut = cmp_exec.submit(
                 compare_task_run, task_name=task.task_name,
@@ -3742,7 +3806,14 @@ def _run_parallel_duel(
                             log.exception("provider account pause checkpoint callback failed (non-fatal)")
                         partial_shutdown_interrupt = bool(task_queue)
                         continue
-                    elif result.challenger_exit_reason == "time_limit_exceeded":
+                    elif (
+                        result.challenger_exit_reason == "time_limit_exceeded"
+                        and result.winner != "challenger"
+                    ):
+                        # Only unproductive timeouts count toward the cutoff: an
+                        # agent that saturates its budget but still wins rounds
+                        # with the collected partial patch is a legitimate
+                        # strategy, not a stall.
                         timeout_streak += 1
                         if timeout_limit > 0 and timeout_streak >= timeout_limit:
                             _stop_submitting(f"{timeout_streak} consecutive challenger timeouts")
@@ -5121,7 +5192,7 @@ def _publish_dashboard(
             "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT,
             "llm_diff_judge_model": _DIFF_JUDGE_MODEL,
             "ties_count": False,
-            "description": "Round score is based only on the LLM diff judgment; patch similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
+            "description": "Round score is the LLM diff judgment of how well each patch satisfies the task; patch similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
         },
         "queue": [
             {

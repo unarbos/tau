@@ -227,6 +227,7 @@ class RunConfig:
     validate_task_pool_target: int = 50
     validate_task_pool_static: bool = True
     validate_pool_filler_concurrency: int = 24
+    validate_pool_fill_during_duel: bool = field(default_factory=lambda: _env_bool("VALIDATE_POOL_FILL_DURING_DUEL"))
     validate_task_pool_refresh_count: int = 0
     validate_task_pool_refresh_interval_seconds: int = 0
     validate_task_pool_fill_from_saved: bool = field(default_factory=lambda: _env_bool("VALIDATE_TASK_POOL_FILL_FROM_SAVED"))
@@ -252,7 +253,7 @@ class RunConfig:
     rollout_hf_dataset: str | None = field(default_factory=lambda: _env_str("TAU_ROLLOUT_HF_DATASET"))
     rollout_hf_token_env: str = field(default_factory=lambda: _env_str("TAU_ROLLOUT_HF_TOKEN_ENV") or "HF_TOKEN")
     rollout_export_format: str = field(default_factory=lambda: _env_str("TAU_ROLLOUT_EXPORT_FORMAT") or "jsonl")
-    clear_uploaded_rollouts: bool = field(default_factory=lambda: _env_bool("TAU_CLEAR_UPLOADED_ROLLOUTS"))
+    clear_uploaded_rollouts: bool = field(default_factory=lambda: _env_bool("TAU_CLEAR_UPLOADED_ROLLOUTS", default=True))
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
     validate_king_window_size: int = 5

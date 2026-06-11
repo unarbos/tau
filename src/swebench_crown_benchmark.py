@@ -157,6 +157,18 @@ def should_benchmark_king(*, king: dict[str, Any] | None, benchmark_root: Path) 
     return not completed_swebench_job_valid(job_dir)
 
 
+def slim_completed_job_dir(job_dir: Path) -> None:
+    """Drop per-instance work trees once a benchmark run is recorded.
+
+    Scores live in comparison.json/history.jsonl and the skip check in
+    completed_swebench_job_valid() only needs job.json, comparison.json and
+    the predictions files; the cloned repos and logs are ~11GB per run.
+    """
+    for agent_dir in ("king",):
+        for heavy in ("repos", "logs"):
+            shutil.rmtree(job_dir / agent_dir / heavy, ignore_errors=True)
+
+
 def completed_swebench_job_valid(job_dir: Path) -> bool:
     job = read_json(job_dir / "job.json")
     if not (isinstance(job, dict) and job.get("status") == "completed"):
@@ -304,6 +316,7 @@ def run_crown_benchmark(
         merge_benchmark_into_dashboard(args.validate_root / "dashboard_data.json", comparison)
         publish_benchmark_payload(comparison)
         write_job(job_dir, status="completed", king=king, manifest=manifest, started_at=comparison["started_at"], comparison=comparison)
+        slim_completed_job_dir(job_dir)
         return comparison
     except Exception as exc:
         error_payload = {"status": "failed", "error": repr(exc), "finished_at": utc_now(), "king": king}

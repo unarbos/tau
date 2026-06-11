@@ -465,17 +465,21 @@ def append_hf_dataset_jsonl_rows(
         return None
     api = HfApi(token=token)
     existing = ""
-    try:
-        existing_path = hf_hub_download(
-            repo_id=dataset_id,
-            filename=path_in_repo,
-            repo_type="dataset",
-            token=token,
-        )
-        existing = Path(existing_path).read_text()
-    except Exception as exc:
-        if not hf_download_error_is_missing(exc):
-            raise
+    # local_dir keeps the growing archive shard out of the global HF hub
+    # cache, which otherwise accumulates one immutable blob per append.
+    with tempfile.TemporaryDirectory(prefix="tau-hf-archive-") as download_dir:
+        try:
+            existing_path = hf_hub_download(
+                repo_id=dataset_id,
+                filename=path_in_repo,
+                repo_type="dataset",
+                token=token,
+                local_dir=download_dir,
+            )
+            existing = Path(existing_path).read_text()
+        except Exception as exc:
+            if not hf_download_error_is_missing(exc):
+                raise
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".jsonl", delete=False) as tmp:
         tmp.write(existing)
         if existing and not existing.endswith("\n"):
@@ -1037,7 +1041,13 @@ def _load_manager_state(config: RunConfig) -> v.ValidatorState:
 
 
 def _pool_filler_paused_for_active_duel(config: RunConfig) -> bool:
-    """Yield Docker/OpenRouter capacity to the validator while a duel is in flight."""
+    """Yield Docker/OpenRouter capacity to the validator while a duel is in flight.
+
+    When ``validate_pool_fill_during_duel`` is enabled the pool keeps rebuilding
+    concurrently with duels instead of pausing.
+    """
+    if config.validate_pool_fill_during_duel:
+        return False
     return _load_manager_state(config).active_duel is not None
 
 

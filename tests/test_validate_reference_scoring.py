@@ -177,28 +177,14 @@ class ReferenceScoringTest(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    def test_diff_judge_falls_back_to_kimi_on_sonnet_route_error(self):
+    def test_diff_judge_route_error_returns_neutral_without_fallback(self):
         calls = []
 
         def fake_complete_text(**kwargs):
             calls.append(kwargs)
-            if kwargs["model"] == validate._DIFF_JUDGE_MODEL:
-                raise RuntimeError(
-                    "OpenRouter returned no choices "
-                    "(error_code=403, error_message=Provider returned error)"
-                )
-            mapping = validate._diff_judge_candidate_mapping(
-                seed=f"task-judge:challenger-7-d3:{kwargs['model']}",
-            )
-            challenger_label = mapping["challenger"]
-            king_label = mapping["king"]
-            return json.dumps(
-                {
-                    "winner": challenger_label,
-                    f"{king_label}_score": 10,
-                    f"{challenger_label}_score": 90,
-                    "rationale": "fallback worked",
-                }
+            raise RuntimeError(
+                "OpenRouter returned no choices "
+                "(error_code=403, error_message=Provider returned error)"
             )
 
         task_paths = SimpleNamespace(
@@ -225,15 +211,17 @@ class ReferenceScoringTest(unittest.TestCase):
                 config=RunConfig(openrouter_api_key="test-key"),
             )
 
-        self.assertEqual(result.winner, "challenger")
-        self.assertEqual(result.model, "moonshotai/kimi-k2.6")
+        self.assertEqual(result.winner, "tie")
+        self.assertAlmostEqual(result.king_score, 0.5)
+        self.assertAlmostEqual(result.challenger_score, 0.5)
         self.assertEqual(
             [call["model"] for call in calls],
-            [validate._DIFF_JUDGE_MODEL, "moonshotai/kimi-k2.6"],
+            list(validate._DIFF_JUDGE_MODELS),
         )
-        self.assertIsInstance(calls[0]["prompt"], list)
-        self.assertIsInstance(calls[1]["prompt"], str)
-        self.assertIsNone(calls[1]["reasoning"])
+        # A route error on a model is terminal for that model: no retries.
+        self.assertEqual(len(calls), len(validate._DIFF_JUDGE_MODELS))
+        self.assertIsInstance(calls[0]["prompt"], str)
+        self.assertIsNone(calls[0]["reasoning"])
 
     def test_diff_judge_parser_maps_blinded_candidates_back_to_roles(self):
         result = validate._parse_diff_judge_payload(

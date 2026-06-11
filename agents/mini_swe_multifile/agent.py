@@ -66,9 +66,22 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
 
-# Stay under the validator's hard container timeout so the loop can finish
-# gracefully and report its own patch instead of relying on the kill path.
-WALL_CLOCK_LIMIT_SECONDS = 280.0
+# Stay under the validator's per-round budget so the loop can finish gracefully
+# and report its own patch instead of relying on the kill path. The validator
+# now exports its real per-round budget as TAU_AGENT_TIMEOUT_SECONDS; honor it
+# (leaving a margin for diff collection) so a looser budget actually lets the
+# agent keep working. Falls back to the conservative 280s when unset.
+def _wall_clock_limit_seconds() -> float:
+    budget = os.environ.get("TAU_AGENT_TIMEOUT_SECONDS")
+    if budget:
+        try:
+            return max(60.0, float(int(budget)) - 20.0)
+        except ValueError:
+            pass
+    return 280.0
+
+
+WALL_CLOCK_LIMIT_SECONDS = _wall_clock_limit_seconds()
 
 
 def _normalize_api_base(api_base: str) -> str:
