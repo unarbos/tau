@@ -731,7 +731,6 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
             {
                 "task_name": r.get("task_name"),
                 "winner": r.get("winner"),
-                "king_challenger_similarity": r.get("king_challenger_similarity", 0.0),
                 "king_score": r.get("king_score", 0.0),
                 "challenger_score": r.get("challenger_score", 0.0),
                 "king_llm_score": r.get("king_llm_score", 0.5),

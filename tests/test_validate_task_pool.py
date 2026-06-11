@@ -31,7 +31,6 @@ class TaskPoolTest(unittest.TestCase):
         scored = validate.ValidationRoundResult(
             task_name="task-scored",
             winner="king",
-            king_challenger_similarity=0.2,
             task_root="/tmp/task-scored",
         )
 
@@ -1758,7 +1757,6 @@ class TaskPoolTest(unittest.TestCase):
                 validate.ValidationRoundResult(
                     task_name="task-a",
                     winner="error",
-                    king_challenger_similarity=0.0,
                     task_root="/tmp/task-a",
                     error="OPENROUTER_API_KEY is not set",
                 )
@@ -1827,7 +1825,6 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="king",
-                    king_challenger_similarity=0.0,
                     task_root=task.task_root,
                 )
 
@@ -1900,7 +1897,6 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="king",
-                    king_challenger_similarity=0.0,
                     task_root=task.task_root,
                 )
 
@@ -1977,7 +1973,6 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner=winner,
-                    king_challenger_similarity=0.0,
                     task_root=task.task_root,
                 )
 
@@ -2005,155 +2000,6 @@ class TaskPoolTest(unittest.TestCase):
         self.assertEqual((result.wins, result.losses, result.ties), (5, 4, 0))
         self.assertEqual(len(result.rounds), 9)
         kill_containers.assert_not_called()
-
-    def test_parallel_duel_does_not_stop_unstarted_rounds_for_mean_copy_dq(self):
-        with tempfile.TemporaryDirectory() as td:
-            pool = TaskPool(Path(td) / "pool")
-            for idx in range(8):
-                task_root = Path(td) / f"task-{idx:02d}"
-                self._write_minimal_task_metadata(task_root)
-                baseline_dir = task_root / "solutions" / "baseline"
-                baseline_dir.mkdir(parents=True, exist_ok=True)
-                (baseline_dir / "solve.json").write_text("{}\n")
-                (baseline_dir / "solution.diff").write_text("diff\n")
-                pool.add(
-                    PoolTask(
-                        task_name=f"task-{idx:02d}",
-                        task_root=str(task_root),
-                        creation_block=1,
-                        cursor_elapsed=float(idx + 1),
-                        king_lines=1,
-                        king_similarity=0.1,
-                        baseline_lines=1,
-                    )
-                )
-            config = RunConfig(
-                workspace_root=Path(td),
-                validate_duel_rounds=8,
-                validate_round_concurrency=1,
-                validate_win_margin=3,
-            )
-            king = validate.ValidatorSubmission(
-                hotkey="king-hotkey",
-                uid=1,
-                repo_full_name="king/ninja",
-                repo_url="https://github.com/king/ninja",
-                commit_sha="a" * 40,
-                commitment="unarbos/ninja@" + "a" * 40,
-                commitment_block=1,
-                source="chain",
-            )
-            challenger = validate.ValidatorSubmission(
-                hotkey="challenger-hotkey",
-                uid=2,
-                repo_full_name="challenger/ninja",
-                repo_url="https://github.com/challenger/ninja",
-                commit_sha="b" * 40,
-                commitment="unarbos/ninja@" + "b" * 40,
-                commitment_block=1,
-                source="chain",
-            )
-
-            def copied_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
-                return validate.ValidationRoundResult(
-                    task_name=task.task_name,
-                    winner="challenger",
-                    king_challenger_similarity=0.95,
-                    task_root=task.task_root,
-                )
-
-            with patch("validate._solve_and_compare_round", side_effect=copied_round) as solve_round:
-                result = validate._run_parallel_duel(
-                    config=config,
-                    state=validate.ValidatorState(current_king=king),
-                    king=king,
-                    challenger=challenger,
-                    duel_id=99,
-                    pool=pool,
-                )
-
-        self.assertFalse(result.king_replaced)
-        self.assertEqual(result.disqualification_reason, "copy detected (mean similarity 0.950 >= 0.90)")
-        self.assertGreater(len(result.rounds), 1)
-        self.assertGreater(solve_round.call_count, 1)
-
-    def test_parallel_duel_cancels_in_flight_rounds_when_near_exact_copy_dq_detected(self):
-        with tempfile.TemporaryDirectory() as td:
-            pool = TaskPool(Path(td) / "pool")
-            for idx in range(14):
-                task_root = Path(td) / f"task-{idx:02d}"
-                self._write_minimal_task_metadata(task_root)
-                baseline_dir = task_root / "solutions" / "baseline"
-                baseline_dir.mkdir(parents=True, exist_ok=True)
-                (baseline_dir / "solve.json").write_text("{}\n")
-                (baseline_dir / "solution.diff").write_text("diff\n")
-                pool.add(
-                    PoolTask(
-                        task_name=f"task-{idx:02d}",
-                        task_root=str(task_root),
-                        creation_block=1,
-                        cursor_elapsed=float(idx + 1),
-                        king_lines=1,
-                        king_similarity=0.1,
-                        baseline_lines=1,
-                    )
-                )
-            config = RunConfig(
-                workspace_root=Path(td),
-                validate_duel_rounds=14,
-                validate_round_concurrency=4,
-                validate_win_margin=3,
-            )
-            king = validate.ValidatorSubmission(
-                hotkey="king-hotkey",
-                uid=1,
-                repo_full_name="king/ninja",
-                repo_url="https://github.com/king/ninja",
-                commit_sha="a" * 40,
-                commitment="unarbos/ninja@" + "a" * 40,
-                commitment_block=1,
-                source="chain",
-            )
-            challenger = validate.ValidatorSubmission(
-                hotkey="challenger-hotkey",
-                uid=2,
-                repo_full_name="challenger/ninja",
-                repo_url="https://github.com/challenger/ninja",
-                commit_sha="b" * 40,
-                commitment="unarbos/ninja@" + "b" * 40,
-                commitment_block=1,
-                source="chain",
-            )
-
-            def copied_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
-                if task.task_name == "task-03":
-                    time.sleep(1.0)
-                return validate.ValidationRoundResult(
-                    task_name=task.task_name,
-                    winner="tie",
-                    king_challenger_similarity=1.0,
-                    task_root=task.task_root,
-                )
-
-            with (
-                patch("validate._solve_and_compare_round", side_effect=copied_round) as solve_round,
-                patch("validate._kill_stale_containers") as kill_containers,
-            ):
-                result = validate._run_parallel_duel(
-                    config=config,
-                    state=validate.ValidatorState(current_king=king),
-                    king=king,
-                    challenger=challenger,
-                    duel_id=99,
-                    pool=pool,
-                )
-
-        self.assertFalse(result.king_replaced)
-        self.assertEqual(result.disqualification_reason, "copy detected (10 near-exact rounds >= 0.98)")
-        self.assertGreaterEqual(len(result.rounds), 10)
-        self.assertLess(len(result.rounds), 14)
-        self.assertGreaterEqual(solve_round.call_count, 1)
-        kill_containers.assert_called_once()
 
     def test_parallel_duel_preserves_done_round_at_hard_deadline_without_submitting_more(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2207,7 +2053,6 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="challenger",
-                    king_challenger_similarity=0.0,
                     task_root=task.task_root,
                 )
 
@@ -2289,7 +2134,6 @@ class TaskPoolTest(unittest.TestCase):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="challenger",
-                    king_challenger_similarity=0.0,
                     task_root=task.task_root,
                 )
 

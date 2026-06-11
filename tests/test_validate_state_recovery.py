@@ -1069,7 +1069,6 @@ def _round(*, task_name: str, winner: str) -> ValidationRoundResult:
     return ValidationRoundResult(
         task_name=task_name,
         winner=winner,
-        king_challenger_similarity=0.4,
         task_root=f"/tmp/{task_name}",
     )
 
