@@ -184,6 +184,9 @@ class RunConfig:
     solver_empty_response_retries: int | None = field(
         default_factory=lambda: _env_int("SOLVER_EMPTY_RESPONSE_RETRIES", "OPENROUTER_SOLVER_EMPTY_RESPONSE_RETRIES"),
     )
+    solver_rate_limit_retries: int | None = field(
+        default_factory=lambda: _env_int("SOLVER_RATE_LIMIT_RETRIES", "OPENROUTER_RATE_LIMIT_RETRIES"),
+    )
     solver_temperature: float | None = field(
         default_factory=lambda: _env_float("SOLVER_TEMPERATURE", "OPENROUTER_SOLVER_TEMPERATURE"),
     )
@@ -326,4 +329,5 @@ class RunConfig:
             text_only=self.solver_text_only,
             shell_tools=self.solver_shell_tools,
             empty_response_retries=self.solver_empty_response_retries,
+            rate_limit_retries=self.solver_rate_limit_retries,
         )

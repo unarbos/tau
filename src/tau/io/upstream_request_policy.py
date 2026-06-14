@@ -6,6 +6,7 @@ from typing import Any
 from tau.io.chat_completion import normalize_message_text
 
 DEFAULT_EMPTY_RESPONSE_RETRIES = 3
+DEFAULT_RATE_LIMIT_RETRIES = 6
 
 SOLVER_SHELL_TOOL = {
     "type": "function",
@@ -33,10 +34,13 @@ class UpstreamRequestPolicy:
     text_only: bool = False
     shell_tools: bool = False
     empty_response_retries: int = DEFAULT_EMPTY_RESPONSE_RETRIES
+    rate_limit_retries: int = DEFAULT_RATE_LIMIT_RETRIES
 
     def __post_init__(self) -> None:
         if self.empty_response_retries < 1:
             raise ValueError("empty_response_retries must be at least 1")
+        if self.rate_limit_retries < 1:
+            raise ValueError("rate_limit_retries must be at least 1")
         if self.text_only and self.shell_tools:
             raise ValueError("text_only and shell_tools are mutually exclusive")
 
@@ -46,8 +50,14 @@ def build_upstream_request_policy(
     text_only: bool = False,
     shell_tools: bool = False,
     empty_response_retries: int | None = None,
+    rate_limit_retries: int | None = None,
 ) -> UpstreamRequestPolicy | None:
-    if not text_only and not shell_tools and empty_response_retries is None:
+    if (
+        not text_only
+        and not shell_tools
+        and empty_response_retries is None
+        and rate_limit_retries is None
+    ):
         return None
     return UpstreamRequestPolicy(
         text_only=text_only,
@@ -56,6 +66,11 @@ def build_upstream_request_policy(
             empty_response_retries
             if empty_response_retries is not None
             else DEFAULT_EMPTY_RESPONSE_RETRIES
+        ),
+        rate_limit_retries=(
+            rate_limit_retries
+            if rate_limit_retries is not None
+            else DEFAULT_RATE_LIMIT_RETRIES
         ),
     )
 

@@ -25,6 +25,7 @@ from tau.io.chat_completion import (
 )
 from tau.io.upstream_request_policy import (
     DEFAULT_EMPTY_RESPONSE_RETRIES,
+    DEFAULT_RATE_LIMIT_RETRIES,
     UpstreamRequestPolicy,
     apply_upstream_request_policy,
 )
@@ -271,36 +272,59 @@ class HttpxUpstreamClient(UpstreamClient):
             if upstream_request_policy is not None
             else DEFAULT_EMPTY_RESPONSE_RETRIES
         )
+        max_rate_limit_retries = (
+            upstream_request_policy.rate_limit_retries
+            if upstream_request_policy is not None
+            else DEFAULT_RATE_LIMIT_RETRIES
+        )
         with httpx.Client(timeout=_UPSTREAM_TIMEOUT) as client:
-            for empty_attempt in range(max_empty_retries):
-                if _should_stream_chat_completion(command, request_path, prepared_payload):
-                    response = self._fetch_streamed(
-                        client=client,
-                        url=url,
-                        headers=headers,
-                        payload=prepared_payload,
-                        start=start,
+            for rate_attempt in range(max_rate_limit_retries):
+                for empty_attempt in range(max_empty_retries):
+                    if _should_stream_chat_completion(command, request_path, prepared_payload):
+                        response = self._fetch_streamed(
+                            client=client,
+                            url=url,
+                            headers=headers,
+                            payload=prepared_payload,
+                            start=start,
+                        )
+                    else:
+                        response = self._fetch_direct(
+                            client=client,
+                            command=command,
+                            url=url,
+                            headers=headers,
+                            body=body,
+                        )
+                    response = _normalize_upstream_response(response)
+                    last_response = response
+                    payload = response.payload if isinstance(response.payload, dict) else {}
+                    if _upstream_response_is_retryable_rate_limit(response):
+                        break
+                    if not payload_has_retryable_empty_content(payload):
+                        return response
+                    if empty_attempt + 1 < max_empty_retries:
+                        log.debug(
+                            "Retrying empty upstream chat completion (attempt %s/%s)",
+                            empty_attempt + 2,
+                            max_empty_retries,
+                        )
+                        time.sleep(min(2.0, 1.5 ** empty_attempt))
+                if (
+                    last_response is not None
+                    and _upstream_response_is_retryable_rate_limit(last_response)
+                    and rate_attempt + 1 < max_rate_limit_retries
+                ):
+                    backoff = _rate_limit_backoff_seconds(last_response, rate_attempt)
+                    log.info(
+                        "Retrying upstream rate limit (attempt %s/%s) after %.2fs",
+                        rate_attempt + 2,
+                        max_rate_limit_retries,
+                        backoff,
                     )
-                else:
-                    response = self._fetch_direct(
-                        client=client,
-                        command=command,
-                        url=url,
-                        headers=headers,
-                        body=body,
-                    )
-                response = _normalize_upstream_response(response)
-                last_response = response
-                payload = response.payload if isinstance(response.payload, dict) else {}
-                if not payload_has_retryable_empty_content(payload):
-                    return response
-                if empty_attempt + 1 < max_empty_retries:
-                    log.debug(
-                        "Retrying empty upstream chat completion (attempt %s/%s)",
-                        empty_attempt + 2,
-                        max_empty_retries,
-                    )
-                    time.sleep(min(2.0, 1.5 ** empty_attempt))
+                    time.sleep(backoff)
+                    continue
+                break
         if last_response is not None:
             return last_response
         return UpstreamResponse(
@@ -1440,6 +1464,28 @@ def _extract_response_error(payload: Any) -> str | None:
         return error
     message = payload.get("message")
     return str(message) if message else None
+
+
+def _upstream_response_is_retryable_rate_limit(response: UpstreamResponse) -> bool:
+    if response.status != 429:
+        return False
+    error_text = str(_extract_response_error(response.payload) or "").lower()
+    return (
+        "rate limit" in error_text
+        or "too many requests" in error_text
+        or "high demand" in error_text
+        or not error_text
+    )
+
+
+def _rate_limit_backoff_seconds(response: UpstreamResponse, attempt: int) -> float:
+    retry_after = response.headers.get("retry-after")
+    if retry_after:
+        try:
+            return min(30.0, max(0.25, float(retry_after)))
+        except ValueError:
+            pass
+    return min(30.0, 2.0 * (1.5 ** attempt))
 
 
 def _extract_cost(payload: Any) -> float | None:

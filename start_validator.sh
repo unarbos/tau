@@ -8,6 +8,7 @@ export OPENROUTER_PROVIDER_ALLOW_FALLBACKS=false
 export SOLVER_SHELL_TOOLS=true
 export SOLVER_TEMPERATURE=0
 export SOLVER_EMPTY_RESPONSE_RETRIES=5
+export SOLVER_RATE_LIMIT_RETRIES=6
 export GENERATOR_MODEL=google/gemini-3.1-flash-lite
 export EVAL_MODEL=google/gemini-3.1-flash-lite
 export PRIVATE_SUBMISSION_JUDGE_MODEL=google/gemini-3.1-flash-lite
@@ -19,7 +20,7 @@ exec /home/const/subnet66/.venv/bin/python -m cli validate \
   --solver-provider-only google-vertex/global \
   --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
-  --round-concurrency 50 \
+  --round-concurrency 25 \
   --docker-solver-start-concurrency 32 \
   --candidate-timeout-streak-limit 10 \
   --poll-interval-seconds 600 \

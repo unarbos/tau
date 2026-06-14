@@ -1,7 +1,10 @@
 import json
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import httpx
 
 from docker_solver import (
     _DockerSolverCommandResult,
@@ -9,9 +12,33 @@ from docker_solver import (
     _proxy_request_is_provider_endpoint_error,
     _resolve_exit_reason,
 )
-from openrouter_proxy import OpenRouterProxy, _upstream_base_url
+from openrouter_proxy import OpenRouterProxy, UpstreamResponse, _upstream_base_url
 from tau.io.upstream_request_policy import UpstreamRequestPolicy
 from solver_runner import COMPLETED_EXIT_REASON, PROVIDER_ACCOUNT_ERROR_EXIT_REASON
+
+_SAMPLE_PAYLOAD = {
+    "model": "test/model",
+    "messages": [{"role": "user", "content": "hello"}],
+    "temperature": 0.0,
+    "top_p": 1.0,
+}
+_SAMPLE_UPSTREAM_RESPONSE = UpstreamResponse(
+    body=json.dumps(
+        {
+            "id": "chatcmpl-abc",
+            "choices": [{"message": {"content": "hi there"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+        }
+    ).encode("utf-8"),
+    payload={
+        "id": "chatcmpl-abc",
+        "choices": [{"message": {"content": "hi there"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+    },
+    status=200,
+    headers=httpx.Headers({"Content-Type": "application/json"}),
+    first_token_latency_ms=None,
+)
 
 
 class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
@@ -316,6 +343,59 @@ class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
         self.assertEqual(events[0]["type"], "llm_call")
         self.assertEqual(events[0]["status_code"], 403)
         self.assertEqual(events[0]["response"]["error"]["code"], "proxy_error")
+
+
+class OpenRouterRateLimitHandlingTest(unittest.TestCase):
+    def test_upstream_response_is_retryable_rate_limit(self):
+        from openrouter_proxy import _upstream_response_is_retryable_rate_limit
+
+        retryable = UpstreamResponse(
+            body=b'{"error":{"message":"Rate limit exceeded"}}',
+            payload={"error": {"message": "Rate limit exceeded"}},
+            status=429,
+            headers=httpx.Headers({}),
+            first_token_latency_ms=None,
+        )
+        budget = UpstreamResponse(
+            body=b'{"error":{"message":"Solve budget exceeded"}}',
+            payload={"error": {"message": "Solve budget exceeded"}},
+            status=429,
+            headers=httpx.Headers({}),
+            first_token_latency_ms=None,
+        )
+        self.assertTrue(_upstream_response_is_retryable_rate_limit(retryable))
+        self.assertFalse(_upstream_response_is_retryable_rate_limit(budget))
+
+    def test_fetch_retries_rate_limited_upstream_response(self):
+        from openrouter_proxy import HttpxUpstreamClient
+
+        responses = [
+            UpstreamResponse(
+                body=b'{"error":{"message":"Rate limit exceeded"}}',
+                payload={"error": {"message": "Rate limit exceeded"}},
+                status=429,
+                headers=httpx.Headers({}),
+                first_token_latency_ms=None,
+            ),
+            _SAMPLE_UPSTREAM_RESPONSE,
+        ]
+        client = HttpxUpstreamClient()
+
+        with unittest.mock.patch("openrouter_proxy._should_stream_chat_completion", return_value=False):
+            with unittest.mock.patch.object(client, "_fetch_direct", side_effect=responses) as fetch_direct:
+                with unittest.mock.patch("openrouter_proxy.time.sleep"):
+                    result = client.fetch(
+                        command="POST",
+                        url="http://unused",
+                        headers={},
+                        body=b"{}",
+                        prepared_payload=_SAMPLE_PAYLOAD,
+                        request_path="/v1/chat/completions",
+                        start=0.0,
+                    )
+
+        self.assertEqual(result.status, 200)
+        self.assertEqual(fetch_direct.call_count, 2)
 
 
 
