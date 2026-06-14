@@ -76,6 +76,47 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual(captured["weights"], [0.0, 0.40, 0.15, 0.15, 0.15, 0.15])
         self.assertEqual(state.last_weight_block, 123)
 
+    def test_set_weights_falls_back_to_submission_uid_when_hotkey_lookup_fails(self):
+        king = _submission(
+            hotkey="5GpkoLVCZWmxCN4hCchz2qsTDunw5wYbAsGuj8dyHRLqQrza",
+            uid=198,
+            commitment="unarbos/ninja@" + "a" * 40,
+            block=100,
+        )
+        state = ValidatorState(current_king=king, recent_kings=[king])
+        captured: dict[str, object] = {}
+
+        class _Neuron:
+            def __init__(self, uid: int):
+                self.uid = uid
+
+        class _Neurons:
+            def neurons_lite(self, _netuid):
+                return [_Neuron(uid) for uid in range(3)] + [_Neuron(uid=198)]
+
+        class _Subnets:
+            def get_uid_for_hotkey_on_subnet(self, _hotkey, _netuid):
+                raise RuntimeError("chain lookup unavailable")
+
+        class _Extrinsics:
+            def set_weights(self, **kwargs):
+                captured.update(kwargs)
+                return object()
+
+        class _Subtensor:
+            neurons = _Neurons()
+            subnets = _Subnets()
+            extrinsics = _Extrinsics()
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("validate.bt.Wallet", return_value=object()):
+            config = RunConfig(workspace_root=Path(tmp), validate_king_window_size=5)
+            _maybe_set_weights(subtensor=_Subtensor(), config=config, state=state, current_block=456, force=True)
+
+        weights = captured["weights"]
+        uids = captured["uids"]
+        self.assertAlmostEqual(weights[uids.index(198)], 0.40)
+        self.assertAlmostEqual(weights[uids.index(0)], 0.60)
+
     def test_startup_purge_clears_recent_kings_when_current_king_missing(self):
         previous = _submission(
             hotkey="5PreviousKing",

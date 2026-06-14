@@ -1074,6 +1074,35 @@ def solve_mini_swe_agent_instance(
     return record, prediction
 
 
+def _benchmark_solver_agent_source(agent: AgentIdentity) -> SolverAgentSource:
+    agent_path = agent.agent_path
+    repo_dir = agent_path.parent
+    manifest = repo_dir / "tau_agent_files.json"
+    if agent_path.name == "agent.py" and manifest.is_file():
+        return SolverAgentSource(
+            raw=str(repo_dir),
+            kind="local_path",
+            local_path=str(repo_dir),
+            agent_file="agent.py",
+            commit_sha=agent.commit_sha,
+        )
+    if agent_path.is_dir():
+        return SolverAgentSource(
+            raw=str(agent_path),
+            kind="local_path",
+            local_path=str(agent_path),
+            agent_file="agent.py",
+            commit_sha=agent.commit_sha,
+        )
+    return SolverAgentSource(
+        raw=str(agent_path),
+        kind="local_file",
+        local_path=str(agent_path),
+        agent_file="agent.py",
+        commit_sha=agent.commit_sha,
+    )
+
+
 def benchmark_run_config(
     *,
     agent: AgentIdentity,
@@ -1087,13 +1116,7 @@ def benchmark_run_config(
         agent_timeout=600,
         solver_provider_only=provider_only,
         solver_provider_allow_fallbacks=False,
-        solver_agent_source=SolverAgentSource(
-            raw=str(agent.agent_path),
-            kind="local_file",
-            local_path=str(agent.agent_path),
-            agent_file="agent.py",
-            commit_sha=agent.commit_sha,
-        ),
+        solver_agent_source=_benchmark_solver_agent_source(agent),
         docker_solver_memory="2g",
         docker_solver_cpus="1",
         docker_solver_pids_limit=256,

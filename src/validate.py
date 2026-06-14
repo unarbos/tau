@@ -4390,6 +4390,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 if not state.king_since:
                     state.king_since = _timestamp()
 
+            if state.current_king or state.recent_kings:
+                try:
+                    _maybe_set_weights(
+                        subtensor=subtensor,
+                        config=config,
+                        state=state,
+                        current_block=cast(int, subtensor.block),
+                    )
+                except Exception:
+                    log.exception("Startup set_weights failed (non-fatal, will retry next interval)")
+
             missing_secrets = _missing_runtime_secrets(config)
             if missing_secrets:
                 log.error(
@@ -4414,6 +4425,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 if restart_requested.is_set():
                     log.info("Restart requested at safe boundary; leaving validator loop for PM2 restart")
                     break
+                if state.current_king or state.recent_kings:
+                    try:
+                        _maybe_set_weights(
+                            subtensor=subtensor,
+                            config=config,
+                            state=state,
+                            current_block=cast(int, subtensor.block),
+                        )
+                    except Exception:
+                        log.exception("Pre-poll set_weights failed (non-fatal, will retry next interval)")
                 current_block = _refresh_chain_inputs(subtensor=subtensor)
                 if _enforce_submission_mode_on_state(config, state):
                     _ensure_king(state=state, github_client=github_client, config=config)
@@ -4510,7 +4531,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 subtensor=subtensor,
                                 config=config,
                                 state=state,
-                                current_block=current_block,
+                                current_block=cast(int, subtensor.block),
                             )
                         except Exception:
                             log.exception("Inter-duel set_weights failed (non-fatal, will retry next interval)")
@@ -5839,6 +5860,204 @@ def _resolve_merged_promotion_candidate(
     return replacement
 
 
+def _private_promotion_commit_message(submission: ValidatorSubmission, base_head_sha: str) -> str:
+    return (
+        f"Promote private miner {submission.hotkey[:12]} as ninja king\n\n"
+        f"Winning miner hotkey: {submission.hotkey}\n"
+        f"Winning uid: {submission.uid}\n"
+        f"Private submission commitment: {submission.commitment}\n"
+        f"Private submission sha256: {submission.commit_sha}\n"
+        f"Base head before publication: {base_head_sha}"
+    )
+
+
+def _fetch_github_manifest_paths_at_ref(
+    client: GitHubClient,
+    *,
+    repo: str,
+    ref: str,
+) -> list[str] | None:
+    fetched = _fetch_github_text_file(
+        client,
+        repo=repo,
+        path=_GITHUB_AGENT_MANIFEST_FILENAME,
+        ref=ref,
+    )
+    if fetched is None:
+        return None
+    content, _ = fetched
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
+        return None
+    return sorted({item.strip() for item in payload if item.strip()})
+
+
+def _publish_github_agent_files_commit_detailed(
+    client: GitHubClient,
+    *,
+    repo: str,
+    branch: str,
+    base_head_sha: str,
+    files: dict[str, str],
+    message: str,
+) -> tuple[str | None, str | None]:
+    try:
+        resp = client.get(f"/repos/{repo}/git/commits/{base_head_sha}")
+    except (httpx.HTTPError, OSError) as exc:
+        detail = _format_github_error("GitHub commit fetch failed", detail=str(exc))
+        log.warning("GitHub commit fetch failed for %s@%s: %s", repo, base_head_sha[:12], exc)
+        return None, detail
+    if resp.status_code != 200:
+        detail = _format_github_error(
+            "GitHub commit fetch failed",
+            status_code=resp.status_code,
+            detail=_github_response_text(resp),
+        )
+        log.warning(
+            "GitHub commit fetch failed for %s@%s: HTTP %s",
+            repo,
+            base_head_sha[:12],
+            resp.status_code,
+        )
+        return None, detail
+    try:
+        commit_payload = resp.json()
+    except ValueError:
+        return None, "GitHub commit fetch failed: invalid JSON"
+    tree = commit_payload.get("tree") if isinstance(commit_payload, dict) else {}
+    base_tree_sha = str(tree.get("sha") or "") if isinstance(tree, dict) else ""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", base_tree_sha):
+        return None, "GitHub commit fetch failed: missing base tree sha"
+
+    manifest_paths = sorted(files)
+    manifest_content = json.dumps(manifest_paths, indent=2) + "\n"
+    publish_files = dict(files)
+    publish_files[_GITHUB_AGENT_MANIFEST_FILENAME] = manifest_content
+    tree_entries: list[dict[str, Any]] = [
+        {
+            "path": path,
+            "mode": "100644",
+            "type": "blob",
+            "content": content,
+        }
+        for path, content in sorted(publish_files.items())
+    ]
+    old_manifest = _fetch_github_manifest_paths_at_ref(client, repo=repo, ref=base_head_sha) or []
+    for path in old_manifest:
+        if path not in publish_files:
+            tree_entries.append({"path": path, "mode": "100644", "sha": None})
+
+    try:
+        resp = client.post(
+            f"/repos/{repo}/git/trees",
+            json={"base_tree": base_tree_sha, "tree": tree_entries},
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        detail = _format_github_error("GitHub tree create failed", detail=str(exc))
+        log.warning("GitHub tree create failed for %s:%s: %s", repo, branch, exc)
+        return None, detail
+    if resp.status_code not in {200, 201}:
+        detail = _format_github_error(
+            "GitHub tree create failed",
+            status_code=resp.status_code,
+            detail=_github_response_text(resp),
+        )
+        log.warning(
+            "GitHub tree create failed for %s:%s: HTTP %s %s",
+            repo,
+            branch,
+            resp.status_code,
+            _github_response_text(resp)[:300],
+        )
+        return None, detail
+    try:
+        tree_payload = resp.json()
+    except ValueError:
+        return None, "GitHub tree create failed: invalid JSON"
+    new_tree_sha = str(tree_payload.get("sha") or "") if isinstance(tree_payload, dict) else ""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", new_tree_sha):
+        return None, "GitHub tree create failed: missing tree sha"
+
+    try:
+        resp = client.post(
+            f"/repos/{repo}/git/commits",
+            json={"message": message, "tree": new_tree_sha, "parents": [base_head_sha]},
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        detail = _format_github_error("GitHub commit create failed", detail=str(exc))
+        log.warning("GitHub commit create failed for %s:%s: %s", repo, branch, exc)
+        return None, detail
+    if resp.status_code not in {200, 201}:
+        detail = _format_github_error(
+            "GitHub commit create failed",
+            status_code=resp.status_code,
+            detail=_github_response_text(resp),
+        )
+        log.warning(
+            "GitHub commit create failed for %s:%s: HTTP %s %s",
+            repo,
+            branch,
+            resp.status_code,
+            _github_response_text(resp)[:300],
+        )
+        return None, detail
+    try:
+        new_commit_payload = resp.json()
+    except ValueError:
+        return None, "GitHub commit create failed: invalid JSON"
+    new_commit_sha = str(new_commit_payload.get("sha") or "") if isinstance(new_commit_payload, dict) else ""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", new_commit_sha):
+        return None, "GitHub commit create failed: missing commit sha"
+
+    try:
+        resp = client.patch(
+            f"/repos/{repo}/git/refs/heads/{branch}",
+            json={"sha": new_commit_sha, "force": False},
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        detail = _format_github_error("GitHub ref update failed", detail=str(exc))
+        log.warning("GitHub ref update failed for %s:%s: %s", repo, branch, exc)
+        return None, detail
+    if resp.status_code not in {200, 201}:
+        detail = _format_github_error(
+            "GitHub ref update failed",
+            status_code=resp.status_code,
+            detail=_github_response_text(resp),
+        )
+        log.warning(
+            "GitHub ref update failed for %s:%s: HTTP %s %s",
+            repo,
+            branch,
+            resp.status_code,
+            _github_response_text(resp)[:300],
+        )
+        return None, detail
+    return new_commit_sha.lower(), None
+
+
+def _published_private_submission(
+    submission: ValidatorSubmission,
+    *,
+    base_repo: str,
+    base_ref: str,
+    published_sha: str,
+) -> ValidatorSubmission:
+    return replace(
+        submission,
+        repo_full_name=base_repo,
+        repo_url=f"https://github.com/{base_repo}.git",
+        commit_sha=published_sha,
+        source=_PRIVATE_SUBMISSION_PUBLISHED_SOURCE,
+        base_repo_full_name=base_repo,
+        base_ref=base_ref,
+        display_repo_full_name=base_repo,
+        display_commit_sha=published_sha,
+    )
+
+
 def _publish_promoted_private_submission(
     *,
     github_client: GitHubClient,
@@ -5853,21 +6072,12 @@ def _publish_promoted_private_submission(
     except Exception as exc:
         log.warning("Promoted private submission %s could not load agent files: %s", submission.commitment, exc)
         return submission
-    if len(winning_files) > 1:
-        log.warning(
-            "Promoted private submission %s is multi-file; the public base repo publication "
-            "is single-file only, so the king keeps running from the private bundle.",
-            submission.commitment,
-        )
-        return submission
 
     base_repo = (config.validate_publish_repo or _MINER_AGENT_REPO_FULL_NAME).strip() or _MINER_AGENT_REPO_FULL_NAME
     base_ref = (config.validate_publish_base or _MINER_AGENT_BRANCH).strip() or _MINER_AGENT_BRANCH
-    agent_path = _private_submission_agent_path(config, submission)
-    try:
-        winning_agent = agent_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        log.warning("Promoted private submission %s could not read agent.py: %s", submission.commitment, exc)
+    winning_agent = winning_files.get(_DEFAULT_GITHUB_AGENT_FILE)
+    if winning_agent is None:
+        log.warning("Promoted private submission %s is missing %s", submission.commitment, _DEFAULT_GITHUB_AGENT_FILE)
         return submission
 
     validation_error = _validate_resolved_agent_py(winning_agent)
@@ -5883,32 +6093,36 @@ def _publish_promoted_private_submission(
     if not base_head_sha:
         log.warning("Promoted private submission %s could not resolve %s:%s", submission.commitment, base_repo, base_ref)
         return submission
-    current_base = _fetch_github_text_file(
-        github_client,
-        repo=base_repo,
-        path=_DEFAULT_GITHUB_AGENT_FILE,
-        ref=base_head_sha,
-    )
-    if current_base is None:
-        log.warning("Promoted private submission %s could not fetch current base agent.py", submission.commitment)
-        return submission
 
-    published_sha, update_error = _update_github_text_file_detailed(
-        github_client,
-        repo=base_repo,
-        path=_DEFAULT_GITHUB_AGENT_FILE,
-        branch=base_ref,
-        current_blob_sha=current_base[1],
-        content=winning_agent,
-        message=(
-            f"Promote private miner {submission.hotkey[:12]} as ninja king\n\n"
-            f"Winning miner hotkey: {submission.hotkey}\n"
-            f"Winning uid: {submission.uid}\n"
-            f"Private submission commitment: {submission.commitment}\n"
-            f"Private submission sha256: {submission.commit_sha}\n"
-            f"Base head before publication: {base_head_sha}"
-        ),
-    )
+    message = _private_promotion_commit_message(submission, base_head_sha)
+    if len(winning_files) == 1:
+        current_base = _fetch_github_text_file(
+            github_client,
+            repo=base_repo,
+            path=_DEFAULT_GITHUB_AGENT_FILE,
+            ref=base_head_sha,
+        )
+        if current_base is None:
+            log.warning("Promoted private submission %s could not fetch current base agent.py", submission.commitment)
+            return submission
+        published_sha, update_error = _update_github_text_file_detailed(
+            github_client,
+            repo=base_repo,
+            path=_DEFAULT_GITHUB_AGENT_FILE,
+            branch=base_ref,
+            current_blob_sha=current_base[1],
+            content=winning_agent,
+            message=message,
+        )
+    else:
+        published_sha, update_error = _publish_github_agent_files_commit_detailed(
+            github_client,
+            repo=base_repo,
+            branch=base_ref,
+            base_head_sha=base_head_sha,
+            files=winning_files,
+            message=message,
+        )
     if not published_sha:
         log.warning(
             "Promoted private submission %s could not publish to %s:%s: %s",
@@ -5920,21 +6134,17 @@ def _publish_promoted_private_submission(
         return submission
 
     log.info(
-        "Promoted private submission %s published to %s@%s",
+        "Promoted private submission %s published %d file(s) to %s@%s",
         submission.commitment,
+        len(winning_files),
         base_repo,
         published_sha[:12],
     )
-    return replace(
+    return _published_private_submission(
         submission,
-        repo_full_name=base_repo,
-        repo_url=f"https://github.com/{base_repo}.git",
-        commit_sha=published_sha,
-        source=_PRIVATE_SUBMISSION_PUBLISHED_SOURCE,
-        base_repo_full_name=base_repo,
+        base_repo=base_repo,
         base_ref=base_ref,
-        display_repo_full_name=base_repo,
-        display_commit_sha=published_sha,
+        published_sha=published_sha,
     )
 
 
@@ -6239,6 +6449,15 @@ def _hotkey_spent_since_block(config: RunConfig) -> int | None:
     return None
 
 
+def _uid_for_hotkey_on_subnet(*, subtensor, hotkey: str, netuid: int) -> int | None:
+    try:
+        lookup = subtensor.get_uid_for_hotkey_on_subnet(hotkey, netuid)
+    except Exception:
+        log.exception("uid lookup failed for %s", hotkey)
+        return None
+    return int(lookup) if lookup is not None else None
+
+
 def _current_registration_block(
     *,
     subtensor,
@@ -6249,7 +6468,11 @@ def _current_registration_block(
     uid_value = uid
     if uid_value is None:
         try:
-            uid_value = subtensor.subnets.get_uid_for_hotkey_on_subnet(hotkey, config.validate_netuid)
+            uid_value = _uid_for_hotkey_on_subnet(
+                subtensor=subtensor,
+                hotkey=hotkey,
+                netuid=config.validate_netuid,
+            )
         except Exception as exc:
             log.debug("uid lookup failed while checking registration block for %s: %s", hotkey, exc)
             return None
@@ -7242,6 +7465,33 @@ def _resolve_promotion_candidate(*, subtensor, github_client, config, state, pri
 # Weight setting
 # ---------------------------------------------------------------------------
 
+def _resolve_weight_uid(
+    *,
+    subtensor,
+    config: RunConfig,
+    submission: ValidatorSubmission,
+    uid_set: set[int],
+) -> int | None:
+    """Resolve a king hotkey to a live subnet uid for set_weights."""
+    try:
+        lookup = subtensor.subnets.get_uid_for_hotkey_on_subnet(
+            submission.hotkey,
+            config.validate_netuid,
+        )
+        if lookup is not None:
+            uid = int(lookup)
+            if uid in uid_set:
+                return uid
+    except Exception:
+        log.exception("uid lookup failed for %s", submission.hotkey)
+    stored_uid = submission.uid
+    if stored_uid is not None:
+        uid = int(stored_uid)
+        if uid in uid_set:
+            return uid
+    return None
+
+
 def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool = False):
     """Distribute weights across the current king and four prior kings.
 
@@ -7270,18 +7520,13 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
     for i, share in enumerate(shares):
         sub = recent[i] if i < len(recent) else None
         uid: int | None = None
-        if (
-            sub is not None
-            and _incumbent_allowed_by_mode(config, sub)
-        ):
-            try:
-                lookup = subtensor.subnets.get_uid_for_hotkey_on_subnet(
-                    sub.hotkey, config.validate_netuid,
-                )
-                uid = int(lookup) if lookup is not None else None
-            except Exception:
-                log.exception("uid lookup failed for %s", sub.hotkey)
-                uid = None
+        if sub is not None and _incumbent_allowed_by_mode(config, sub):
+            uid = _resolve_weight_uid(
+                subtensor=subtensor,
+                config=config,
+                submission=sub,
+                uid_set=uid_set,
+            )
         if uid is not None and uid in uid_set and sub is not None:
             weights_by_uid[uid] += share
             resolved.append((uid, sub.hotkey, share))
