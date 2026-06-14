@@ -10,10 +10,14 @@ from config import RunConfig
 from validate import (
     DiffJudgeResult,
     PoolTask,
+    ValidationRoundResult,
     ValidatorSubmission,
     _challenger_wins,
+    _copy_detection_reason,
     _diff_judge_prompt_injection_result,
     _duel_speed_stop_reason,
+    _parse_diff_judge_payload,
+    _round_winner_from_scores,
     _solve_and_compare_round,
 )
 
@@ -127,6 +131,73 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertAlmostEqual(result.king_score, 0.0)
         self.assertAlmostEqual(result.challenger_score, 1.0)
         self.assertEqual(result.llm_judge_winner, "challenger")
+
+    def test_llm_tie_stays_round_tie_despite_score_noise(self):
+        result = self._run_round_with_judge(
+            king_similarity=0.90,
+            challenger_similarity=0.90,
+            judge=DiffJudgeResult(
+                winner="tie",
+                king_score=1.0,
+                challenger_score=1.0,
+                rationale="both patches are equivalent",
+            ),
+        )
+
+        self.assertEqual(result.winner, "tie")
+        self.assertEqual(result.llm_judge_winner, "tie")
+
+    def test_round_score_margin_ties_near_identical_combined_scores(self):
+        self.assertEqual(
+            _round_winner_from_scores(0.9982, 0.9981, llm_judge_winner="challenger"),
+            "tie",
+        )
+        self.assertEqual(
+            _round_winner_from_scores(0.60, 0.75, llm_judge_winner="challenger"),
+            "challenger",
+        )
+        self.assertEqual(
+            _round_winner_from_scores(0.80, 0.60, llm_judge_winner="king"),
+            "king",
+        )
+
+    def test_parse_diff_judge_payload_preserves_llm_tie(self):
+        judge = _parse_diff_judge_payload(
+            {
+                "winner": "tie",
+                "candidate_a_score": 1.0,
+                "candidate_b_score": 1.0,
+                "rationale": "equivalent",
+            },
+            candidate_mapping={"king": "candidate_a", "challenger": "candidate_b"},
+        )
+        self.assertEqual(judge.winner, "tie")
+
+    def test_copy_detection_still_flags_near_exact_rounds(self):
+        rounds = [
+            ValidationRoundResult(
+                task_name=f"task-{idx}",
+                winner="challenger",
+                king_lines=0,
+                challenger_lines=10,
+                king_similarity_ratio=0.0,
+                challenger_similarity_ratio=0.5,
+                king_challenger_similarity=0.99,
+                task_root=f"/tmp/task-{idx}",
+                king_compare_root="",
+                challenger_compare_root="",
+            )
+            for idx in range(10)
+        ]
+        self.assertEqual(
+            _copy_detection_reason(
+                rounds,
+                include_mean_similarity=False,
+                include_suspicious_fraction=False,
+            ),
+            "copy detected (10 near-exact rounds >= 0.98)",
+        )
+        self.assertTrue(_copy_detection_reason(rounds).startswith("copy detected"))
 
     def test_patch_similarity_does_not_offset_llm_judge(self):
         result = self._run_round_with_judge(

@@ -316,7 +316,9 @@ class Sim:
         challenger_similarity = 0.0 if zero_challenger else (chall_cmp.similarity_ratio if chall_cmp else 0.0)
         base_score = _combined_round_score(base_similarity, judge.king_score)
         challenger_score = _combined_round_score(challenger_similarity, judge.challenger_score)
-        winner = _round_winner_from_scores(base_score, challenger_score)
+        winner = _round_winner_from_scores(
+            base_score, challenger_score, llm_judge_winner=judge.winner,
+        )
 
         # Streak accounting: NEW rule only counts a challenger timeout when the
         # challenger did NOT win that round; OLD rule counts every timeout.

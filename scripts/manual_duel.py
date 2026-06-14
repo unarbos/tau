@@ -307,7 +307,9 @@ class ManualDuelRunner:
             challenger_lines = challenger_compare.matched_changed_lines if challenger_compare else 0
         base_score = _combined_round_score(base_similarity, judge.king_score)
         challenger_score = _combined_round_score(challenger_similarity, judge.challenger_score)
-        winner = _round_winner_from_scores(base_score, challenger_score)
+        winner = _round_winner_from_scores(
+            base_score, challenger_score, llm_judge_winner=judge.winner,
+        )
 
         result = {
             "task_name": task.task_name,

@@ -90,6 +90,9 @@ _DIFF_JUDGE_WEIGHT = 1.0
 # (1 - weight) is the LLM diff-judge quality score. With equal quality, a
 # faster solve scores strictly higher; speed never dominates real quality.
 _SOLVE_TIME_WEIGHT = 0.05
+# Minimum combined round-score gap required to award a side a decisive win.
+# LLM-declared ties always stay ties regardless of float noise or speed nudges.
+_ROUND_SCORE_WIN_MARGIN = float(os.environ.get("TAU_ROUND_SCORE_WIN_MARGIN", "0.02"))
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_MAX_TOKENS = 16_000
@@ -1480,10 +1483,20 @@ def _combined_round_score(
     return _clamp01((1.0 - _SOLVE_TIME_WEIGHT) * quality + _SOLVE_TIME_WEIGHT * speed)
 
 
-def _round_winner_from_scores(king_score: float, challenger_score: float) -> str:
-    if challenger_score > king_score:
+def _round_winner_from_scores(
+    king_score: float,
+    challenger_score: float,
+    *,
+    llm_judge_winner: str | None = None,
+    score_margin: float | None = None,
+) -> str:
+    if llm_judge_winner == "tie":
+        return "tie"
+    margin = _ROUND_SCORE_WIN_MARGIN if score_margin is None else score_margin
+    delta = challenger_score - king_score
+    if delta >= margin:
         return "challenger"
-    if challenger_score < king_score:
+    if delta <= -margin:
         return "king"
     return "tie"
 
@@ -1962,11 +1975,8 @@ def _parse_diff_judge_payload(
         else:
             king_score, challenger_score = 0.5, 0.5
 
-    score_winner = _round_winner_from_scores(king_score, challenger_score)
     if winner not in {"king", "challenger", "tie"}:
-        winner = score_winner
-    elif winner != score_winner:
-        winner = score_winner
+        winner = _round_winner_from_scores(king_score, challenger_score)
 
     return DiffJudgeResult(
         winner=winner,
@@ -3362,7 +3372,11 @@ def _solve_and_compare_round(
             challenger_similarity, diff_judge.challenger_score, time_score=challenger_time_score,
         )
 
-        winner = _round_winner_from_scores(king_score, challenger_score)
+        winner = _round_winner_from_scores(
+            king_score,
+            challenger_score,
+            llm_judge_winner=diff_judge.winner,
+        )
 
         king_rollout_id = _solution_rollout_id(
             task_name=task.task_name,
@@ -4108,11 +4122,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
     _kill_stale_containers()
     log.info(
-        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s) + %.0f%% linear solve time (faster wins ties); patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
+        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s) + %.0f%% linear solve time (faster wins ties); LLM ties stay ties; decisive wins need >=%.0f%% combined-score gap; patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
         config.validate_duel_rounds,
         (_DIFF_JUDGE_WEIGHT - _SOLVE_TIME_WEIGHT) * 100,
         _DIFF_JUDGE_MODEL,
         _SOLVE_TIME_WEIGHT * 100,
+        _ROUND_SCORE_WIN_MARGIN * 100,
         config.validate_win_margin,
     )
 
@@ -5275,7 +5290,14 @@ def _publish_dashboard(
             "solve_time_weight": _SOLVE_TIME_WEIGHT,
             "llm_diff_judge_model": _DIFF_JUDGE_MODEL,
             "ties_count": False,
-            "description": "Round score is mostly the LLM diff judgment of how well each patch satisfies the task, plus a linear solve-time component: with equal quality, the faster solve scores strictly higher. Patch similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
+            "description": (
+                "Round score is mostly the LLM diff judgment of how well each patch satisfies the task, "
+                "plus a linear solve-time component: with equal quality, the faster solve scores strictly higher. "
+                "LLM-declared ties always remain round ties. Decisive wins require a combined-score gap of at least "
+                f"{_ROUND_SCORE_WIN_MARGIN:.0%}. Patch similarity is retained as telemetry and for pool operations. "
+                "Challenger must win more decisive rounds than the king plus margin (ties ignored)"
+            ),
+            "round_score_win_margin": _ROUND_SCORE_WIN_MARGIN,
         },
         "queue": [
             {
