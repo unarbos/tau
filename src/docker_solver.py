@@ -218,6 +218,21 @@ class _DockerProxyTransport:
         return proxy.container_base_url(self.container_host_name)
 
 
+_SOLVE_TIME_SCORING_NOTICE = (
+    "\n\n---\n"
+    "Scoring note: your solution is graded primarily on how correctly and "
+    "completely it solves the task, but solve time is also scored linearly. "
+    "Among solutions of equal quality, a shorter solve time scores strictly "
+    "higher. As soon as the task is correctly and completely solved, stop "
+    "immediately: do not re-read files, re-verify, or polish, since the extra "
+    "time only lowers your score."
+)
+
+
+def _issue_with_solve_time_notice(prompt_text: str) -> str:
+    return f"{prompt_text.rstrip()}{_SOLVE_TIME_SCORING_NOTICE}"
+
+
 def solve_task_in_docker(
     *,
     repo_dir: Path,
@@ -236,7 +251,7 @@ def solve_task_in_docker(
             "OPENROUTER_API_KEY is not set. Load it from .env or export it before running swe-eval."
         )
 
-    issue = task.prompt_text
+    issue = _issue_with_solve_time_notice(task.prompt_text)
     language = _detect_repo_language(repo_dir)
     image_tag = _resolve_image_tag(config, language)
     model_id = _solver_model_id(config.solver_model)
