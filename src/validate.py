@@ -26,7 +26,7 @@ import httpx
 
 from config import RunConfig, SolverAgentSource
 from openrouter_client import complete_text
-from pipeline import _setup_logging, compare_task_run, solve_task_run
+from pipeline import _setup_logging, solve_task_run
 from private_submission import (
     MAX_AGENT_FILES,
     PRIVATE_SUBMISSION_QUEUE_WAKEUP,
@@ -138,7 +138,6 @@ _COPY_NEAR_EXACT_MIN_ROUNDS = 10
 _COPY_SUSPICIOUS_FRACTION_THRESHOLD = 0.60
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
-_PARALLEL_DUEL_COMPARE_TIMEOUT = 600.0
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 300.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _GRACEFUL_DUEL_SHUTDOWN_SECONDS = 300.0
@@ -3274,16 +3273,6 @@ def _solve_and_compare_round(
             solution_name=solution_label,
             config=config,
         )
-        _remove_compare_artifacts(
-            task_name=task.task_name,
-            solution_names=_reference_compare_solution_names(solution_label),
-            config=config,
-        )
-        _remove_compare_artifacts(
-            task_name=task.task_name,
-            solution_names=["king", solution_label],
-            config=config,
-        )
         agent_timeout = _duel_agent_timeout(task)
         king_exit_reason, king_elapsed_seconds = _cached_solution_summary(
             task_name=task.task_name,
@@ -3328,27 +3317,10 @@ def _solve_and_compare_round(
                 chall_has_patch,
             )
 
-        cmp_exec = _DaemonThreadExecutor(thread_name_prefix="round-compare")
-        try:
-            chall_fut = cmp_exec.submit(
-                compare_task_run, task_name=task.task_name,
-                solution_names=_reference_compare_solution_names(solution_label), config=config,
-            )
-            kc_fut = cmp_exec.submit(
-                compare_task_run, task_name=task.task_name,
-                solution_names=["king", solution_label], config=config,
-            )
-            # Bound compare time so a wedged comparator can't pin a round forever.
-            chall_compare = chall_fut.result(timeout=_PARALLEL_DUEL_COMPARE_TIMEOUT)
-            kc_compare = kc_fut.result(timeout=_PARALLEL_DUEL_COMPARE_TIMEOUT)
-        finally:
-            # Never block on hung compare workers after result timeouts.
-            cmp_exec.shutdown(wait=False, cancel_futures=True)
-
         zero_challenger = chall_timed_out and not chall_has_patch
-        c_lines = 0 if zero_challenger else chall_compare.matched_changed_lines
+        c_lines = 0
         k_lines = task.king_lines
-        challenger_similarity = 0.0 if zero_challenger else chall_compare.similarity_ratio
+        challenger_similarity = 0.0
         diff_judge = _judge_round_diffs(
             task_name=task.task_name,
             challenger_solution_name=solution_label,
@@ -3393,10 +3365,10 @@ def _solve_and_compare_round(
             king_lines=k_lines, challenger_lines=c_lines,
             king_similarity_ratio=task.king_similarity,
             challenger_similarity_ratio=challenger_similarity,
-            king_challenger_similarity=kc_compare.similarity_ratio,
+            king_challenger_similarity=0.0,
             task_root=task.task_root,
             king_compare_root="",
-            challenger_compare_root=chall_compare.comparison_root,
+            challenger_compare_root="",
             baseline_lines=task.baseline_lines,
             king_score=king_score,
             challenger_score=challenger_score,
@@ -3460,7 +3432,7 @@ def _run_parallel_duel(
     """Run a duel with all rounds executing in parallel.
 
     Instead of running rounds sequentially, this gathers N tasks from the
-    pool up front and then launches all challenger solves + comparisons
+    pool up front and then launches all challenger solves + LLM judges
     concurrently.  Wall-clock time is roughly that of a single round.
     """
     n_rounds = config.validate_duel_rounds
@@ -3584,7 +3556,7 @@ def _run_parallel_duel(
     _raise_if_insufficient_duel_tasks(duel_id, n_rounds, tasks)
 
     # Phase 2+3: solve and compare all rounds in parallel
-    log.info("Duel %d phase 2: launching %d parallel solves + compares",
+    log.info("Duel %d phase 2: launching %d parallel solves + judges",
              duel_id, len(tasks))
     solve_start = time.monotonic()
 
@@ -4298,6 +4270,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
     try:
         with _open_subtensor(config) as subtensor:
+            # SubtensorApi() re-silences non-bittensor loggers to CRITICAL on init.
+            _setup_logging(debug=config.debug)
             log.info("Connected to chain for netuid %s", config.validate_netuid)
 
             if _backfill_recent_king_display_metadata(

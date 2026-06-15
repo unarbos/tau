@@ -1,6 +1,4 @@
 import json
-import threading
-import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -63,21 +61,15 @@ class ReferenceScoringTest(unittest.TestCase):
             "challenger cannot catch king",
         )
 
-    def test_parallel_round_compares_challenger_to_reference(self):
+    def test_parallel_round_skips_cursor_compare(self):
         calls: list[tuple[str, ...]] = []
 
         def fake_compare_task_run(*, task_name, solution_names, config):
             calls.append(tuple(solution_names))
-            if solution_names[1] == "reference":
-                return SimpleNamespace(
-                    matched_changed_lines=123,
-                    similarity_ratio=0.82,
-                    comparison_root="/tmp/challenger-vs-reference",
-                )
             return SimpleNamespace(
-                matched_changed_lines=77,
-                similarity_ratio=0.31,
-                comparison_root="/tmp/king-vs-challenger",
+                matched_changed_lines=123,
+                similarity_ratio=0.82,
+                comparison_root="/tmp/compare",
             )
 
         task = PoolTask(
@@ -107,11 +99,9 @@ class ReferenceScoringTest(unittest.TestCase):
                 duel_id=3,
             )
 
-        self.assertIn(("challenger-7-d3", "reference"), calls)
-        self.assertIn(("king", "challenger-7-d3"), calls)
-        self.assertNotIn(("challenger-7-d3", "baseline"), calls)
+        self.assertEqual(calls, [])
         self.assertEqual(result.winner, "tie")
-        self.assertEqual(result.challenger_lines, 123)
+        self.assertEqual(result.challenger_lines, 0)
         self.assertAlmostEqual(result.king_score, 0.5)
         self.assertAlmostEqual(result.challenger_score, 0.5)
 
@@ -367,10 +357,10 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertEqual(result.challenger_score, 0.5)
         self.assertIn("total timeout", result.error or "")
 
-    def test_compare_timeout_does_not_block_round_worker(self):
+    def test_round_proceeds_to_judge_without_compare(self):
         task = PoolTask(
-            task_name="task-compare-timeout",
-            task_root="/tmp/task-compare-timeout",
+            task_name="task-no-compare",
+            task_root="/tmp/task-no-compare",
             creation_block=10,
             cursor_elapsed=1.0,
             king_lines=5000,
@@ -380,17 +370,20 @@ class ReferenceScoringTest(unittest.TestCase):
         king = _submission(hotkey="king-hk", uid=6, sha="b" * 40)
         challenger = _submission(uid=9)
 
-        _stop = threading.Event()
-
-        def slow_compare(**_kwargs):
-            _stop.wait(3600)
-
-        started = time.monotonic()
         with (
             patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
-            patch("validate.compare_task_run", side_effect=slow_compare),
             patch("validate._ensure_task_ready_for_king", return_value=task),
-            patch("validate._PARALLEL_DUEL_COMPARE_TIMEOUT", 0.05),
+            patch(
+                "validate._judge_round_diffs",
+                return_value=DiffJudgeResult(
+                    winner="tie",
+                    king_score=0.5,
+                    challenger_score=0.5,
+                    model="test",
+                    rationale="ok",
+                    error=None,
+                ),
+            ),
         ):
             result = _solve_and_compare_round(
                 task=task,
@@ -399,11 +392,9 @@ class ReferenceScoringTest(unittest.TestCase):
                 config=RunConfig(openrouter_api_key="test-key"),
                 duel_id=99,
             )
-        _stop.set()
 
-        self.assertLess(time.monotonic() - started, 2.0)
-        self.assertEqual(result.winner, "error")
-        self.assertIn("failed", result.error or "")
+        self.assertEqual(result.winner, "tie")
+        self.assertIsNone(result.error)
 
     def _run_round_with_judge(
         self,
@@ -412,19 +403,6 @@ class ReferenceScoringTest(unittest.TestCase):
         challenger_similarity: float,
         judge: DiffJudgeResult,
     ):
-        def fake_compare_task_run(*, task_name, solution_names, config):
-            if solution_names[1] == "reference":
-                return SimpleNamespace(
-                    matched_changed_lines=int(challenger_similarity * 10_000),
-                    similarity_ratio=challenger_similarity,
-                    comparison_root="/tmp/challenger-vs-reference",
-                )
-            return SimpleNamespace(
-                matched_changed_lines=77,
-                similarity_ratio=0.31,
-                comparison_root="/tmp/king-vs-challenger",
-            )
-
         task = PoolTask(
             task_name="task-judge",
             task_root="/tmp/task-judge",
@@ -439,7 +417,6 @@ class ReferenceScoringTest(unittest.TestCase):
 
         with (
             patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
-            patch("validate.compare_task_run", side_effect=fake_compare_task_run),
             patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate._judge_round_diffs", return_value=judge),
             patch("validate.publish_round_data"),
