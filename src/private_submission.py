@@ -653,6 +653,7 @@ def record_private_submission_acceptance(
     agent_username: str | None = None,
     coldkey: str | None = None,
     coldkey_signature: str | None = None,
+    uid: int | None = None,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
     ledger = _read_acceptance_ledger(root)
@@ -660,7 +661,7 @@ def record_private_submission_acceptance(
     hotkeys = ledger.setdefault("hotkeys", {})
     if not isinstance(hotkeys, dict):
         raise ValueError("private submission acceptance ledger has invalid `hotkeys`")
-    hotkeys[hotkey] = {
+    entry = {
         "registration_block": int(registration_block),
         "submission_id": submission_id,
         "agent_sha256": agent_sha256.lower(),
@@ -671,8 +672,38 @@ def record_private_submission_acceptance(
             coldkey_signature=coldkey_signature,
         ),
     }
+    if uid is not None:
+        entry["uid"] = int(uid)
+    hotkeys[hotkey] = entry
     _write_acceptance_ledger(root, ledger)
     touch_private_submission_queue_wakeup(root=root)
+
+
+def backfill_acceptance_ledger_uids(*, root: Path, netuid: int = 66) -> int:
+    """Write missing uids into the acceptance ledger from chain state."""
+    from hotkey_uid_cache import clear_hotkey_uid_cache, hotkey_uid_map
+
+    ledger = _read_acceptance_ledger(root)
+    hotkeys = ledger.get("hotkeys", {})
+    if not isinstance(hotkeys, dict):
+        return 0
+
+    clear_hotkey_uid_cache()
+    uid_map = hotkey_uid_map(netuid=netuid, ttl_seconds=0)
+    updated = 0
+    for hotkey, entry in hotkeys.items():
+        if not isinstance(entry, dict) or entry.get("uid") is not None:
+            continue
+        uid = uid_map.get(str(hotkey))
+        if uid is None:
+            continue
+        entry["uid"] = int(uid)
+        updated += 1
+
+    if updated:
+        _write_acceptance_ledger(root, ledger)
+        touch_private_submission_queue_wakeup(root=root)
+    return updated
 
 
 def touch_private_submission_queue_wakeup(*, root: Path) -> None:
@@ -786,6 +817,7 @@ def accepted_private_submission_entries(*, root: Path) -> list[dict[str, Any]]:
                 "agent_sha256": str(entry.get("agent_sha256") or "").lower(),
                 "registration_block": _optional_int(entry.get("registration_block")),
                 "accepted_at": entry.get("accepted_at"),
+                "uid": _optional_int(entry.get("uid")),
                 "agent_username": entry.get("agent_username") or entry.get("username"),
                 "coldkey": entry.get("coldkey"),
                 "coldkey_signature": entry.get("coldkey_signature") or entry.get("signature"),
@@ -814,6 +846,7 @@ def _public_submission_from_ledger_entry(
             "agent_sha256": agent_sha256,
             "commitment": f"private-submission:{submission_id}:{agent_sha256}",
             "registration_block": _optional_int(entry.get("registration_block")),
+            "uid": _optional_int(entry.get("uid")),
             "accepted_at": entry.get("accepted_at"),
             **_public_identity_metadata(entry),
             "accepted": bool(check_result.get("accepted", True)),

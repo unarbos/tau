@@ -1,5 +1,5 @@
 #!/bin/bash
-exec doppler run -p arbos -c dev -- bash -lc '
+exec doppler run -p sn66 -c prd -- bash -lc '
 set -euo pipefail
 : "${OPENROUTER_API_KEY:?Set OPENROUTER_API_KEY in Doppler}"
 export OPENROUTER_UPSTREAM_BASE_URL=https://openrouter.ai/api/v1

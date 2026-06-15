@@ -320,11 +320,13 @@ the hotkey re-registers.
 - `Submission Scope Guard` rejects edits that break the
   solve contract or attempt forbidden provider/sampling control.
 - `OpenRouter Submission Judge` reviews the diff with the private submission
-  gatekeeping prompt through OpenRouter using `anthropic/claude-opus-4.7`,
-  temperature 0, medium reasoning effort, and required overall/component score
-  floors. Reorder-only or gate-order-only submissions must show concrete
-  evidence that they improve broad task behavior, not just that they change
-  control flow.
+  gatekeeping prompt through OpenRouter using `google/gemini-3.1-flash-lite`
+  at temperature 0 with a 16000-token output cap and required overall/component
+  score floors. Override with `--judge-model` or
+  `PRIVATE_SUBMISSION_JUDGE_MODEL`; Anthropic models additionally get medium
+  reasoning effort. Reorder-only or gate-order-only submissions must show
+  concrete evidence that they improve broad task behavior, not just that they
+  change control flow.
 
 The validator keeps two independent 50-task pools: a primary pool for the
 first challenger-vs-king duel, and a retest pool used only when the challenger
@@ -357,27 +359,27 @@ static at 50 tasks each. Scheduled recycling is disabled unless
 `--task-pool-refresh-count` and `--task-pool-refresh-interval-seconds` are set
 to non-zero values.
 
-`start_validator.sh` enables this production path with:
+`start_validator.sh` sets `PRIVATE_SUBMISSION_JUDGE_MODEL=google/gemini-3.1-flash-lite`
+and runs `cli validate` with notable flags such as:
 
 ```bash
---solver-model minimax/minimax-m2.7 \
---solver-provider-only minimax/fp8,minimax/highspeed \
---round-concurrency 25 \
---candidate-timeout-streak-limit 10 \
---poll-interval-seconds 600 \
---task-pool-target 50 \
---task-pool-static \
---task-pool-fill-from-saved \
---task-pool-refresh-count 0 \
---task-pool-refresh-interval-seconds 0 \
---duel-rounds 50 \
---win-margin 3 \
---hotkey-spent-since-block 8104340 \
---pool-filler-concurrency 25 \
---watch-private-submissions \
---private-submission-only \
---publish-repo unarbos/ninja \
---publish-base main
+python -m cli validate \
+  --solver-model google/gemini-3.1-flash-lite \
+  --solver-provider-only google-vertex/global \
+  --solver-provider-disable-fallbacks \
+  --round-concurrency 50 \
+  --docker-solver-start-concurrency 50 \
+  --candidate-timeout-streak-limit 10 \
+  --poll-interval-seconds 600 \
+  --task-pool-target 50 \
+  --task-pool-static \
+  --duel-rounds 50 \
+  --win-margin 6 \
+  --hotkey-spent-since-block 8104340 \
+  --watch-private-submissions \
+  --private-submission-only \
+  --publish-repo unarbos/ninja \
+  --publish-base main
 ```
 
 `--private-submission-only` means normal `unarbos/ninja@sha` submissions are
@@ -390,9 +392,16 @@ Each validation task still starts from a mined GitHub commit: `task/original` is
 
 For duels, the score comes solely from the LLM diff judge. The pool filler still creates a Cursor baseline solution at `solutions/baseline` so the validator can keep compatibility telemetry, copy checks, and timeout calibration data, but Cursor-baseline similarity no longer contributes to the winner.
 
-Round score is based only on the LLM diff judgment. The diff judge uses `anthropic/claude-sonnet-4.6` through OpenRouter at temperature 0 with adaptive reasoning enabled and a 16000-token output cap, then scores the king and challenger patches against the task/reference context. The request uses OpenRouter Anthropic prompt caching with an explicit `cache_control: {"type": "ephemeral"}` content-block breakpoint after the stable task and reference patch context, leaving candidate patches uncached so repeated tasks can reuse cached prompt reads when they meet Sonnet 4.6 cache-size requirements. If Sonnet returns the same OpenRouter route/provider no-choices error, the judge falls back to `moonshotai/kimi-k2.6` with a plain non-Anthropic prompt shape.
+Round score is based only on the LLM diff judgment. The diff judge uses
+`google/gemini-3.1-flash-lite` through OpenRouter at temperature 0 with a
+16000-token output cap, then scores the king and challenger patches against
+the task/reference context. Candidate patches are role-blinded and treated as
+untrusted input. Up to four attempts run within a 300-second total timeout.
+Change the model in code via `_DIFF_JUDGE_MODEL` in `validate.py`; Anthropic
+models use adaptive reasoning and prompt-cache breakpoints, but production
+currently runs Gemini with no configured fallback models.
 
-Cursor is telemetry only for round scoring. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king plus the configured margin. `start_validator.sh` currently uses `--win-margin 3`.
+Cursor is telemetry only for round scoring. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king plus the configured margin. `start_validator.sh` currently uses `--win-margin 6`.
 
 The validator still compares `king` to `challenger` separately for copy detection, but that pairwise similarity does not affect the round score.
 

@@ -53,6 +53,10 @@ _submission_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SUBMISSIONS)
 _rate_lock = threading.Lock()
 _hotkey_rate_lock = threading.Lock()
 _rate_buckets: dict[str, list[tuple[float, bool]]] = {}
+_public_payload_cache_lock = threading.Lock()
+_public_payload_rebuild_lock = threading.Lock()
+_public_payload_cache: dict[str, Any] = {"payload": None, "ts": 0.0, "ledger_mtime": None}
+PUBLIC_SUBMISSIONS_CACHE_TTL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,45 @@ class SubmissionApiConfig:
     hotkey_rate_limit_max_attempts: int = HOTKEY_RATE_LIMIT_MAX_ATTEMPTS
 
 
+def _accepted_submissions_ledger_mtime(root: Path) -> float | None:
+    path = root / "_accepted_submissions.json"
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def cached_public_submissions_api_payload(*, root: Path) -> dict[str, Any]:
+    now = time.monotonic()
+    ledger_mtime = _accepted_submissions_ledger_mtime(root)
+    with _public_payload_cache_lock:
+        cached = _public_payload_cache.get("payload")
+        if isinstance(cached, dict) and (now - float(_public_payload_cache["ts"])) < PUBLIC_SUBMISSIONS_CACHE_TTL_SECONDS:
+            if _public_payload_cache.get("ledger_mtime") == ledger_mtime:
+                return cached
+    with _public_payload_rebuild_lock:
+        now = time.monotonic()
+        ledger_mtime = _accepted_submissions_ledger_mtime(root)
+        with _public_payload_cache_lock:
+            cached = _public_payload_cache.get("payload")
+            if isinstance(cached, dict) and (now - float(_public_payload_cache["ts"])) < PUBLIC_SUBMISSIONS_CACHE_TTL_SECONDS:
+                if _public_payload_cache.get("ledger_mtime") == ledger_mtime:
+                    return cached
+        payload = build_public_submissions_api_payload(root=root)
+        with _public_payload_cache_lock:
+            _public_payload_cache["payload"] = payload
+            _public_payload_cache["ts"] = time.monotonic()
+            _public_payload_cache["ledger_mtime"] = ledger_mtime
+        return payload
+
+
+def invalidate_public_submissions_api_cache() -> None:
+    with _public_payload_cache_lock:
+        _public_payload_cache["payload"] = None
+        _public_payload_cache["ts"] = 0.0
+        _public_payload_cache["ledger_mtime"] = None
+
+
 def serve_submissions_api(*, host: str, port: int, config: SubmissionApiConfig) -> None:
     handler = build_handler(config)
     server = ThreadingHTTPServer((host, port), handler)
@@ -88,7 +131,7 @@ def build_handler(config: SubmissionApiConfig):
             parsed = urlparse(self.path)
             normalized_path = parsed.path.rstrip("/")
             if normalized_path == "/api/submissions":
-                send_json(self, 200, build_public_submissions_api_payload(root=config.private_submission_root))
+                send_json(self, 200, cached_public_submissions_api_payload(root=config.private_submission_root))
                 return
             if normalized_path == "/api/solve-spend":
                 send_json(self, 200, solve_spend_payload_for_query(config=config, query=parsed.query))
@@ -316,7 +359,9 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                     agent_username=identity["agent_username"] if identity else None,
                     coldkey=identity["coldkey"] if identity else None,
                     coldkey_signature=identity["coldkey_signature"] if identity else None,
+                    uid=uid,
                 )
+            invalidate_public_submissions_api_cache()
             publish_submissions_api_data(build_public_submissions_api_payload(root=config.private_submission_root))
 
         payload = response_payload(
@@ -348,9 +393,10 @@ def read_base_agent_py(*, config: SubmissionApiConfig) -> str:
 
 
 def fetch_git_base_agent_py(*, repo: Path, ref: str, path: str) -> str:
-    remote_ref = f"origin/{ref}"
+    repo_path = repo.expanduser().resolve()
+    git_base = ["git", "-C", str(repo_path), "-c", f"safe.directory={repo_path}"]
     fetch_result = subprocess.run(
-        ["git", "-C", str(repo), "fetch", "--quiet", "origin", ref],
+        [*git_base, "fetch", "--quiet", "origin", ref],
         text=True,
         capture_output=True,
         timeout=30,
@@ -360,7 +406,7 @@ def fetch_git_base_agent_py(*, repo: Path, ref: str, path: str) -> str:
         detail = (fetch_result.stderr or fetch_result.stdout or "").strip()[-500:]
         raise RuntimeError(f"base agent fetch failed for {repo} {ref}: {detail}")
     show_result = subprocess.run(
-        ["git", "-C", str(repo), "show", f"{remote_ref}:{path}"],
+        [*git_base, "show", f"origin/{ref}:{path}"],
         text=True,
         capture_output=True,
         timeout=10,
@@ -368,7 +414,7 @@ def fetch_git_base_agent_py(*, repo: Path, ref: str, path: str) -> str:
     )
     if show_result.returncode != 0:
         detail = (show_result.stderr or show_result.stdout or "").strip()[-500:]
-        raise RuntimeError(f"base agent read failed for {remote_ref}:{path}: {detail}")
+        raise RuntimeError(f"base agent read failed for origin/{ref}:{path}: {detail}")
     return show_result.stdout
 
 

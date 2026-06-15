@@ -1,0 +1,10 @@
+[Unit]
+Description=Persist PM2 process list (pm2 save)
+After=pm2-const.service
+Wants=pm2-const.service
+
+[Service]
+Type=oneshot
+User=const
+Environment=PM2_HOME=/home/const/.pm2
+ExecStart=/home/const/subnet66/tau/scripts/sync_pm2_dump.sh

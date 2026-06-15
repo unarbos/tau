@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically persist PM2 process list
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

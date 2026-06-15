@@ -1,5 +1,5 @@
 #!/bin/bash
-exec doppler run -p arbos -c dev -- \
+exec doppler run -p sn66 -c prd -- \
   /home/const/subnet66/.venv/bin/python -m cli serve-submissions-api \
   --host 127.0.0.1 \
   --port 8066 \

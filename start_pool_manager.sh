@@ -1,5 +1,5 @@
 #!/bin/bash
-exec doppler run -p arbos -c dev -- bash -lc '
+exec doppler run -p sn66 -c prd -- bash -lc '
 set -euo pipefail
 TAU_POLAR_HF_DATASET="Wejh/ninja-rollouts-polar"
 TAU_ROLLOUT_HF_DATASET="$TAU_POLAR_HF_DATASET"
