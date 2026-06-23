@@ -14,6 +14,7 @@ from private_submission import (
     agent_bundle_sha256,
     agent_file_path_violations,
     agent_files_violations,
+    normalize_base_agent_files,
     normalize_agent_files,
     private_submission_bundle_files,
     private_submission_check_passed,
@@ -184,7 +185,38 @@ class MultiFileChecksTest(unittest.TestCase):
         self.assertEqual(filenames, sorted(MULTI_FILES))
         self.assertIn("/dev/null", captured["patch"])
         self.assertIn("b/helpers/steps.py", captured["patch"])
+        self.assertEqual(captured["base_files"], {"agent.py": BASE_AGENT})
         self.assertEqual(captured["submitted_files"], MULTI_FILES)
+
+    def test_judge_payload_compares_against_multifile_base(self):
+        captured = {}
+
+        def judge(payload):
+            captured.update(payload)
+            return PASSING_JUDGE
+
+        base_files = normalize_base_agent_files(
+            base_agent_py=BASE_AGENT,
+            files={
+                "agent.py": BASE_AGENT,
+                "helpers/__init__.py": "",
+                "helpers/steps.py": "def old_helper():\n    return 'old'\n",
+            },
+        )
+        run_private_submission_checks(
+            hotkey=HOTKEY,
+            base_agent_py=BASE_AGENT,
+            base_files=base_files,
+            submitted_agent_py=BASE_AGENT,
+            openrouter_judge=judge,
+        )
+
+        self.assertEqual(captured["base_files"], base_files)
+        self.assertIn("a/helpers/steps.py", captured["patch"])
+        self.assertIn("/dev/null", captured["patch"])
+        statuses = {item["filename"]: item["status"] for item in captured["changed_files"]}
+        self.assertEqual(statuses["helpers/steps.py"], "deleted")
+        self.assertEqual(statuses["helpers/__init__.py"], "deleted")
 
     def test_module_with_non_stdlib_import_is_rejected(self):
         files = {**MULTI_FILES, "helpers/steps.py": "import requests\n" + MULTI_HELPER}

@@ -320,7 +320,7 @@ the hotkey re-registers.
 - `Submission Scope Guard` rejects edits that break the
   solve contract or attempt forbidden provider/sampling control.
 - `OpenRouter Submission Judge` reviews the diff with the private submission
-  gatekeeping prompt through OpenRouter using `google/gemini-3.1-flash-lite`
+  gatekeeping prompt through OpenRouter using `z-ai/glm-5.2`
   at temperature 0 with a 16000-token output cap and required overall/component
   score floors. Override with `--judge-model` or
   `PRIVATE_SUBMISSION_JUDGE_MODEL`; Anthropic models additionally get medium
@@ -359,16 +359,17 @@ static at 50 tasks each. Scheduled recycling is disabled unless
 `--task-pool-refresh-count` and `--task-pool-refresh-interval-seconds` are set
 to non-zero values.
 
-`start_validator.sh` sets `PRIVATE_SUBMISSION_JUDGE_MODEL=google/gemini-3.1-flash-lite`
-and runs `cli validate` with notable flags such as:
+`start_validator.sh` routes both judges through OpenRouter with
+`TAU_DIFF_JUDGE_MODEL=z-ai/glm-5.2` and
+`PRIVATE_SUBMISSION_JUDGE_MODEL=z-ai/glm-5.2`. Solver, generator, and eval
+traffic uses the self-hosted `Qwen/Qwen3-32B` endpoint. The script runs
+`cli validate` with notable flags such as:
 
 ```bash
 python -m cli validate \
-  --solver-model google/gemini-3.1-flash-lite \
-  --solver-provider-only google-vertex/global \
-  --solver-provider-disable-fallbacks \
-  --round-concurrency 50 \
-  --docker-solver-start-concurrency 50 \
+  --solver-model Qwen/Qwen3-32B \
+  --round-concurrency 25 \
+  --docker-solver-start-concurrency 25 \
   --candidate-timeout-streak-limit 10 \
   --poll-interval-seconds 600 \
   --task-pool-target 50 \
@@ -393,13 +394,13 @@ Each validation task still starts from a mined GitHub commit: `task/original` is
 For duels, the score comes solely from the LLM diff judge. The pool filler still creates a Cursor baseline solution at `solutions/baseline` so the validator can keep compatibility telemetry, copy checks, and timeout calibration data, but Cursor-baseline similarity no longer contributes to the winner.
 
 Round score is based only on the LLM diff judgment. The diff judge uses
-`google/gemini-3.1-flash-lite` through OpenRouter at temperature 0 with a
+`z-ai/glm-5.2` through OpenRouter at temperature 0 with a
 16000-token output cap, then scores the king and challenger patches against
 the task/reference context. Candidate patches are role-blinded and treated as
 untrusted input. Up to four attempts run within a 300-second total timeout.
-Change the model in code via `_DIFF_JUDGE_MODEL` in `validate.py`; Anthropic
-models use adaptive reasoning and prompt-cache breakpoints, but production
-currently runs Gemini with no configured fallback models.
+Change the model with `TAU_DIFF_JUDGE_MODEL`; Anthropic models use adaptive
+reasoning and prompt-cache breakpoints, but production currently runs GLM 5.2
+with no configured fallback models.
 
 Cursor is telemetry only for round scoring. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king plus the configured margin. `start_validator.sh` currently uses `--win-margin 6`.
 
@@ -411,7 +412,7 @@ Docker file agents receive a validator-managed OpenAI-compatible endpoint throug
 
 The proxy forwards to OpenRouter and enforces:
 
-- the validator-selected model, currently `deepseek/deepseek-v4-flash` for solver inference unless overridden by validator config
+- the validator-selected model, currently self-hosted `Qwen/Qwen3-32B` for solver inference unless overridden by validator config
 - `temperature=0.0`
 - `top_p=0.01` (override via `TAU_TOP_P`)
 - removal of miner-controlled sampling fields such as `top_k`, `seed`, penalties, `logit_bias`, and `logprobs`

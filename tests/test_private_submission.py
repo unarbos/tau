@@ -905,13 +905,54 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
         def registration_block(*, subtensor, config, hotkey, uid=None):
             return 125 if hotkey == HOTKEY else 150
 
-        with patch("validate._current_registration_block", registration_block):
+        def current_uid(*, subtensor, hotkey, netuid):
+            return 42 if hotkey == HOTKEY else 24
+
+        with (
+            patch("validate._uid_for_hotkey_on_subnet", current_uid),
+            patch("validate._current_registration_block", registration_block),
+        ):
             _refresh_queue(
                 chain_submissions=[],
                 config=config,
                 state=state,
                 subtensor=FakeSubtensor(""),
             )
+
+        self.assertEqual([item.hotkey for item in state.queue], [current.hotkey])
+
+    def test_refresh_queue_removes_unregistered_private_submission(self):
+        stale = ValidatorSubmission(
+            hotkey="5UnregisteredPrivateSubmissionHotkey",
+            uid=42,
+            repo_full_name="private-submission/stale",
+            repo_url="private-submission://stale",
+            commit_sha="a" * 64,
+            commitment=f"private-submission:stale:{'a' * 64}",
+            commitment_block=100,
+            source="private",
+            accepted_at="2026-05-24T21:51:16.885693+00:00",
+        )
+        current = ValidatorSubmission(
+            hotkey=HOTKEY,
+            uid=42,
+            repo_full_name="private-submission/current",
+            repo_url="private-submission://current",
+            commit_sha="b" * 64,
+            commitment=f"private-submission:current:{'b' * 64}",
+            commitment_block=150,
+            source="private",
+            accepted_at="2026-05-28T14:53:28.941563+00:00",
+        )
+        state = ValidatorState(queue=[stale, current])
+        config = RunConfig(validate_hotkey_spent_since_block=None)
+
+        _refresh_queue(
+            chain_submissions=[],
+            config=config,
+            state=state,
+            subtensor=FakeSubtensor(""),
+        )
 
         self.assertEqual([item.hotkey for item in state.queue], [current.hotkey])
 
@@ -1639,9 +1680,11 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertIn("credit modest", call["system_prompt"])
         self.assertIn("<submission_data>", call["prompt"])
         self.assertIn('"patch": "diff"', call["prompt"])
+        self.assertIn("base_files", call["prompt"])
         self.assertIn("base_agent_py", call["prompt"])
         self.assertIn("submitted_agent_py", call["prompt"])
-        self.assertIn("full text of the current public", call["system_prompt"])
+        self.assertIn("current public base harness files", call["system_prompt"])
+        self.assertIn("full harness", call["system_prompt"])
         self.assertNotIn("<pr_data>", call["prompt"])
 
     def test_solve_spend_payload_sums_recent_solve_costs(self):

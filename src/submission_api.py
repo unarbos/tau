@@ -18,6 +18,7 @@ from private_submission import (
     SubmissionCheck,
     accepted_private_submission_identity,
     agent_bundle_sha256,
+    agent_files_violations,
     build_public_submissions_api_payload,
     check_and_record_private_submission_attempt,
     derive_submission_id,
@@ -315,10 +316,12 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 registration_block=registration_block,
                 hotkey_rate=hotkey_rate,
             )
-        base_agent_py = read_base_agent_py(config=config)
+        base_files = read_base_agent_files(config=config)
+        base_agent_py = base_files[AGENT_ENTRYPOINT_FILENAME]
         result = run_private_submission_checks(
             hotkey=hotkey,
             base_agent_py=base_agent_py,
+            base_files=base_files,
             openrouter_judge=config.judge,
             min_score=config.judge_min_score,
             submitted_files=agent_files,
@@ -385,13 +388,88 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
 
 
 def read_base_agent_py(*, config: SubmissionApiConfig) -> str:
+    return read_base_agent_files(config=config)[AGENT_ENTRYPOINT_FILENAME]
+
+
+def read_base_agent_files(*, config: SubmissionApiConfig) -> dict[str, str]:
     if config.base_agent_git_repo is None:
-        return config.base_agent.expanduser().read_text(encoding="utf-8")
-    return fetch_git_base_agent_py(
+        return read_local_base_agent_files(config.base_agent)
+    return fetch_git_base_agent_files(
         repo=config.base_agent_git_repo.expanduser(),
         ref=config.base_agent_git_ref,
         path=config.base_agent_git_path,
     )
+
+
+def read_local_base_agent_files(path: Path) -> dict[str, str]:
+    candidate = path.expanduser()
+    if candidate.is_file() and candidate.name != AGENT_ENTRYPOINT_FILENAME:
+        return {AGENT_ENTRYPOINT_FILENAME: candidate.read_text(encoding="utf-8")}
+    root = candidate if candidate.is_dir() else candidate.parent
+    if not root.is_dir():
+        raise ValueError(f"base agent path does not exist: {candidate}")
+    files: dict[str, str] = {}
+    for file_path in sorted(root.rglob("*.py")):
+        relative = file_path.relative_to(root)
+        if any(part == "__pycache__" or part.startswith(".") for part in relative.parts):
+            continue
+        files[relative.as_posix()] = file_path.read_text(encoding="utf-8")
+    if candidate.is_file() and AGENT_ENTRYPOINT_FILENAME not in files:
+        files[AGENT_ENTRYPOINT_FILENAME] = candidate.read_text(encoding="utf-8")
+    violations = agent_files_violations(files)
+    if violations:
+        raise ValueError(f"base agent directory is not a valid harness: {violations[0]}")
+    return files
+
+
+def fetch_git_base_agent_files(*, repo: Path, ref: str, path: str) -> dict[str, str]:
+    entrypoint = path.strip("/") or AGENT_ENTRYPOINT_FILENAME
+    root = str(Path(entrypoint).parent)
+    if root == ".":
+        root = ""
+    repo_path = repo.expanduser().resolve()
+    git_base = ["git", "-C", str(repo_path), "-c", f"safe.directory={repo_path}"]
+    fetch_result = subprocess.run(
+        [*git_base, "fetch", "--quiet", "origin", ref],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if fetch_result.returncode != 0:
+        detail = (fetch_result.stderr or fetch_result.stdout or "").strip()[-500:]
+        raise RuntimeError(f"base agent fetch failed for {repo} {ref}: {detail}")
+    treeish = f"origin/{ref}:{root}" if root else f"origin/{ref}"
+    ls_result = subprocess.run(
+        [*git_base, "ls-tree", "-r", "--name-only", treeish],
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if ls_result.returncode != 0:
+        detail = (ls_result.stderr or ls_result.stdout or "").strip()[-500:]
+        raise RuntimeError(f"base agent tree read failed for {treeish}: {detail}")
+    files: dict[str, str] = {}
+    for rel in sorted(line.strip() for line in ls_result.stdout.splitlines() if line.strip().endswith(".py")):
+        if any(part == "__pycache__" or part.startswith(".") for part in Path(rel).parts):
+            continue
+        full_path = f"{root}/{rel}" if root else rel
+        show_result = subprocess.run(
+            [*git_base, "show", f"origin/{ref}:{full_path}"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if show_result.returncode != 0:
+            detail = (show_result.stderr or show_result.stdout or "").strip()[-500:]
+            raise RuntimeError(f"base agent read failed for origin/{ref}:{full_path}: {detail}")
+        files[rel] = show_result.stdout
+    violations = agent_files_violations(files)
+    if violations:
+        raise ValueError(f"base agent tree is not a valid harness: {violations[0]}")
+    return files
 
 
 def fetch_git_base_agent_py(*, repo: Path, ref: str, path: str) -> str:

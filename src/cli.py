@@ -22,7 +22,7 @@ _PRIVATE_SUBMISSION_JUDGE_MODEL = "google/gemini-3.1-flash-lite"
 _PRIVATE_SUBMISSION_JUDGE_REASONING = {"effort": "medium", "exclude": True}
 _PRIVATE_SUBMISSION_JUDGE_SYSTEM_PROMPT = """\
 You are a CI gatekeeping judge for the private Subnet 66 ninja submission API,
-which accepts the single-file miner harness `agent.py` for Bittensor Subnet 66.
+which accepts the miner harness repo rooted at `agent.py` for Bittensor Subnet 66.
 
 # How the subnet works (so you can reason about miner intent)
 
@@ -37,7 +37,7 @@ which accepts the single-file miner harness `agent.py` for Bittensor Subnet 66.
   patches against the task and reference context; patch similarity is telemetry
   and copy-detection support, not the decisive round score.
 - IMPORTANT: when a challenger wins, the validator publishes the challenger's
-  `agent.py` into the public `unarbos/ninja` base harness, and every future
+  harness files into the public `unarbos/ninja` base harness, and every future
   miner starts from that published harness. The winning code becomes shared
   infrastructure for the entire ecosystem.
 - A separate copy detector disqualifies challengers whose mean output-patch
@@ -51,7 +51,7 @@ A separate static `Submission Scope Guard` already verified the submission's
 mechanical contract. Its results appear under `static_findings`. Trust it; do not
 re-litigate things it already covers, only escalate something it missed:
 
-- only `agent.py` is submitted
+- submitted files are Python harness files rooted at `agent.py`
 - `solve(...)` signature, return shape, and validator-owned helpers preserved
 - no third-party imports; stdlib-only
 - no forbidden provider hostnames, secret-name strings, or sampling params
@@ -67,12 +67,12 @@ can pass, but only when the diff shows a concrete mechanism that could improve
 the agent on real tasks. Plausible intent is not enough. A clever-looking change
 designed to slip past the gate should fail. Your unique value is detecting
 *intent* and *patterns* the static
-guard cannot see, especially across the full file. The user payload
-includes `base_agent_py` -- the full text of the current public `agent.py`
-before this private submission -- so you can compare the diff against the
-actual prior state, not just read the +/- hunks. If `base_agent_py` is empty and
-`base_agent_py_fetch_error` is set, do your best from the diff alone and
-record reduced confidence in `reasons`.
+guard cannot see, especially across the full harness. The user payload includes
+`base_files` -- the current public base harness files before this private
+submission -- plus `base_agent_py` for the entrypoint. Compare against the
+actual prior repo state, not just the +/- hunks. If the base file payload is
+missing or truncated, do your best from the diff alone and record reduced
+confidence in `reasons`.
 
 Important: the CI gate must be harder than "does this change behavior somehow?"
 Many low-value submissions alter behavior by reordering fallbacks, moving caps,
@@ -419,7 +419,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Private submitted agent.py file, or a directory of Python files with agent.py as the entrypoint.",
     )
-    private_submit.add_argument("--base-agent", required=True, type=Path, help="Current public base agent.py to diff against.")
+    private_submit.add_argument(
+        "--base-agent",
+        required=True,
+        type=Path,
+        help="Current public base agent.py, or base harness directory, to diff against.",
+    )
     private_submit.add_argument("--signature", required=True, help="Hotkey signature over the printed signature payload.")
     private_submit.add_argument("--agent-username", help="Optional agent username signed by the owning coldkey.")
     private_submit.add_argument("--coldkey", help="Coldkey that owns the submitting hotkey.")
@@ -449,7 +454,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shared_args(serve_submissions_api)
     serve_submissions_api.add_argument("--host", default="127.0.0.1", help="Host to bind.")
     serve_submissions_api.add_argument("--port", type=int, default=8066, help="Port to bind.")
-    serve_submissions_api.add_argument("--base-agent", required=True, type=Path, help="Current public base agent.py.")
+    serve_submissions_api.add_argument(
+        "--base-agent",
+        required=True,
+        type=Path,
+        help="Current public base agent.py, or base harness directory.",
+    )
     serve_submissions_api.add_argument("--base-agent-git-repo", type=Path, help="Fetch base agent.py from this repo before judging.")
     serve_submissions_api.add_argument("--base-agent-git-ref", default="main", help="Remote branch/ref to fetch for --base-agent-git-repo.")
     serve_submissions_api.add_argument("--base-agent-git-path", default="agent.py", help="Path to agent.py inside --base-agent-git-ref.")
@@ -1245,11 +1255,13 @@ def _run_private_submit(args: argparse.Namespace) -> None:
         )
         return
 
-    base_agent_py = args.base_agent.expanduser().read_text(encoding="utf-8")
+    base_files = _collect_base_agent_files(args.base_agent.expanduser())
+    base_agent_py = base_files[_DEFAULT_AGENT_FILE]
     judge = None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args)
     result = run_private_submission_checks(
         hotkey=args.hotkey,
         base_agent_py=base_agent_py,
+        base_files=base_files,
         openrouter_judge=judge,
         min_score=args.judge_min_score,
         submitted_files=submitted_files,
@@ -1447,7 +1459,11 @@ def _build_private_submission_openrouter_judge(args: argparse.Namespace):
         prompt_payload = dict(payload)
         prompt_payload["patch"] = str(prompt_payload.get("patch") or "")[:120_000]
         prompt_payload["base_agent_py"] = str(prompt_payload.get("base_agent_py") or "")[:80_000]
+        prompt_payload["base_files"] = _truncate_text_map(prompt_payload.get("base_files"), max_total_chars=120_000)
         prompt_payload["submitted_agent_py"] = str(prompt_payload.get("submitted_agent_py") or "")[:120_000]
+        prompt_payload["submitted_files"] = _truncate_text_map(
+            prompt_payload.get("submitted_files"), max_total_chars=160_000
+        )
         requested_model = args.judge_model or os.environ.get("PRIVATE_SUBMISSION_JUDGE_MODEL")
         judge_model = requested_model or _PRIVATE_SUBMISSION_JUDGE_MODEL
         response = complete_text(
@@ -1473,6 +1489,22 @@ def _build_private_submission_openrouter_judge(args: argparse.Namespace):
         return _parse_json_object(response)
 
     return judge
+
+
+def _truncate_text_map(value: object, *, max_total_chars: int) -> dict[str, str]:
+    if not isinstance(value, dict) or max_total_chars <= 0:
+        return {}
+    remaining = max_total_chars
+    truncated: dict[str, str] = {}
+    for raw_key in sorted(value):
+        key = str(raw_key)
+        text = str(value[raw_key])
+        if remaining <= 0:
+            truncated[key] = ""
+            continue
+        truncated[key] = text[:remaining]
+        remaining -= len(truncated[key])
+    return truncated
 
 
 def _parse_json_object(text: str) -> dict:
@@ -1885,6 +1917,22 @@ def _collect_submitted_agent_files(candidate: Path) -> dict[str, str]:
     violations = agent_files_violations(files)
     if violations:
         raise ValueError(f"--agent directory is not a valid submission: {violations[0]}")
+    return files
+
+
+def _collect_base_agent_files(candidate: Path) -> dict[str, str]:
+    """Read the current public base harness as {relative path: content}."""
+    if candidate.is_file():
+        if candidate.name != _DEFAULT_AGENT_FILE:
+            return {_DEFAULT_AGENT_FILE: candidate.read_text(encoding="utf-8")}
+        root = candidate.parent
+    elif candidate.is_dir():
+        root = candidate
+    else:
+        raise ValueError(f"--base-agent must be a Python file or a directory: {candidate}")
+    files = _collect_submitted_agent_files(root)
+    if candidate.is_file() and _DEFAULT_AGENT_FILE not in files:
+        files[_DEFAULT_AGENT_FILE] = candidate.read_text(encoding="utf-8")
     return files
 
 

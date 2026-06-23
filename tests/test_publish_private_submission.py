@@ -157,13 +157,15 @@ class PublishPrivateSubmissionTest(unittest.TestCase):
         deleted = [entry["path"] for entry in tree_entries if "sha" in entry and entry.get("sha") is None]
         self.assertEqual(deleted, ["agent/old_helper.py"])
 
-    def test_single_file_private_submission_still_uses_contents_api(self):
+    def test_single_file_private_submission_removes_stale_manifest_files(self):
         files = {"agent.py": BASE_AGENT}
         with tempfile.TemporaryDirectory() as tmp:
             root, submission_id, commit_sha = self._write_bundle(tmp, files=files, submission_id="sub-single")
             config = RunConfig(validate_private_submission_root=root)
             submission = self._submission(commit_sha=commit_sha, submission_id=submission_id)
-            client = RecordingGitHubClient()
+            client = RecordingGitHubClient(
+                manifest=["agent.py", "agent/old_helper.py", _GITHUB_AGENT_MANIFEST_FILENAME],
+            )
 
             with patch("validate._fetch_branch_head_sha", return_value=BASE_HEAD):
                 published = _publish_promoted_private_submission(
@@ -174,8 +176,60 @@ class PublishPrivateSubmissionTest(unittest.TestCase):
 
         self.assertFalse(_is_private_submission(published))
         self.assertEqual(published.commit_sha, NEW_COMMIT)
-        self.assertTrue(any(call[0] == "PUT" and "/contents/agent.py" in call[1] for call in client.calls))
-        self.assertFalse(any(call[1].endswith("/git/trees") for call in client.calls))
+        self.assertFalse(any(call[0] == "PUT" and "/contents/agent.py" in call[1] for call in client.calls))
+        tree_call = next(call for call in client.calls if call[0] == "POST" and call[1].endswith("/git/trees"))
+        tree_entries = tree_call[2]["tree"]
+        written = [entry["path"] for entry in tree_entries if entry.get("content") is not None]
+        deleted = sorted(entry["path"] for entry in tree_entries if "sha" in entry and entry.get("sha") is None)
+        self.assertEqual(written, ["agent.py"])
+        self.assertEqual(deleted, ["agent/old_helper.py", _GITHUB_AGENT_MANIFEST_FILENAME])
+
+    def test_single_file_private_submission_from_single_file_base_writes_no_manifest(self):
+        files = {"agent.py": BASE_AGENT}
+        with tempfile.TemporaryDirectory() as tmp:
+            root, submission_id, commit_sha = self._write_bundle(tmp, files=files, submission_id="sub-single")
+            config = RunConfig(validate_private_submission_root=root)
+            submission = self._submission(commit_sha=commit_sha, submission_id=submission_id)
+            client = RecordingGitHubClient(manifest=None)
+
+            with patch("validate._fetch_branch_head_sha", return_value=BASE_HEAD):
+                published = _publish_promoted_private_submission(
+                    github_client=client,
+                    config=config,
+                    submission=submission,
+                )
+
+        self.assertFalse(_is_private_submission(published))
+        self.assertEqual(published.commit_sha, NEW_COMMIT)
+        tree_call = next(call for call in client.calls if call[0] == "POST" and call[1].endswith("/git/trees"))
+        tree_entries = tree_call[2]["tree"]
+        written = [entry["path"] for entry in tree_entries if entry.get("content") is not None]
+        deleted = [entry["path"] for entry in tree_entries if "sha" in entry and entry.get("sha") is None]
+        self.assertEqual(written, ["agent.py"])
+        self.assertEqual(deleted, [])
+
+    def test_multifile_private_submission_from_single_file_base_adds_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, submission_id, commit_sha = self._write_bundle(tmp, files=MULTI_FILES)
+            config = RunConfig(validate_private_submission_root=root)
+            submission = self._submission(commit_sha=commit_sha, submission_id=submission_id)
+            client = RecordingGitHubClient(manifest=None)
+
+            with patch("validate._fetch_branch_head_sha", return_value=BASE_HEAD):
+                published = _publish_promoted_private_submission(
+                    github_client=client,
+                    config=config,
+                    submission=submission,
+                )
+
+        self.assertFalse(_is_private_submission(published))
+        self.assertEqual(published.commit_sha, NEW_COMMIT)
+        tree_call = next(call for call in client.calls if call[0] == "POST" and call[1].endswith("/git/trees"))
+        tree_entries = tree_call[2]["tree"]
+        written = {entry["path"] for entry in tree_entries if entry.get("content") is not None}
+        deleted = [entry["path"] for entry in tree_entries if "sha" in entry and entry.get("sha") is None]
+        self.assertEqual(written, {"agent.py", "agent/helper.py", _GITHUB_AGENT_MANIFEST_FILENAME})
+        self.assertEqual(deleted, [])
 
 
 if __name__ == "__main__":

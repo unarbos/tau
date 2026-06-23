@@ -1816,13 +1816,6 @@ def _judge_round_diffs_uncapped(
     except Exception as exc:
         return _finalize(_neutral_diff_judge(f"failed to read diff judge inputs: {exc}"), outcome="input_error")
 
-    empty_patch_judgment = _diff_judge_empty_patch_result(
-        king_patch=king_patch,
-        challenger_patch=challenger_patch,
-    )
-    if empty_patch_judgment is not None:
-        return _finalize(empty_patch_judgment, outcome="empty_patch")
-
     injection_judgment = _diff_judge_prompt_injection_result(
         king_patch=king_patch,
         challenger_patch=challenger_patch,
@@ -2219,8 +2212,14 @@ def _build_diff_judge_prompt(
     payload = {
         "task": _truncate_middle(task_prompt, _DIFF_JUDGE_MAX_TASK_CHARS),
         "reference_patch_hint": _truncate_middle(reference_patch, _DIFF_JUDGE_MAX_PATCH_CHARS),
-        "candidate_a_patch": _truncate_middle(candidate_a_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
-        "candidate_b_patch": _truncate_middle(candidate_b_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
+        "candidate_a_patch": _truncate_middle(
+            candidate_a_patch if candidate_a_patch.strip() else "(no changes)",
+            _DIFF_JUDGE_MAX_PATCH_CHARS,
+        ),
+        "candidate_b_patch": _truncate_middle(
+            candidate_b_patch if candidate_b_patch.strip() else "(no changes)",
+            _DIFF_JUDGE_MAX_PATCH_CHARS,
+        ),
     }
     return _diff_judge_instruction_text() + "\n" + json.dumps(payload, indent=2, sort_keys=True)
 
@@ -2257,37 +2256,6 @@ def _parse_diff_judge_payload(
         challenger_score=challenger_score,
         rationale=str(payload.get("rationale") or "").strip(),
         model=model,
-    )
-
-
-def _diff_judge_empty_patch_result(
-    *,
-    king_patch: str,
-    challenger_patch: str,
-) -> DiffJudgeResult | None:
-    king_empty = not king_patch.strip()
-    challenger_empty = not challenger_patch.strip()
-    if not king_empty and not challenger_empty:
-        return None
-    if king_empty and challenger_empty:
-        return DiffJudgeResult(
-            winner="tie",
-            king_score=0.0,
-            challenger_score=0.0,
-            rationale="Automatic LLM score failure: both patches are empty.",
-        )
-    if king_empty:
-        return DiffJudgeResult(
-            winner="challenger",
-            king_score=0.0,
-            challenger_score=1.0,
-            rationale="Automatic LLM score failure: king patch is empty.",
-        )
-    return DiffJudgeResult(
-        winner="king",
-        king_score=1.0,
-        challenger_score=0.0,
-        rationale="Automatic LLM score failure: challenger patch is empty.",
     )
 
 
@@ -4591,7 +4559,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             if wakeup_changed and paths.state_path.exists():
                 try:
                     disk_state = _load_state(paths.state_path)
-                    merged = _merge_queued_submissions_from_disk_state(state, disk_state)
+                    merged = _merge_queued_submissions_from_disk_state(
+                        state,
+                        disk_state,
+                        config=config,
+                        subtensor=subtensor,
+                    )
                     if merged:
                         log.info(
                             "Wakeup merged %d queued submission(s) from state.json before refresh",
@@ -4618,7 +4591,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 log.info("Queue refresh added %d candidate(s); queue=%d", added, len(state.queue))
             if [submission.to_dict() for submission in state.queue] != queue_before:
                 try:
-                    _save_state(paths.state_path, state)
+                    _save_state(paths.state_path, state, config=config, subtensor=subtensor)
                 except Exception:
                     log.exception("Queue refresh state save failed (non-fatal)")
                 try:
@@ -4665,11 +4638,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 config=config,
                 state=state,
             ):
-                _save_state(paths.state_path, state)
+                _save_state(paths.state_path, state, config=config, subtensor=subtensor)
             _ensure_king(state=state, github_client=github_client, config=config)
             if _enforce_submission_mode_on_state(config, state):
                 _ensure_king(state=state, github_client=github_client, config=config)
-                _save_state(paths.state_path, state)
+                _save_state(paths.state_path, state, config=config, subtensor=subtensor)
                 while not shutdown_requested.is_set():
                     time.sleep(poll_interval_seconds)
                 return ValidateStageResult(
@@ -4712,6 +4685,21 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     prune_counts["removed_king_solution_dirs"],
                     prune_counts["removed_king_compare_dirs"],
                 )
+
+            startup_queue_before = [submission.to_dict() for submission in state.queue]
+            _refresh_queue(
+                chain_submissions=[],
+                config=config,
+                state=state,
+                subtensor=subtensor,
+            )
+            if [submission.to_dict() for submission in state.queue] != startup_queue_before:
+                log.info(
+                    "Startup queue prune removed %d queued submission(s); queue=%d",
+                    len(startup_queue_before) - len(state.queue),
+                    len(state.queue),
+                )
+                _save_state(paths.state_path, state, config=config, subtensor=subtensor)
 
             current_block = cast(int, subtensor.block)
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
@@ -5518,7 +5506,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         if inner_wakeup_changed:
                             try:
                                 disk_state = _load_state(paths.state_path)
-                                merged = _merge_queued_submissions_from_disk_state(state, disk_state)
+                                merged = _merge_queued_submissions_from_disk_state(
+                                    state,
+                                    disk_state,
+                                    config=config,
+                                    subtensor=subtensor,
+                                )
                                 if merged:
                                     log.info(
                                         "Merged %d queued submission(s) from state.json during duel drain",
@@ -5740,23 +5733,125 @@ def _publish_dashboard(
 
     _benchmarks = previous_dashboard.get("benchmarks")
     benchmarks = _benchmarks if isinstance(_benchmarks, dict) else {}
+    public_history = _compact_dashboard_history_for_publish(history)
     payload = {
         "updated_at": _timestamp(),
         "current_king": king_dict,
-        "duels": history,
+        "duels": public_history,
         "status": status,
         "benchmarks": benchmarks,
     }
     try:
-        write_json(config.validate_root / "dashboard_data.json", payload)
-        write_json(config.validate_root / "dashboard-home.json", build_dashboard_home_payload(payload))
-        write_json(config.validate_root / "dashboard-summary.json", build_dashboard_summary_payload(payload))
+        home_payload = build_dashboard_home_payload(payload)
+        summary_payload = build_dashboard_summary_payload(payload)
+        write_json(config.validate_root / "dashboard_data.json", summary_payload)
+        write_json(config.validate_root / "dashboard-home.json", home_payload)
+        write_json(config.validate_root / "dashboard-summary.json", summary_payload)
     except Exception:
         log.exception("Local dashboard write failed (non-fatal)")
     try:
-        publish_dashboard_data(current_king=king_dict, duel_history=history, status=status)
+        publish_dashboard_data(
+            current_king=king_dict,
+            duel_history=public_history,
+            status=status,
+            benchmarks=benchmarks,
+        )
     except Exception:
         log.exception("R2 dashboard publish failed (non-fatal)")
+
+
+_DASHBOARD_DUEL_PUBLISH_KEYS = {
+    "duel_id",
+    "started_at",
+    "finished_at",
+    "king_uid",
+    "king_hotkey",
+    "king_repo",
+    "king_display_repo_full_name",
+    "king_repo_url",
+    "king_pr_url",
+    "king_commit_sha",
+    "king_display_commit_sha",
+    "king_commitment_block",
+    "challenger_uid",
+    "challenger_hotkey",
+    "challenger_repo",
+    "challenger_display_repo_full_name",
+    "challenger_repo_url",
+    "challenger_pr_url",
+    "challenger_commit_sha",
+    "challenger_display_commit_sha",
+    "challenger_commitment_block",
+    "king_similarity_ratio_mean",
+    "challenger_similarity_ratio_mean",
+    "king_score_mean",
+    "challenger_score_mean",
+    "king_llm_score_mean",
+    "challenger_llm_score_mean",
+    "wins",
+    "losses",
+    "ties",
+    "errors",
+    "king_replaced",
+    "disqualification_reason",
+    "task_set_phase",
+    "manual_retest_of_duel_id",
+    "confirmation_of_duel_id",
+    "confirmation_duel_id",
+    "confirmation_retest_passed",
+    "confirmation_failure_reason",
+}
+
+_DASHBOARD_ROUND_PUBLISH_KEYS = {
+    "task_name",
+    "winner",
+    "king_similarity_ratio",
+    "challenger_similarity_ratio",
+    "king_challenger_similarity",
+    "king_score",
+    "challenger_score",
+    "king_llm_score",
+    "challenger_llm_score",
+    "llm_judge_winner",
+    "task_error",
+    "king_lines",
+    "challenger_lines",
+    "baseline_lines",
+}
+
+
+def _compact_dashboard_round_for_publish(round_payload: Any) -> dict[str, Any]:
+    if not isinstance(round_payload, dict):
+        return {}
+    compact = {
+        key: round_payload[key]
+        for key in _DASHBOARD_ROUND_PUBLISH_KEYS
+        if key in round_payload
+    }
+    if "llm_judge_rationale" in round_payload:
+        compact["llm_judge_rationale"] = public_judge_rationale(
+            rationale=round_payload.get("llm_judge_rationale"),
+            llm_judge_winner=round_payload.get("llm_judge_winner"),
+        )
+    return compact
+
+
+def _compact_dashboard_duel_for_publish(duel: Any) -> dict[str, Any]:
+    if not isinstance(duel, dict):
+        return {}
+    compact = {key: duel.get(key) for key in _DASHBOARD_DUEL_PUBLISH_KEYS if key in duel}
+    rounds = duel.get("rounds")
+    if isinstance(rounds, list):
+        compact["rounds"] = [
+            _compact_dashboard_round_for_publish(round_payload)
+            for round_payload in rounds
+            if isinstance(round_payload, dict)
+        ]
+    return compact
+
+
+def _compact_dashboard_history_for_publish(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_compact_dashboard_duel_for_publish(duel) for duel in history if isinstance(duel, dict)]
 
 
 def _dashboard_submission_dict(
@@ -6279,6 +6374,7 @@ def _publish_github_agent_files_commit_detailed(
     base_head_sha: str,
     files: dict[str, str],
     message: str,
+    publish_manifest: bool = True,
 ) -> tuple[str | None, str | None]:
     try:
         resp = client.get(f"/repos/{repo}/git/commits/{base_head_sha}")
@@ -6308,10 +6404,11 @@ def _publish_github_agent_files_commit_detailed(
     if not re.fullmatch(r"[0-9a-fA-F]{40}", base_tree_sha):
         return None, "GitHub commit fetch failed: missing base tree sha"
 
-    manifest_paths = sorted(files)
-    manifest_content = json.dumps(manifest_paths, indent=2) + "\n"
     publish_files = dict(files)
-    publish_files[_GITHUB_AGENT_MANIFEST_FILENAME] = manifest_content
+    if publish_manifest:
+        manifest_paths = sorted(files)
+        manifest_content = json.dumps(manifest_paths, indent=2) + "\n"
+        publish_files[_GITHUB_AGENT_MANIFEST_FILENAME] = manifest_content
     tree_entries: list[dict[str, Any]] = [
         {
             "path": path,
@@ -6322,9 +6419,13 @@ def _publish_github_agent_files_commit_detailed(
         for path, content in sorted(publish_files.items())
     ]
     old_manifest = _fetch_github_manifest_paths_at_ref(client, repo=repo, ref=base_head_sha) or []
+    deleted_paths: set[str] = set()
     for path in old_manifest:
         if path not in publish_files:
+            deleted_paths.add(path)
             tree_entries.append({"path": path, "mode": "100644", "sha": None})
+    if not publish_manifest and old_manifest and _GITHUB_AGENT_MANIFEST_FILENAME not in deleted_paths:
+        tree_entries.append({"path": _GITHUB_AGENT_MANIFEST_FILENAME, "mode": "100644", "sha": None})
 
     try:
         resp = client.post(
@@ -6471,34 +6572,15 @@ def _publish_promoted_private_submission(
         return submission
 
     message = _private_promotion_commit_message(submission, base_head_sha)
-    if len(winning_files) == 1:
-        current_base = _fetch_github_text_file(
-            github_client,
-            repo=base_repo,
-            path=_DEFAULT_GITHUB_AGENT_FILE,
-            ref=base_head_sha,
-        )
-        if current_base is None:
-            log.warning("Promoted private submission %s could not fetch current base agent.py", submission.commitment)
-            return submission
-        published_sha, update_error = _update_github_text_file_detailed(
-            github_client,
-            repo=base_repo,
-            path=_DEFAULT_GITHUB_AGENT_FILE,
-            branch=base_ref,
-            current_blob_sha=current_base[1],
-            content=winning_agent,
-            message=message,
-        )
-    else:
-        published_sha, update_error = _publish_github_agent_files_commit_detailed(
-            github_client,
-            repo=base_repo,
-            branch=base_ref,
-            base_head_sha=base_head_sha,
-            files=winning_files,
-            message=message,
-        )
+    published_sha, update_error = _publish_github_agent_files_commit_detailed(
+        github_client,
+        repo=base_repo,
+        branch=base_ref,
+        base_head_sha=base_head_sha,
+        files=winning_files,
+        message=message,
+        publish_manifest=len(winning_files) > 1,
+    )
     if not published_sha:
         log.warning(
             "Promoted private submission %s could not publish to %s:%s: %s",
@@ -6827,7 +6909,12 @@ def _hotkey_spent_since_block(config: RunConfig) -> int | None:
 
 def _uid_for_hotkey_on_subnet(*, subtensor, hotkey: str, netuid: int) -> int | None:
     try:
-        lookup = subtensor.get_uid_for_hotkey_on_subnet(hotkey, netuid)
+        get_uid = getattr(subtensor, "get_uid_for_hotkey_on_subnet", None)
+        if not callable(get_uid):
+            get_uid = getattr(getattr(subtensor, "subnets", None), "get_uid_for_hotkey_on_subnet", None)
+        if not callable(get_uid):
+            return None
+        lookup = get_uid(hotkey, netuid)
     except Exception:
         log.exception("uid lookup failed for %s", hotkey)
         return None
@@ -7135,30 +7222,46 @@ def _refresh_queue(
     )
     known: set[str] = set()
     tracked_hotkeys = _tracked_hotkeys(state)
-    registration_block_cache: dict[str, int | None] = {}
+    registration_status_cache: dict[str, tuple[bool, int | None]] = {}
+
+    def registration_status_for(submission: ValidatorSubmission) -> tuple[bool, int | None]:
+        if subtensor is None or submission.hotkey not in tracked_hotkeys:
+            return True, None
+        if submission.hotkey not in registration_status_cache:
+            current_uid = _uid_for_hotkey_on_subnet(
+                subtensor=subtensor,
+                hotkey=submission.hotkey,
+                netuid=config.validate_netuid,
+            )
+            if current_uid is None:
+                registration_status_cache[submission.hotkey] = (False, None)
+            else:
+                registration_block = _current_registration_block(
+                    subtensor=subtensor,
+                    config=config,
+                    hotkey=submission.hotkey,
+                    uid=current_uid,
+                )
+                _clear_stale_spent_state_for_reregistered_hotkey(
+                    state,
+                    hotkey=submission.hotkey,
+                    registration_block=registration_block,
+                )
+                registration_status_cache[submission.hotkey] = (True, registration_block)
+        return registration_status_cache[submission.hotkey]
 
     def registration_block_for(submission: ValidatorSubmission) -> int | None:
-        if subtensor is None or submission.hotkey not in tracked_hotkeys:
-            return None
-        if submission.hotkey not in registration_block_cache:
-            registration_block_cache[submission.hotkey] = _current_registration_block(
-                subtensor=subtensor,
-                config=config,
-                hotkey=submission.hotkey,
-                uid=submission.uid,
-            )
-            _clear_stale_spent_state_for_reregistered_hotkey(
-                state,
-                hotkey=submission.hotkey,
-                registration_block=registration_block_cache[submission.hotkey],
-            )
-        return registration_block_cache[submission.hotkey]
+        return registration_status_for(submission)[1]
+
+    def submission_is_registered(submission: ValidatorSubmission) -> bool:
+        return registration_status_for(submission)[0]
 
     original_queue_size = len(state.queue)
     state.queue = [
         submission
         for submission in state.queue
-        if _submission_is_current_for_registration(
+        if submission_is_registered(submission)
+        and _submission_is_current_for_registration(
             submission,
             registration_block_for(submission),
         )
@@ -7166,7 +7269,7 @@ def _refresh_queue(
     ]
     if len(state.queue) != original_queue_size:
         log.info(
-            "Removed %d stale or spent queued submission(s)",
+            "Removed %d stale, unregistered, or spent queued submission(s)",
             original_queue_size - len(state.queue),
         )
 
@@ -7181,6 +7284,8 @@ def _refresh_queue(
             and sub.commitment_block < config.validate_min_commitment_block
             and not _is_private_submission(sub)
         ):
+            continue
+        if not submission_is_registered(sub):
             continue
         registration_block = registration_block_for(sub)
         spent = (
@@ -7961,7 +8066,6 @@ def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfi
 
 def _cached_agent_source(config: RunConfig, sub: ValidatorSubmission) -> SolverAgentSource:
     if _is_private_submission(sub):
-        agent_path = _private_submission_agent_path(config, sub)
         files = _private_submission_agent_files(config, sub)
         if len(files) > 1:
             agent_dir = _materialize_private_submission_agent_dir(config, sub, files)
@@ -7972,6 +8076,7 @@ def _cached_agent_source(config: RunConfig, sub: ValidatorSubmission) -> SolverA
                 agent_file=_DEFAULT_GITHUB_AGENT_FILE,
                 commit_sha=sub.commit_sha,
             )
+        agent_path = _private_submission_agent_path(config, sub)
         return SolverAgentSource(
             raw=sub.agent_ref,
             kind="local_file",
@@ -8484,6 +8589,9 @@ def _reconcile_state_with_duel_history(
 def _merge_queued_submissions_from_disk_state(
     state: ValidatorState,
     disk: ValidatorState,
+    *,
+    config: RunConfig | None = None,
+    subtensor: Any | None = None,
 ) -> int:
     """Pull queue entries written by submissions-api into in-memory validator state."""
     memory_commitments = {submission.commitment for submission in state.queue}
@@ -8506,6 +8614,27 @@ def _merge_queued_submissions_from_disk_state(
         locked = state.locked_commitments.get(submission.hotkey)
         if locked is not None and locked != submission.commitment:
             continue
+        if config is not None and subtensor is not None:
+            current_uid = _uid_for_hotkey_on_subnet(
+                subtensor=subtensor,
+                hotkey=submission.hotkey,
+                netuid=config.validate_netuid,
+            )
+            if current_uid is None:
+                continue
+            registration_block = _current_registration_block(
+                subtensor=subtensor,
+                config=config,
+                hotkey=submission.hotkey,
+                uid=current_uid,
+            )
+            _clear_stale_spent_state_for_reregistered_hotkey(
+                state,
+                hotkey=submission.hotkey,
+                registration_block=registration_block,
+            )
+            if not _submission_is_current_for_registration(submission, registration_block):
+                continue
         _clear_stale_spent_state_for_reregistered_hotkey(
             state,
             hotkey=submission.hotkey,
@@ -8521,13 +8650,24 @@ def _merge_queued_submissions_from_disk_state(
     return added
 
 
-def _save_state(path: Path, state: ValidatorState) -> None:
+def _save_state(
+    path: Path,
+    state: ValidatorState,
+    *,
+    config: RunConfig | None = None,
+    subtensor: Any | None = None,
+) -> None:
     from validator_state_io import validator_state_lock
 
     with validator_state_lock(path):
         if path.exists():
             disk = _load_state(path)
-            merged = _merge_queued_submissions_from_disk_state(state, disk)
+            merged = _merge_queued_submissions_from_disk_state(
+                state,
+                disk,
+                config=config,
+                subtensor=subtensor,
+            )
             if merged:
                 log.info("Merged %d queued submission(s) from disk before save", merged)
         write_json(path, state.to_dict())

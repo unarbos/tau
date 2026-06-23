@@ -230,14 +230,18 @@ def run_private_submission_checks(
     hotkey: str,
     submitted_agent_py: str | None = None,
     base_agent_py: str,
+    base_files: dict[str, str] | None = None,
     openrouter_judge: JudgeFn | None = None,
     min_score: int = DEFAULT_OPENROUTER_MIN_SCORE,
     submitted_files: dict[str, str] | None = None,
 ) -> PrivateSubmissionCheckResult:
     files = normalize_agent_files(agent_py=submitted_agent_py, files=submitted_files)
     agent_sha = agent_bundle_sha256(files)
-    base_files = {AGENT_ENTRYPOINT_FILENAME: base_agent_py}
-    patch = _files_patch(base_files=base_files, submitted_files=files)
+    normalized_base_files = normalize_base_agent_files(
+        base_agent_py=base_agent_py,
+        files=base_files,
+    )
+    patch = _files_patch(base_files=normalized_base_files, submitted_files=files)
     smoke = run_agent_smoke_checks(files=files)
     scope_guard = run_scope_guard(hotkey=hotkey, files=files, patch=patch)
     checks = {"agent_smoke": smoke, "scope_guard": scope_guard}
@@ -245,6 +249,7 @@ def run_private_submission_checks(
         checks["openrouter_judge"] = run_openrouter_judge_gate(
             hotkey=hotkey,
             base_agent_py=base_agent_py,
+            base_files=normalized_base_files,
             submitted_agent_py=files.get(AGENT_ENTRYPOINT_FILENAME, ""),
             patch=patch,
             judge=openrouter_judge,
@@ -260,6 +265,21 @@ def run_private_submission_checks(
         )
     accepted = all(check.status == "passed" for check in checks.values())
     return PrivateSubmissionCheckResult(accepted=accepted, agent_sha256=agent_sha, checks=checks)
+
+
+def normalize_base_agent_files(
+    *,
+    base_agent_py: str,
+    files: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return the public base harness files used for submission diffs.
+
+    Legacy callers pass only `base_agent_py`; repo-aware callers can provide the
+    whole public harness file set so omissions/deletions are visible to the LLM
+    gate instead of silently comparing only the entrypoint.
+    """
+    merged = normalize_agent_files(agent_py=base_agent_py, files=files)
+    return dict(sorted(merged.items()))
 
 
 def run_agent_smoke_checks(
@@ -345,6 +365,7 @@ def run_openrouter_judge_gate(
     *,
     hotkey: str,
     base_agent_py: str,
+    base_files: dict[str, str],
     submitted_agent_py: str,
     patch: str,
     judge: JudgeFn | None,
@@ -361,9 +382,16 @@ def run_openrouter_judge_gate(
     changed_files = [
         {
             "filename": path,
-            "status": "modified" if path == AGENT_ENTRYPOINT_FILENAME else "added",
+            "status": (
+                "deleted"
+                if path not in files
+                else "added"
+                if path not in base_files
+                else "modified"
+            ),
         }
-        for path in sorted(files)
+        for path in sorted(set(base_files) | set(files))
+        if base_files.get(path) != files.get(path)
     ]
     payload = {
         "hotkey": hotkey,
@@ -377,6 +405,7 @@ def run_openrouter_judge_gate(
         },
         "patch": patch,
         "base_agent_py": base_agent_py,
+        "base_files": base_files,
         "submitted_agent_py": submitted_agent_py,
         "submitted_files": files,
     }

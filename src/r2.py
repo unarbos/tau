@@ -395,7 +395,7 @@ def build_dashboard_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "active_duel": status.get("active_duel"),
         "benchmarks": payload.get("benchmarks") if isinstance(payload.get("benchmarks"), dict) else {},
-        "links": {**links, "duels_html": "./duels.html", "dashboard_full": "./dashboard.json"},
+        "links": {**links, "duels_html": "./duels.html", "dashboard_full": "./dashboard-summary.json"},
     }
 
 
@@ -527,14 +527,13 @@ def publish_dashboard_data(
     current_king: dict[str, Any] | None,
     duel_history: list[dict[str, Any]],
     status: dict[str, Any] | None = None,
+    benchmarks: dict[str, Any] | None = None,
 ) -> bool:
-    """Serialize and upload dashboard.json to R2. Returns True on success."""
+    """Serialize and upload dashboard home/summary data to R2. Returns True on success."""
     if _get_client() is None:
         log.warning("R2 credentials not configured; skipping dashboard publish")
         return False
 
-    existing = _download_dashboard_payload()
-    benchmarks = existing.get("benchmarks") if isinstance(existing.get("benchmarks"), dict) else {}
     payload = build_dashboard_payload(
         current_king=current_king,
         duel_history=duel_history,
@@ -546,10 +545,14 @@ def publish_dashboard_data(
         # Short max-age so Hippius's edge cache doesn't make the dashboard
         # look frozen to viewers. We publish every few seconds anyway.
         summary_payload = build_dashboard_summary_payload(payload)
-        _upload_json(_DASHBOARD_KEY, payload, cache_control="public, max-age=10")
         _upload_json(_DASHBOARD_HOME_KEY, home_payload, cache_control="public, max-age=10")
         _upload_json(f"{_R2_KEY_PREFIX}dashboard-summary.json", summary_payload, cache_control="public, max-age=10")
-        log.info("Published dashboard data to r2://%s/%s (%d duels)", _get_bucket(), _DASHBOARD_KEY, len(duel_history))
+        log.info(
+            "Published dashboard home/summary to r2://%s/%s (%d duels)",
+            _get_bucket(),
+            _DASHBOARD_HOME_KEY,
+            len(duel_history),
+        )
         return True
     except Exception as exc:
         if _is_throttle_error(exc):

@@ -2,6 +2,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from private_submission import record_private_submission_acceptance
 from config import RunConfig
@@ -154,6 +155,32 @@ class ValidatorStateIoTest(unittest.TestCase):
         memory = ValidatorState(disqualified_hotkeys=["hk-dq"])
 
         added = _merge_queued_submissions_from_disk_state(memory, disk)
+
+        self.assertEqual(added, 0)
+        self.assertEqual(memory.queue, [])
+
+    def test_merge_skips_disk_submission_from_prior_registration(self) -> None:
+        disk_entry = private_submission_validator_queue_entry(
+            hotkey="hk-reregistered",
+            submission_id="sub-stale",
+            agent_sha256="deadbeef",
+            registration_block=200,
+            uid=160,
+        )
+        disk = ValidatorState.from_dict({"queue": [disk_entry]})
+        memory = ValidatorState()
+        config = RunConfig()
+
+        with (
+            patch("validate._uid_for_hotkey_on_subnet", return_value=12),
+            patch("validate._current_registration_block", return_value=250),
+        ):
+            added = _merge_queued_submissions_from_disk_state(
+                memory,
+                disk,
+                config=config,
+                subtensor=object(),
+            )
 
         self.assertEqual(added, 0)
         self.assertEqual(memory.queue, [])

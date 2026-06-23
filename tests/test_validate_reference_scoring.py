@@ -13,7 +13,6 @@ from validate import (
     ValidatorSubmission,
     _challenger_wins,
     _copy_detection_reason,
-    _diff_judge_empty_patch_result,
     _diff_judge_prompt_injection_result,
     _duel_speed_stop_reason,
     _parse_diff_judge_payload,
@@ -207,56 +206,19 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertAlmostEqual(result.king_score, 0.0)
         self.assertAlmostEqual(result.challenger_score, 1.0)
 
-    def test_diff_judge_empty_patch_result_fails_empty_challenger(self):
-        result = _diff_judge_empty_patch_result(
-            king_patch="diff --git a/foo b/foo\n+fix\n",
-            challenger_patch="\n",
-        )
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.winner, "king")
-        self.assertEqual(result.king_score, 1.0)
-        self.assertEqual(result.challenger_score, 0.0)
-
-    def test_diff_judge_empty_patch_result_fails_empty_king(self):
-        result = _diff_judge_empty_patch_result(
-            king_patch="",
-            challenger_patch="diff --git a/foo b/foo\n+fix\n",
-        )
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.winner, "challenger")
-        self.assertEqual(result.king_score, 0.0)
-        self.assertEqual(result.challenger_score, 1.0)
-
-    def test_diff_judge_empty_patch_result_ties_when_both_empty(self):
-        result = _diff_judge_empty_patch_result(
-            king_patch=" \n",
-            challenger_patch="",
-        )
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.winner, "tie")
-        self.assertEqual(result.king_score, 0.0)
-        self.assertEqual(result.challenger_score, 0.0)
-
-    def test_diff_judge_empty_patch_result_allows_both_nonempty(self):
-        result = _diff_judge_empty_patch_result(
-            king_patch="diff --git a/k b/k\n+king\n",
-            challenger_patch="diff --git a/c b/c\n+challenger\n",
-        )
-
-        self.assertIsNone(result)
-
-    def test_judge_round_diffs_skips_llm_for_empty_challenger_patch(self):
+    def test_judge_round_diffs_sends_empty_challenger_patch_to_llm(self):
         calls = []
 
         def fake_complete_text(**kwargs):
             calls.append(kwargs)
-            raise AssertionError("LLM judge should not run for empty patches")
+            return json.dumps(
+                {
+                    "winner": "candidate_b",
+                    "candidate_a_score": 35,
+                    "candidate_b_score": 65,
+                    "rationale": "candidate_b is more complete",
+                }
+            )
 
         task_paths = SimpleNamespace(
             task_txt_path=SimpleNamespace(read_text=lambda: "fix the bug"),
@@ -281,11 +243,9 @@ class ReferenceScoringTest(unittest.TestCase):
                 duel_id=6861,
             )
 
-        self.assertEqual(calls, [])
-        self.assertEqual(result.winner, "king")
-        self.assertEqual(result.king_score, 1.0)
-        self.assertEqual(result.challenger_score, 0.0)
-        self.assertEqual(result.outcome, "empty_patch")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("(no changes)", calls[0]["prompt"])
+        self.assertEqual(result.outcome, "success")
 
     def test_diff_judge_static_prompt_injection_loses_round_score(self):
         result = _diff_judge_prompt_injection_result(
