@@ -159,7 +159,7 @@ class GitHubTokenRotatorTest(unittest.TestCase):
             self.assertEqual(_pop_date_commit(cache), ("owner/repo", "good-sha"))
             self.assertIsNone(_pop_date_commit(cache))
 
-    def test_sample_commit_reuses_events_across_attempts(self):
+    def test_sample_commit_does_not_retry_same_event_commit(self):
         miner = GitHubMiner(rng=random.Random(1), start_search_refiller=False)
         events = [
             {
@@ -184,11 +184,73 @@ class GitHubTokenRotatorTest(unittest.TestCase):
         miner._sample_commit_by_random_day = lambda: None  # type: ignore[method-assign]
         miner._reject_cache.add = lambda *args, **kwargs: None  # type: ignore[method-assign]
 
-        with self.assertRaisesRegex(RuntimeError, "bad commit"):
+        with self.assertRaisesRegex(RuntimeError, "No commits from date search and no usable recent push events"):
             miner.sample_commit(max_attempts=3)
 
-        self.assertEqual(calls, {"events": 1, "commit": 3})
+        self.assertEqual(calls, {"events": 1, "commit": 1})
         miner.close()
+
+    def test_event_fallback_skips_cached_rejects_before_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "rejects.jsonl"
+            cache = CommitRejectCache(cache_path)
+            cache.add("owner/repo", "bad-sha", "cached")
+
+            miner = GitHubMiner(
+                rng=random.Random(1),
+                reject_cache_path=cache_path,
+                start_search_refiller=False,
+            )
+            events = [
+                {
+                    "type": "PushEvent",
+                    "id": "event-1",
+                    "repo": {"name": "owner/repo"},
+                    "payload": {
+                        "commits": [
+                            {"sha": "bad-sha", "modified": ["src/bad.py"]},
+                            {"sha": "good-sha", "modified": ["src/good.py"]},
+                        ],
+                    },
+                }
+            ]
+
+            candidates = miner._fallback_event_commit_candidates(events)
+
+            self.assertEqual(candidates, [("owner/repo", "good-sha", "event-1")])
+            miner.close()
+
+    def test_event_fallback_candidates_are_process_wide_unique(self):
+        events = [
+            {
+                "type": "PushEvent",
+                "id": "event-1",
+                "repo": {"name": "owner/repo"},
+                "payload": {"commits": [{"sha": "bad-sha"}]},
+            }
+        ]
+        miner_a = GitHubMiner(rng=random.Random(1), start_search_refiller=False)
+        miner_b = GitHubMiner(rng=random.Random(2), start_search_refiller=False)
+        calls = {"commit": 0}
+
+        def fake_fetch_commit_candidate(**_kwargs):
+            calls["commit"] += 1
+            raise ValueError("bad commit")
+
+        for miner in (miner_a, miner_b):
+            miner._recent_push_events = lambda: events  # type: ignore[method-assign]
+            miner._fetch_commit_candidate = fake_fetch_commit_candidate  # type: ignore[method-assign]
+            miner._sample_commit_by_random_day = lambda: None  # type: ignore[method-assign]
+            miner._reject_cache.add = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "bad commit"):
+            miner_a.sample_commit(max_attempts=1)
+        with self.assertRaisesRegex(RuntimeError, "No commits from date search and no usable recent push events"):
+            miner_b.sample_commit(max_attempts=1)
+
+        self.assertEqual(calls, {"commit": 1})
+        miner_a.close()
+        miner_b.close()
 
     def test_pick_random_commit_sha_prefers_event_commits_with_code_hints(self):
         miner = GitHubMiner(rng=random.Random(1), start_search_refiller=False)
@@ -228,7 +290,8 @@ class GitHubTokenRotatorTest(unittest.TestCase):
             from github_miner import _commit_search_refiller_loop
 
             with patch("github_miner._SEARCH_REFILLER_STOP") as mock_stop:
-                mock_stop.wait.side_effect = [False, True]
+                mock_stop.is_set.return_value = False
+                mock_stop.wait.return_value = True
                 _commit_search_refiller_loop(token_rotator=rotator, timeout=5.0)
         self.assertEqual(_pop_date_commit(None), ("owner/b", "sha-b"))
         self.assertEqual(_pop_date_commit(None), ("owner/a", "sha-a"))

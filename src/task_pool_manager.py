@@ -1196,6 +1196,8 @@ def _prepare_one_task_for_pool(
 
         try:
             with v._open_subtensor(config) as sub:
+                # SubtensorApi() can reset non-bittensor loggers; keep pool-manager progress visible.
+                v._setup_logging(debug=config.debug)
                 creation_block = sub.block
         except Exception:
             creation_block = 0

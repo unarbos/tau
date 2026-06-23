@@ -23,11 +23,21 @@ _RATE_LIMIT_COOLDOWN = 60  # seconds to wait before reusing a rate-limited token
 _RECENT_EVENTS_CACHE_TTL_SECONDS = 60.0
 _RECENT_EVENTS_CACHE_LOCK = threading.Lock()
 _RECENT_EVENTS_CACHE: tuple[float, list[dict]] | None = None
+_FALLBACK_EVENT_COMMIT_LOCK = threading.Lock()
+_FALLBACK_EVENT_COMMIT_BUFFER: list[tuple[str, str, str]] = []
+_FALLBACK_EVENT_COMMIT_SEEN: set[tuple[str, str]] = set()
 
 
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
     except (KeyError, ValueError):
         return default
 
@@ -54,6 +64,7 @@ _SEARCH_QUERY_SUFFIX = _env_str("TAU_MINER_SEARCH_QUERY_SUFFIX", "merge:false")
 _BUFFER_LOW_WATERMARK = _env_int("TAU_MINER_BUFFER_LOW_WATERMARK", 50)
 _BUFFER_HIGH_WATERMARK = _env_int("TAU_MINER_BUFFER_HIGH_WATERMARK", 500)
 _REFILLER_POLL_SECONDS = float(_env_int("TAU_MINER_REFILLER_POLL_SECONDS", 2))
+_BUFFER_WAIT_SECONDS = _env_float("TAU_MINER_BUFFER_WAIT_SECONDS", 5.0)
 # How many pages of the recent-events firehose to pull on a cache miss (only
 # used by the fallback path). More pages -> a wider pool of distinct repos.
 _EVENT_PAGES_TO_FETCH = _env_int("TAU_MINER_EVENT_PAGES", 4)
@@ -85,6 +96,9 @@ def clear_recent_events_cache() -> None:
     global _RECENT_EVENTS_CACHE
     with _RECENT_EVENTS_CACHE_LOCK:
         _RECENT_EVENTS_CACHE = None
+    with _FALLBACK_EVENT_COMMIT_LOCK:
+        _FALLBACK_EVENT_COMMIT_BUFFER.clear()
+        _FALLBACK_EVENT_COMMIT_SEEN.clear()
 
 
 def reset_commit_search_buffer_for_tests() -> None:
@@ -171,6 +185,11 @@ def _date_commit_buffer_len() -> int:
         return len(_DATE_COMMIT_BUFFER)
 
 
+def _search_refiller_is_alive() -> bool:
+    thread = _SEARCH_REFILLER_THREAD
+    return thread is not None and thread.is_alive()
+
+
 def _pop_date_commit(reject_cache: CommitRejectCache | None) -> tuple[str, str] | None:
     with _DATE_COMMIT_BUFFER_LOCK:
         while _DATE_COMMIT_BUFFER:
@@ -225,11 +244,15 @@ def _commit_search_refiller_loop(*, token_rotator: GitHubTokenRotator, timeout: 
         start_search_refiller=False,
     )
     try:
-        while not _SEARCH_REFILLER_STOP.wait(_REFILLER_POLL_SECONDS):
+        while not _SEARCH_REFILLER_STOP.is_set():
             buffer_len = _date_commit_buffer_len()
             if buffer_len >= _BUFFER_LOW_WATERMARK:
+                if _SEARCH_REFILLER_STOP.wait(_REFILLER_POLL_SECONDS):
+                    break
                 continue
             if time.monotonic() < _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL:
+                if _SEARCH_REFILLER_STOP.wait(_REFILLER_POLL_SECONDS):
+                    break
                 continue
             commits = miner._search_commits_for_random_day()
             buffer_len = _extend_date_commit_buffer(commits)
@@ -241,6 +264,8 @@ def _commit_search_refiller_loop(*, token_rotator: GitHubTokenRotator, timeout: 
                     _BUFFER_LOW_WATERMARK,
                     _BUFFER_HIGH_WATERMARK,
                 )
+            if _SEARCH_REFILLER_STOP.wait(_REFILLER_POLL_SECONDS):
+                break
     finally:
         miner.close()
 
@@ -565,14 +590,12 @@ class GitHubMiner:
                     # Fallback: recent-events firehose (search unavailable/rate limited).
                     if events is None:
                         events = self._recent_push_events()
-                    if not events:
-                        last_error = "No commits from date search and no recent push events"
+                    fallback_pick = self._pop_fallback_event_commit(events)
+                    if fallback_pick is None:
+                        last_error = "No commits from date search and no usable recent push events"
                         log.debug(last_error)
                         continue
-                    event = self._rng.choice(events)
-                    repo_full_name = event["repo"]["name"]
-                    event_id = str(event.get("id", ""))
-                    commit_sha = self._pick_random_commit_sha(event)
+                    repo_full_name, commit_sha, event_id = fallback_pick
                 if self._reject_cache.contains(repo_full_name, commit_sha):
                     last_error = f"Cached reject for {repo_full_name}@{commit_sha}"
                     log.debug(last_error)
@@ -651,6 +674,9 @@ class GitHubMiner:
                     return list(events)
             events = self._fetch_recent_push_events()
             _RECENT_EVENTS_CACHE = (time.monotonic(), list(events))
+            with _FALLBACK_EVENT_COMMIT_LOCK:
+                _FALLBACK_EVENT_COMMIT_BUFFER.clear()
+                _FALLBACK_EVENT_COMMIT_SEEN.clear()
             return list(events)
 
     def _fetch_recent_push_events(self) -> list[dict]:
@@ -672,7 +698,73 @@ class GitHubMiner:
 
     def _sample_commit_by_random_day(self) -> tuple[str, str] | None:
         """Pop the next buffered (repo, sha) from the shared search refiller."""
-        return _pop_date_commit(self._reject_cache)
+        pick = _pop_date_commit(self._reject_cache)
+        if pick is not None or not _search_refiller_is_alive() or _BUFFER_WAIT_SECONDS <= 0:
+            return pick
+
+        deadline = time.monotonic() + _BUFFER_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            pick = _pop_date_commit(self._reject_cache)
+            if pick is not None:
+                return pick
+        return None
+
+    def _pop_fallback_event_commit(self, events: list[dict]) -> tuple[str, str, str] | None:
+        """Pop a process-wide unique fallback commit from cached recent events."""
+        with _FALLBACK_EVENT_COMMIT_LOCK:
+            while True:
+                while _FALLBACK_EVENT_COMMIT_BUFFER:
+                    repo_full_name, commit_sha, event_id = _FALLBACK_EVENT_COMMIT_BUFFER.pop()
+                    if self._reject_cache.contains(repo_full_name, commit_sha):
+                        continue
+                    return repo_full_name, commit_sha, event_id
+
+                candidates = self._fallback_event_commit_candidates(events)
+                added = 0
+                for repo_full_name, commit_sha, event_id in candidates:
+                    key = (repo_full_name, commit_sha)
+                    if key in _FALLBACK_EVENT_COMMIT_SEEN:
+                        continue
+                    _FALLBACK_EVENT_COMMIT_SEEN.add(key)
+                    _FALLBACK_EVENT_COMMIT_BUFFER.append((repo_full_name, commit_sha, event_id))
+                    added += 1
+                if added == 0:
+                    return None
+
+    def _fallback_event_commit_candidates(self, events: list[dict]) -> list[tuple[str, str, str]]:
+        """Return deduped, non-rejected commits from cached recent push events."""
+        candidates: list[tuple[str, str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for event in events:
+            try:
+                repo_full_name = str(event["repo"]["name"])
+            except (KeyError, TypeError):
+                continue
+            event_id = str(event.get("id", ""))
+            shas = self._event_commit_shas(event)
+            for commit_sha in shas:
+                key = (repo_full_name, commit_sha)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if self._reject_cache.contains(repo_full_name, commit_sha):
+                    continue
+                candidates.append((repo_full_name, commit_sha, event_id))
+        self._rng.shuffle(candidates)
+        return candidates
+
+    def _event_commit_shas(self, event: dict) -> list[str]:
+        commits = _push_event_commits_with_code_hints(event)
+        shas: list[str] = []
+        for commit in commits:
+            sha = commit.get("sha")
+            if sha:
+                shas.append(str(sha))
+        if shas:
+            return shas
+        head_sha = event.get("payload", {}).get("head")
+        return [str(head_sha)] if head_sha else []
 
     def _search_commits_for_random_day(self) -> list[tuple[str, str]]:
         """One commit-search call for a random day; returns all (repo, sha) hits."""

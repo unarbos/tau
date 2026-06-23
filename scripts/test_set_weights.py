@@ -43,7 +43,9 @@ def _preview(subtensor, config: RunConfig, state: ValidatorState) -> dict:
     shares = _king_emission_shares(config.validate_king_window_size)
     neurons = list(subtensor.neurons.neurons_lite(config.validate_netuid))
     uids = [int(n.uid) for n in neurons]
-    uid_set = set(uids)
+    uid_by_hotkey = {
+        str(n.hotkey): int(n.uid) for n in neurons if getattr(n, "hotkey", None) is not None
+    }
     weights_by_uid: dict[int, float] = {u: 0.0 for u in uids}
     burn_share = 0.0
     slots: list[dict] = []
@@ -53,12 +55,7 @@ def _preview(subtensor, config: RunConfig, state: ValidatorState) -> dict:
         uid = None
         label = "burn"
         if sub is not None and _incumbent_allowed_by_mode(config, sub):
-            uid = _resolve_weight_uid(
-                subtensor=subtensor,
-                config=config,
-                submission=sub,
-                uid_set=uid_set,
-            )
+            uid = _resolve_weight_uid(submission=sub, uid_by_hotkey=uid_by_hotkey)
         if uid is not None and sub is not None:
             weights_by_uid[uid] += share
             label = sub.hotkey

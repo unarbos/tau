@@ -47,16 +47,16 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class _Neuron:
-            def __init__(self, uid: int):
+            def __init__(self, uid: int, hotkey: str):
                 self.uid = uid
+                self.hotkey = hotkey
 
         class _Neurons:
             def neurons_lite(self, _netuid):
-                return [_Neuron(uid) for uid in range(6)]
-
-        class _Subnets:
-            def get_uid_for_hotkey_on_subnet(self, hotkey, _netuid):
-                return int(hotkey.removeprefix("5King"))
+                # uid 0 is the burn uid; uids 1..5 carry the king hotkeys.
+                return [_Neuron(uid=0, hotkey="5Burn")] + [
+                    _Neuron(uid=i, hotkey=f"5King{i}") for i in range(1, 6)
+                ]
 
         class _Extrinsics:
             def set_weights(self, **kwargs):
@@ -65,7 +65,6 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
 
         class _Subtensor:
             neurons = _Neurons()
-            subnets = _Subnets()
             extrinsics = _Extrinsics()
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch("validate.bt.Wallet", return_value=object()):
@@ -76,10 +75,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual(captured["weights"], [0.0, 0.40, 0.15, 0.15, 0.15, 0.15])
         self.assertEqual(state.last_weight_block, 123)
 
-    def test_set_weights_falls_back_to_submission_uid_when_hotkey_lookup_fails(self):
+    def test_set_weights_follows_hotkey_to_new_uid_and_never_pays_stale_uid(self):
+        # The king was crowned at uid 138 but its hotkey re-registered onto uid
+        # 46; uid 138 is now held by a different neuron. Emission must follow the
+        # hotkey to uid 46, and the stale uid 138 must receive nothing.
         king = _submission(
-            hotkey="5GpkoLVCZWmxCN4hCchz2qsTDunw5wYbAsGuj8dyHRLqQrza",
-            uid=198,
+            hotkey="5DGBt4Mgj96PLvnbNdtcEPSVK1uHKR7hTdKSzWAdES1fv5Ad",
+            uid=138,
             commitment="unarbos/ninja@" + "a" * 40,
             block=100,
         )
@@ -87,16 +89,17 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class _Neuron:
-            def __init__(self, uid: int):
+            def __init__(self, uid: int, hotkey: str):
                 self.uid = uid
+                self.hotkey = hotkey
 
         class _Neurons:
             def neurons_lite(self, _netuid):
-                return [_Neuron(uid) for uid in range(3)] + [_Neuron(uid=198)]
-
-        class _Subnets:
-            def get_uid_for_hotkey_on_subnet(self, _hotkey, _netuid):
-                raise RuntimeError("chain lookup unavailable")
+                return [
+                    _Neuron(uid=0, hotkey="5Burn"),
+                    _Neuron(uid=46, hotkey="5DGBt4Mgj96PLvnbNdtcEPSVK1uHKR7hTdKSzWAdES1fv5Ad"),
+                    _Neuron(uid=138, hotkey="5StrangerWhoNowHoldsTheOldUid"),
+                ]
 
         class _Extrinsics:
             def set_weights(self, **kwargs):
@@ -105,7 +108,6 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
 
         class _Subtensor:
             neurons = _Neurons()
-            subnets = _Subnets()
             extrinsics = _Extrinsics()
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch("validate.bt.Wallet", return_value=object()):
@@ -114,7 +116,11 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
 
         weights = captured["weights"]
         uids = captured["uids"]
-        self.assertAlmostEqual(weights[uids.index(198)], 0.40)
+        # King's 0.40 share follows the hotkey to its current uid 46.
+        self.assertAlmostEqual(weights[uids.index(46)], 0.40)
+        # The stale uid 138 (now a different neuron) gets nothing from the king.
+        self.assertAlmostEqual(weights[uids.index(138)], 0.0)
+        # The four empty prior-king slots (0.15 each) roll to the burn uid 0.
         self.assertAlmostEqual(weights[uids.index(0)], 0.60)
 
     def test_startup_purge_clears_recent_kings_when_current_king_missing(self):

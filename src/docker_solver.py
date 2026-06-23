@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from config import RunConfig
-from openrouter_proxy import OpenRouterProxy, SolveBudget
+from openrouter_proxy import OpenRouterProxy, SolveBudget, select_solver_upstream_base_url
 from solver_runner import (
     COMPLETED_EXIT_REASON,
     PROVIDER_ACCOUNT_ERROR_EXIT_REASON,
@@ -286,6 +286,18 @@ def solve_task_in_docker(
             agent_hash=agent_hash,
             started_at=rollout_started_at,
         )
+        solve_shard_key = _solver_upstream_shard_key(
+            task_name=task_name or run_label or "unknown-task",
+            solution_name=solution_name or run_label or "solution",
+            agent_hash=agent_hash,
+        )
+        upstream_base_url = select_solver_upstream_base_url(solve_shard_key)
+        log.info(
+            "Docker solver upstream pinned: task=%s solution=%s upstream=%s",
+            task_name or run_label or "unknown-task",
+            solution_name or run_label or "solution",
+            upstream_base_url,
+        )
         rollout_events: list[dict[str, Any]] = []
         rollout_events_lock = threading.Lock()
 
@@ -297,8 +309,8 @@ def solve_task_in_docker(
         proxy_cache_dir = config.solver_proxy_replay_dir or config.solver_proxy_cache_dir
         with OpenRouterProxy(
             # The proxy authenticates to the SOLVER upstream. When the solver
-            # targets a self-hosted endpoint (SOLVER_UPSTREAM_BASE_URL), use its
-            # key; otherwise the OpenRouter key. The judge uses its own key.
+            # targets self-hosted endpoints (SOLVER_UPSTREAM_BASE_URL[S]), use
+            # its key; otherwise the OpenRouter key. The judge uses its own key.
             openrouter_api_key=(
                 os.environ.get("SOLVER_UPSTREAM_API_KEY") or config.openrouter_api_key
             ),
@@ -319,6 +331,7 @@ def solve_task_in_docker(
             rollout_capture_bodies=config.record_rollouts,
             cache_dir=proxy_cache_dir,
             cache_replay_only=config.solver_proxy_replay_dir is not None,
+            upstream_base_url=upstream_base_url,
         ) as proxy:
             sensitive_values = _sensitive_values(config=config, proxy=proxy)
             try:
@@ -1728,10 +1741,13 @@ def _solver_enforced_sampling_params(
     }
     # Extra body fields forced onto every solver request (e.g. disabling a thinking
     # template: SOLVER_CHAT_TEMPLATE_KWARGS='{"enable_thinking": false}'). When the
-    # solver targets a self-hosted endpoint (SOLVER_UPSTREAM_BASE_URL), default to
-    # thinking-off — those Qwen endpoints default to thinking ON.
+    # solver targets a self-hosted endpoint, default to thinking-off — those Qwen
+    # endpoints default to thinking ON.
     extra = os.environ.get("SOLVER_CHAT_TEMPLATE_KWARGS")
-    if not extra and os.environ.get("SOLVER_UPSTREAM_BASE_URL"):
+    if not extra and (
+        os.environ.get("SOLVER_UPSTREAM_BASE_URL")
+        or os.environ.get("SOLVER_UPSTREAM_BASE_URLS")
+    ):
         extra = '{"enable_thinking": false}'
     if extra:
         try:
@@ -1739,6 +1755,10 @@ def _solver_enforced_sampling_params(
         except Exception:
             log.warning("Ignoring invalid SOLVER_CHAT_TEMPLATE_KWARGS JSON: %r", extra)
     return params
+
+
+def _solver_upstream_shard_key(*, task_name: str, solution_name: str, agent_hash: str) -> str:
+    return f"{task_name}\0{solution_name}\0{agent_hash}"
 
 
 def _solver_provider_preferences(config: RunConfig) -> dict[str, Any] | None:

@@ -4,9 +4,11 @@ set -euo pipefail
 umask 002
 : "${OPENROUTER_API_KEY:?Set OPENROUTER_API_KEY in Doppler}"
 : "${SOLVER_UPSTREAM_API_KEY:?Set SOLVER_UPSTREAM_API_KEY (self-hosted Qwen endpoint key) in Doppler}"
-# Self-hosted Qwen3-32B endpoint (its own upstream + key). The solver proxy reads
-# SOLVER_UPSTREAM_BASE_URL; complete_text routes the SELF_HOSTED_MODEL here too.
-export SOLVER_UPSTREAM_BASE_URL=http://107.170.115.150:8000/v1
+# Self-hosted Qwen3-32B endpoint URLs live in local env/Doppler. The solver proxy
+# reads SOLVER_UPSTREAM_BASE_URLS as a comma-separated GPU list and pins each solve
+# to one upstream; complete_text routes SELF_HOSTED_MODEL via SOLVER_UPSTREAM_BASE_URL.
+: "${SOLVER_UPSTREAM_BASE_URL:?Set SOLVER_UPSTREAM_BASE_URL in local env/Doppler}"
+export SOLVER_UPSTREAM_BASE_URL SOLVER_UPSTREAM_BASE_URLS
 export SELF_HOSTED_MODEL=Qwen/Qwen3-32B
 # Non-judge models all run on the self-hosted Qwen3-32B (solver via the proxy;
 # generator/eval routed to SOLVER_UPSTREAM_BASE_URL by SELF_HOSTED_MODEL).
@@ -26,8 +28,8 @@ exec /home/const/subnet66/.venv/bin/python -m cli validate \
   --wallet-hotkey default \
   --solver-model Qwen/Qwen3-32B \
   --max-concurrency 1 \
-  --round-concurrency 50 \
-  --docker-solver-start-concurrency 50 \
+  --round-concurrency 25 \
+  --docker-solver-start-concurrency 25 \
   --candidate-timeout-streak-limit 10 \
   --poll-interval-seconds 600 \
   --task-pool-target 50 \

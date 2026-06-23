@@ -12,10 +12,16 @@ from docker_solver import (
     _proxy_request_is_provider_endpoint_error,
     _resolve_exit_reason,
 )
-from openrouter_proxy import OpenRouterProxy, UpstreamResponse, _upstream_base_url
+from openrouter_proxy import (
+    OpenRouterProxy,
+    UpstreamResponse,
+    _upstream_base_url,
+    select_solver_upstream_base_url,
+    solver_upstream_base_urls_from_env,
+)
 from sampling_seed import VALIDATOR_TOP_P
-from tau.io.upstream_request_policy import UpstreamRequestPolicy
 from solver_runner import COMPLETED_EXIT_REASON, PROVIDER_ACCOUNT_ERROR_EXIT_REASON
+from tau.io.upstream_request_policy import UpstreamRequestPolicy
 
 _SAMPLE_PAYLOAD = {
     "model": "test/model",
@@ -50,6 +56,48 @@ class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
             clear=False,
         ):
             self.assertEqual(_upstream_base_url(), "https://example.test/custom")
+
+    def test_solver_upstream_base_urls_reads_comma_list(self):
+        with patch.dict(
+            "openrouter_proxy.os.environ",
+            {
+                "SOLVER_UPSTREAM_BASE_URLS": (
+                    "https://gpu-a.example/v1, https://gpu-b.example/v1/chat/completions"
+                )
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                solver_upstream_base_urls_from_env(),
+                ["https://gpu-a.example", "https://gpu-b.example"],
+            )
+
+    def test_select_solver_upstream_base_url_is_stable_for_key(self):
+        with patch.dict(
+            "openrouter_proxy.os.environ",
+            {
+                "SOLVER_UPSTREAM_BASE_URLS": (
+                    "https://gpu-a.example/v1, https://gpu-b.example/v1"
+                )
+            },
+            clear=False,
+        ):
+            first = select_solver_upstream_base_url("task-a\0solution-a")
+            second = select_solver_upstream_base_url("task-a\0solution-a")
+            self.assertEqual(first, second)
+            self.assertIn(first, {"https://gpu-a.example", "https://gpu-b.example"})
+
+    def test_proxy_can_pin_upstream_base_url_for_session(self):
+        with patch.dict(
+            "openrouter_proxy.os.environ",
+            {"SOLVER_UPSTREAM_BASE_URL": "https://global.example/v1"},
+            clear=False,
+        ):
+            proxy = OpenRouterProxy(
+                openrouter_api_key="upstream-key",
+                upstream_base_url="https://pinned.example/v1/chat/completions",
+            )
+            self.assertEqual(proxy._upstream_base_url(), "https://pinned.example")
 
     def test_rewrites_requested_model_to_validator_model(self):
         proxy = OpenRouterProxy(openrouter_api_key="upstream-key", enforced_model="validator/model")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,7 @@ options:
   --artifact PATH               output JSON path
   --min-timeout N               override minimum per-round solver timeout
   --max-timeout N               override maximum per-round solver timeout
+  --solver-model MODEL          solver model id (default: SELF_HOSTED_MODEL or AGENT_MODEL)
   --timeout-scale FLOAT         scale validator timeout formula
   --keep-base-repos             keep reconstructed cached base repos
   --no-stop-when-decided        run all selected rounds even after outcome is fixed
@@ -125,6 +127,7 @@ def main() -> int:
         validate_netuid=args.netuid,
         agent_timeout=args.agent_timeout,
         docker_solver_max_output_bytes=args.max_output_bytes,
+        solver_model=args.solver_model,
     )
     if not config.openrouter_api_key:
         raise SystemExit("OPENROUTER_API_KEY is required")
@@ -137,27 +140,21 @@ def main() -> int:
         config,
         solver_backend="docker-file",
         solve_agent=f"base-main-{base_sha[:12]}",
-        solver_agent_source=SolverAgentSource(
+        solver_agent_source=_agent_source_from_path(
+            base_agent,
             raw=f"base-main-{base_sha}",
-            kind="local_file",
-            local_path=str(base_agent),
-            agent_file="agent.py",
-            commit_sha=base_sha,
+            sha=base_sha,
         ),
-        solver_model=None,
     )
     challenger_cfg = replace(
         config,
         solver_backend="docker-file",
         solve_agent=f"manual-challenger-{challenger_sha[:12]}",
-        solver_agent_source=SolverAgentSource(
+        solver_agent_source=_agent_source_from_path(
+            challenger_agent,
             raw=str(challenger_agent),
-            kind="local_file",
-            local_path=str(challenger_agent),
-            agent_file="agent.py",
-            commit_sha=challenger_sha,
+            sha=challenger_sha,
         ),
-        solver_model=None,
     )
 
     runner = ManualDuelRunner(
@@ -506,6 +503,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-base-repos", action="store_true")
     parser.add_argument("--min-timeout", type=int, help="Override minimum per-round solver timeout.")
     parser.add_argument("--max-timeout", type=int, help="Override maximum per-round solver timeout.")
+    parser.add_argument(
+        "--solver-model",
+        default=os.environ.get("SELF_HOSTED_MODEL") or os.environ.get("AGENT_MODEL"),
+    )
     parser.add_argument("--timeout-scale", type=float, default=1.0, help="Scale the per-round solver timeout before min/max clamp.")
     parser.add_argument("--no-stop-when-decided", action="store_false", dest="stop_when_decided")
     parser.set_defaults(stop_when_decided=True)
@@ -543,6 +544,32 @@ def _solution_artifacts_exist(config: RunConfig, task_name: str, solution_name: 
     task_paths = resolve_task_paths(config.tasks_root, task_name)
     solution_paths = build_solution_paths(task_paths, solution_name)
     return solution_paths.solution_diff_path.exists() and solution_paths.solve_json_path.exists()
+
+
+def _agent_source_from_path(path: Path, *, raw: str, sha: str) -> SolverAgentSource:
+    if path.is_dir():
+        return SolverAgentSource(
+            raw=raw,
+            kind="local_path",
+            local_path=str(path),
+            agent_file="agent.py",
+            commit_sha=sha,
+        )
+    if (path.parent / "agent").is_dir():
+        return SolverAgentSource(
+            raw=raw,
+            kind="local_path",
+            local_path=str(path.parent),
+            agent_file=path.name,
+            commit_sha=sha,
+        )
+    return SolverAgentSource(
+        raw=raw,
+        kind="local_file",
+        local_path=str(path),
+        agent_file=path.name,
+        commit_sha=sha,
+    )
 
 
 def _ensure_repo_from_solution_diff(config: RunConfig, task_name: str, solution_name: str) -> None:

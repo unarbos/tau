@@ -8,7 +8,11 @@ TAU_ROLLOUT_HF_DATASET="$TAU_POLAR_HF_DATASET"
 : "${OPENROUTER_API_KEY:?Set OPENROUTER_API_KEY in Doppler}"
 : "${SOLVER_UPSTREAM_API_KEY:?Set SOLVER_UPSTREAM_API_KEY (self-hosted Qwen endpoint key) in Doppler}"
 # Self-hosted Qwen3-32B for solver + generator + eval (routed via SELF_HOSTED_MODEL).
-export SOLVER_UPSTREAM_BASE_URL=http://107.170.115.150:8000/v1
+# Keep endpoint URLs in local env/Doppler. SOLVER_UPSTREAM_BASE_URLS may contain a
+# comma-separated GPU list; each solve pins to one upstream for all tool turns so
+# prefix cache stays useful.
+: "${SOLVER_UPSTREAM_BASE_URL:?Set SOLVER_UPSTREAM_BASE_URL in local env/Doppler}"
+export SOLVER_UPSTREAM_BASE_URL SOLVER_UPSTREAM_BASE_URLS
 export SELF_HOSTED_MODEL=Qwen/Qwen3-32B
 export GENERATOR_MODEL=Qwen/Qwen3-32B
 export EVAL_MODEL=Qwen/Qwen3-32B
@@ -31,6 +35,6 @@ exec /home/const/subnet66/.venv/bin/python -m cli pool-manager \
   --rollout-root /home/const/subnet66/tau/workspace/rollouts \
   --push-rollouts-to-hf \
   --rollout-hf-dataset "$TAU_ROLLOUT_HF_DATASET" \
-  --pool-filler-concurrency 32 \
-  --docker-solver-start-concurrency 32
+  --pool-filler-concurrency 25 \
+  --docker-solver-start-concurrency 25
 '

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -24,13 +25,13 @@ from tau.io.chat_completion import (
     normalize_chat_completion_payload,
     payload_has_retryable_empty_content,
 )
+from tau.io.openrouter import CacheMissError, normalize_base_url
 from tau.io.upstream_request_policy import (
     DEFAULT_EMPTY_RESPONSE_RETRIES,
     DEFAULT_RATE_LIMIT_RETRIES,
     UpstreamRequestPolicy,
     apply_upstream_request_policy,
 )
-from tau.io.openrouter import CacheMissError, normalize_base_url
 from tau.rollouts.schema import build_llm_event, utc_now
 from tau.utils import DiskCache, json_sha256
 
@@ -87,6 +88,33 @@ def _upstream_base_url() -> str:
         or os.environ.get("OPENROUTER_UPSTREAM_BASE_URL")
         or os.environ.get("OPENROUTER_BASE_URL"),
     )
+
+
+def _split_upstream_base_urls(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    urls: list[str] = []
+    for item in raw.replace("\n", ",").split(","):
+        value = item.strip()
+        if value:
+            urls.append(normalize_base_url(value))
+    return urls
+
+
+def solver_upstream_base_urls_from_env() -> list[str]:
+    urls = _split_upstream_base_urls(os.environ.get("SOLVER_UPSTREAM_BASE_URLS"))
+    if urls:
+        return urls
+    return [_upstream_base_url()]
+
+
+def select_solver_upstream_base_url(shard_key: str) -> str:
+    urls = solver_upstream_base_urls_from_env()
+    if len(urls) == 1:
+        return urls[0]
+    digest = hashlib.sha256(shard_key.encode("utf-8")).digest()
+    index = int.from_bytes(digest[:8], "big") % len(urls)
+    return urls[index]
 
 
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -573,6 +601,7 @@ class OpenRouterProxy:
     rollout_capture_bodies: bool = False
     cache_dir: Path | None = None
     cache_replay_only: bool = False
+    upstream_base_url: str | None = None
     _server: _ReusableThreadingHTTPServer | None = field(default=None, init=False, repr=False)
     _unix_server: _ReusableThreadingUnixServer | None = field(default=None, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -582,6 +611,8 @@ class OpenRouterProxy:
     _upstream_client: UpstreamClient = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.upstream_base_url:
+            self.upstream_base_url = normalize_base_url(self.upstream_base_url)
         httpx_client = HttpxUpstreamClient(on_first_token=self._record_first_token)
         if self.cache_dir is not None:
             inner = None if self.cache_replay_only else httpx_client
@@ -853,7 +884,7 @@ class OpenRouterProxy:
         try:
             upstream = self._upstream_client.fetch(
                 command=handler.command,
-                url=f"{_upstream_base_url()}{handler.path}",
+                url=f"{self._upstream_base_url()}{handler.path}",
                 headers=self._build_upstream_headers(handler),
                 body=body,
                 prepared_payload=prepared_payload,
@@ -888,6 +919,7 @@ class OpenRouterProxy:
                 )
             self._send_raw(handler, 503, error_body, content_type="application/json")
             return
+
         except httpx.HTTPError as exc:
             latency_ms = int((time.monotonic() - start) * 1000)
             finished_at = utc_now()
@@ -955,6 +987,9 @@ class OpenRouterProxy:
         handler.wfile.write(upstream.body)
         handler.wfile.flush()
         handler.close_connection = True
+
+    def _upstream_base_url(self) -> str:
+        return self.upstream_base_url or _upstream_base_url()
 
     @staticmethod
     def _send_raw(

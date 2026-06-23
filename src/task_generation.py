@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
+
 from claude_runner import run_claude
 from github_miner import CommitCandidate
 from openrouter_client import complete_text
@@ -73,13 +75,19 @@ def generate_task_description(
     (prompt_dir / "task_generation_prompt.txt").write_text(prompt + "\n")
     start = time.monotonic()
     log.debug("Invoking task generation Claude runner for %s", candidate.repo_full_name)
-    result = _run_claude(
-        prompt=prompt,
-        workspace=prompt_dir,
-        model=model,
-        timeout=timeout,
-        openrouter_api_key=openrouter_api_key,
-    )
+    try:
+        result = _run_claude(
+            prompt=prompt,
+            workspace=prompt_dir,
+            model=model,
+            timeout=timeout,
+            openrouter_api_key=openrouter_api_key,
+        )
+    except httpx.HTTPStatusError as exc:
+        elapsed = time.monotonic() - start
+        result = _http_error_text(exc)
+        log.warning("Task generation model call failed; using fallback task: %s", result)
+        return _fallback_task(candidate=candidate, raw_output=result, elapsed=elapsed)
     elapsed = time.monotonic() - start
     (prompt_dir / "task_generation_raw.txt").write_text((result or "") + "\n")
     payload = _extract_json_object(result)
@@ -134,6 +142,13 @@ def _default_title(candidate: CommitCandidate) -> str:
     if message:
         return message[:100]
     return f"Reproduce the behavior from {candidate.short_sha}"
+
+
+def _http_error_text(exc: httpx.HTTPStatusError) -> str:
+    body = exc.response.text.strip()
+    if len(body) > 1000:
+        body = body[:1000] + "...[truncated]"
+    return f"HTTP {exc.response.status_code} from task generation model: {body or exc.response.reason_phrase}"
 
 
 def _build_generation_prompt(candidate: CommitCandidate) -> str:

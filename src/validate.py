@@ -7859,29 +7859,18 @@ def _resolve_promotion_candidate(*, subtensor, github_client, config, state, pri
 
 def _resolve_weight_uid(
     *,
-    subtensor,
-    config: RunConfig,
     submission: ValidatorSubmission,
-    uid_set: set[int],
+    uid_by_hotkey: dict[str, int],
 ) -> int | None:
-    """Resolve a king hotkey to a live subnet uid for set_weights."""
-    try:
-        lookup = subtensor.subnets.get_uid_for_hotkey_on_subnet(
-            submission.hotkey,
-            config.validate_netuid,
-        )
-        if lookup is not None:
-            uid = int(lookup)
-            if uid in uid_set:
-                return uid
-    except Exception:
-        log.exception("uid lookup failed for %s", submission.hotkey)
-    stored_uid = submission.uid
-    if stored_uid is not None:
-        uid = int(stored_uid)
-        if uid in uid_set:
-            return uid
-    return None
+    """Resolve a king to its *current* subnet uid by hotkey.
+
+    Emission follows the hotkey, never the uid recorded when the king was
+    crowned. If the hotkey re-registered onto a new uid, weight tracks it to the
+    new uid; if the hotkey is no longer on the subnet, return None so the caller
+    routes that share to burn rather than paying a stale uid that may now belong
+    to a different neuron.
+    """
+    return uid_by_hotkey.get(submission.hotkey)
 
 
 def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool = False):
@@ -7904,6 +7893,13 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
         return
     uids = [int(n.uid) for n in neurons]
     uid_set = set(uids)
+    # Resolve kings against this same metagraph snapshot, keyed by hotkey, so a
+    # king that re-registered onto a new uid is paid at its current uid and a
+    # stale stored uid is never used (which would hand the king's emission to
+    # whatever neuron now occupies that uid).
+    uid_by_hotkey = {
+        str(n.hotkey): int(n.uid) for n in neurons if getattr(n, "hotkey", None) is not None
+    }
     shares = _king_emission_shares(config.validate_king_window_size)
     weights_by_uid: dict[int, float] = {u: 0.0 for u in uids}
     burn_share = 0.0
@@ -7913,12 +7909,7 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
         sub = recent[i] if i < len(recent) else None
         uid: int | None = None
         if sub is not None and _incumbent_allowed_by_mode(config, sub):
-            uid = _resolve_weight_uid(
-                subtensor=subtensor,
-                config=config,
-                submission=sub,
-                uid_set=uid_set,
-            )
+            uid = _resolve_weight_uid(submission=sub, uid_by_hotkey=uid_by_hotkey)
         if uid is not None and uid in uid_set and sub is not None:
             weights_by_uid[uid] += share
             resolved.append((uid, sub.hotkey, share))

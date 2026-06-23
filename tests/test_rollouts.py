@@ -169,6 +169,49 @@ class RolloutHelpersTest(unittest.TestCase):
             self.assertEqual(len(uploads), 1)
             self.assertTrue(uploads[0].endswith("/retired-task.jsonl.gz"))
 
+    def test_retired_export_batches_hf_folder_uploads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "rollouts"
+            for task_name in ("task-a", "task-b", "task-c"):
+                append_rollout(root, {
+                    "schema_version": 1,
+                    "rollout_id": f"rol_{task_name}",
+                    "task_name": task_name,
+                    "trajectory": [],
+                    "issue": task_name,
+                })
+
+            uploads = []
+
+            def fake_upload_folder(**kwargs):
+                folder_path = Path(kwargs["folder_path"])
+                uploaded = sorted(
+                    path.relative_to(folder_path).as_posix()
+                    for path in folder_path.rglob("*.jsonl.gz")
+                )
+                uploads.append({**kwargs, "uploaded": uploaded})
+
+            config = SimpleNamespace(
+                push_rollouts_to_hf=True,
+                rollout_hf_dataset="owner/dataset",
+                rollout_hf_token_env="HF_TOKEN",
+                resolved_rollout_root=lambda: root,
+            )
+            with patch.dict(os.environ, {"HF_TOKEN": "token", "TAU_ROLLOUT_HF_BATCH_SIZE": "10"}):
+                count = export_retired_rollouts_to_hf(
+                    config=config,
+                    active_task_names=set(),
+                    upload_folder=fake_upload_folder,
+                )
+
+            self.assertEqual(count, 3)
+            self.assertEqual(len(uploads), 1)
+            self.assertEqual(uploads[0]["task_count"], 3)
+            self.assertEqual(len(uploads[0]["uploaded"]), 3)
+            self.assertTrue(all(path.startswith("rollouts/") for path in uploads[0]["uploaded"]))
+            manifest_tasks = load_export_manifest(root)["tasks"]
+            self.assertEqual(set(manifest_tasks), {"task-a", "task-b", "task-c"})
+
     def test_retired_export_continues_after_task_upload_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "rollouts"
