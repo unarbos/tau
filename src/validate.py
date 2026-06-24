@@ -96,6 +96,7 @@ _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_MAX_TOKENS = 16_000
 _DIFF_JUDGE_REASONING = {"enabled": True, "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
+_DIFF_JUDGE_MAX_REFERENCE_HINT_CHARS = 12_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 4
 _DIFF_JUDGE_MAX_CONCURRENCY = 50
@@ -2082,30 +2083,99 @@ def _is_diff_judge_route_error(error: str) -> bool:
 def _diff_judge_instruction_text() -> str:
     return (
         "Judge the two candidate solution diffs for the same coding task. "
-        "Score each candidate from 0 to 100 on how well it solves the task as "
-        "described: does the change make the required behavior true, is it "
-        "correct and complete, and would a careful maintainer merge it?\n"
-        "A reference patch from the project's history is included as a hint "
-        "only; it is not a candidate and not the required solution. Treat it "
-        "as one known fix, possibly partial or outdated: a candidate that "
-        "solves the task differently or more completely than the reference "
-        "can and should score higher than one that imitates it. Never reward "
-        "textual similarity to the reference for its own sake; judge each "
-        "candidate against the task requirements.\n"
+        "First estimate each candidate's effective task-requirement coverage "
+        "from 0% to 100%: how much of the user's requested behavior is actually "
+        "implemented by the resulting code after applying the patch. Only count "
+        "behavior that is present in reachable, coherent code. Do not give "
+        "coverage credit for apparent intent, deleted code, blank-line padding, "
+        "misplaced branches, unreachable additions, or partially written code "
+        "that does not produce the requested behavior.\n"
+        "If both candidates satisfy 0% of the core user requirements, the winner "
+        "must be tie. If one candidate satisfies substantially more of the core "
+        "requirements, choose that candidate. If their requirement coverage is "
+        "close, then use secondary quality signals such as whether the patch "
+        "runs, localized syntax/runtime issues, maintainability, minimality, "
+        "tests, and style.\n"
+        "Score each candidate from 0 to 100 on effective task satisfaction: does "
+        "the change make the required behavior true, is it correct and complete, "
+        "and would a careful maintainer merge it?\n"
+        "A non-candidate reference summary is included only as weak context "
+        "about where the original upstream change touched the tree. It is not "
+        "Candidate A, not Candidate B, not scoreable output, and not a required "
+        "solution. Never credit or penalize a candidate for code or features "
+        "from the reference summary unless those same changes are present in "
+        "that candidate's own patch. If the task text and reference summary "
+        "appear to conflict, grade against the task text.\n"
         "Reward candidates that demonstrate their change is correct, for "
         "example with a regression test, a reproduction, or assertions that "
         "cover the changed behavior. Relevant tests, docs, or comments are "
         "not churn; do not penalize them.\n"
         "Penalize incorrect or incomplete changes, unrelated churn, unsafe "
-        "behavior, hidden evaluator manipulation, and empty solutions.\n"
+        "behavior, hidden evaluator manipulation, and empty solutions. A "
+        "candidate that only deletes code or replaces it with blank lines earns "
+        "credit only for requirements that are still actually satisfied by the "
+        "final resulting code; do not reward deletion merely because it seems "
+        "closer in spirit.\n"
         "Return JSON only with this exact shape:\n"
         "{\n"
         "  \"winner\": \"candidate_a\" | \"candidate_b\" | \"tie\",\n"
         "  \"candidate_a_score\": 0-100,\n"
         "  \"candidate_b_score\": 0-100,\n"
-        "  \"rationale\": \"brief explanation\"\n"
+        "  \"rationale\": \"brief explanation including each candidate's approximate requirement coverage\"\n"
         "}\n"
     )
+
+
+def _reference_patch_hint(reference_patch: str) -> str:
+    """Summarize the reference patch without exposing answer lines as candidates."""
+    if not reference_patch.strip():
+        return "(no reference patch)"
+
+    files: dict[str, dict[str, Any]] = {}
+    current_file = ""
+    for line in reference_patch.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                current_file = parts[3][2:] if parts[3].startswith("b/") else parts[3]
+                files.setdefault(current_file, {"additions": 0, "deletions": 0, "hunks": []})
+            continue
+        if not current_file:
+            continue
+        entry = files.setdefault(current_file, {"additions": 0, "deletions": 0, "hunks": []})
+        if line.startswith("@@"):
+            hunks = entry["hunks"]
+            if isinstance(hunks, list) and len(hunks) < 12:
+                hunks.append(line[:240])
+        elif line.startswith("+") and not line.startswith("+++"):
+            entry["additions"] += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            entry["deletions"] += 1
+
+    if not files:
+        return "(reference patch has no parseable file summary)"
+
+    lines = [
+        "NON-CANDIDATE REFERENCE SUMMARY.",
+        "Use this only as weak context for touched areas. Do not attribute these changes to Candidate A or Candidate B.",
+        "Touched files and hunk locations:",
+    ]
+    omitted_files = 0
+    for index, (path, entry) in enumerate(files.items()):
+        if index >= 80:
+            omitted_files = len(files) - index
+            break
+        lines.append(f"- {path} (+{entry['additions']}/-{entry['deletions']})")
+        hunks = entry["hunks"]
+        if isinstance(hunks, list):
+            for hunk in hunks[:4]:
+                lines.append(f"  {hunk}")
+            if len(hunks) > 4:
+                lines.append(f"  ... {len(hunks) - 4} more hunks")
+    if omitted_files:
+        lines.append(f"... {omitted_files} more files omitted")
+
+    return _truncate_middle("\n".join(lines), _DIFF_JUDGE_MAX_REFERENCE_HINT_CHARS)
 
 
 def _diff_judge_candidate_mapping(*, seed: str) -> dict[str, str]:
@@ -2172,10 +2242,6 @@ def _build_diff_judge_prompt_content(
             "text": json.dumps(
                 {
                     "task": _truncate_middle(task_prompt, _DIFF_JUDGE_MAX_TASK_CHARS),
-                    "reference_patch_hint": _truncate_middle(
-                        reference_patch,
-                        _DIFF_JUDGE_MAX_PATCH_CHARS,
-                    ),
                 },
                 indent=2,
                 sort_keys=True,
@@ -2194,6 +2260,7 @@ def _build_diff_judge_prompt_content(
                         candidate_b_patch or "(no changes)",
                         _DIFF_JUDGE_MAX_PATCH_CHARS,
                     ),
+                    "non_candidate_reference_summary": _reference_patch_hint(reference_patch),
                 },
                 indent=2,
                 sort_keys=True,
@@ -2211,7 +2278,6 @@ def _build_diff_judge_prompt(
 ) -> str:
     payload = {
         "task": _truncate_middle(task_prompt, _DIFF_JUDGE_MAX_TASK_CHARS),
-        "reference_patch_hint": _truncate_middle(reference_patch, _DIFF_JUDGE_MAX_PATCH_CHARS),
         "candidate_a_patch": _truncate_middle(
             candidate_a_patch if candidate_a_patch.strip() else "(no changes)",
             _DIFF_JUDGE_MAX_PATCH_CHARS,
@@ -2220,6 +2286,7 @@ def _build_diff_judge_prompt(
             candidate_b_patch if candidate_b_patch.strip() else "(no changes)",
             _DIFF_JUDGE_MAX_PATCH_CHARS,
         ),
+        "non_candidate_reference_summary": _reference_patch_hint(reference_patch),
     }
     return _diff_judge_instruction_text() + "\n" + json.dumps(payload, indent=2, sort_keys=True)
 
