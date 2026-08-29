@@ -8022,7 +8022,7 @@ def _resolve_promotion_candidate(*, subtensor, github_client, config, state, pri
     if _submission_is_eligible(subtensor=subtensor, github_client=github_client, config=config, submission=primary_candidate):
         return primary_candidate
     _mark_disqualified(state, primary_candidate.hotkey)
-    return _pop_next_valid_challenger(subtensor=subtensor, github_client=github_client, config=config, state=state)
+    return None
 
 
 # ---------------------------------------------------------------------------
